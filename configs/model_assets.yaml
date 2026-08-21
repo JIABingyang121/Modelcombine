@@ -1,0 +1,254 @@
+models:
+  - id: "arima"
+    type: "ts_forecast"
+    family: "stats"
+    input_schema: ["timestamp", "region", "load"]
+    output_schema: ["timestamp", "yhat"]
+    metrics: ["RMSE", "MAE", "MAPE"]
+    task_types: ["forecasting"]
+    lifecycle_stage: "active"
+    output_schema_struct: { "timestamp": "datetime", "yhat": "float" }
+    notes: "快速基线，季节性一般，适合短期电力预测"
+    best_for: ["短期预测", "平稳负荷", "基线模型"]
+    input_constraints:
+      features: ["load"]
+      min_samples: 50
+      freq: ["H", "D"]
+    output_constraints:
+      horizon: "short"
+      resolution: "H"
+    resource_cost:
+      cpu: "low"
+      memory: "low"
+      latency: "low"
+    scenario_tags: ["stable_load", "short_term", "baseline"]
+    business_dims: ["general"]
+
+  - id: "seasonal_naive"
+    type: "ts_forecast"
+    family: "baseline"
+    input_schema: ["timestamp", "region", "load"]
+    output_schema: ["timestamp", "yhat"]
+    metrics: ["RMSE", "MAE", "MAPE"]
+    task_types: ["forecasting"]
+    lifecycle_stage: "active"
+    output_schema_struct: { "timestamp": "datetime", "yhat": "float" }
+    notes: "Seasonal Naive基线模型，使用上一季节周期值直接预测"
+    best_for: ["强季节性", "快速基线", "周期稳定数据"]
+    input_constraints:
+      features: ["load"]
+      min_samples: 30
+      freq: ["H", "D"]
+    output_constraints:
+      horizon: "short"
+      resolution: "H"
+    resource_cost:
+      cpu: "low"
+      memory: "low"
+      latency: "low"
+    scenario_tags: ["baseline", "high_seasonality"]
+    business_dims: ["general"]
+
+  - id: "prophet"
+    type: "ts_forecast"
+    family: "bayesian_additive"
+    input_schema: ["timestamp", "region", "load", "holidays", "weather"]
+    output_schema: ["timestamp", "yhat"]
+    metrics: ["RMSE", "MAE", "MAPE"]
+    task_types: ["forecasting"]
+    lifecycle_stage: "active"
+    output_schema_struct: { "timestamp": "datetime", "yhat": "float" }
+    notes: "强季节性、节假日影响，适合住宅和服务区用电预测"
+    best_for: ["强季节性", "节假日效应", "住宅用电", "服务区用电"]
+    input_constraints:
+      features: ["load", "holidays"]
+      min_samples: 100
+      freq: ["H", "D"]
+    output_constraints:
+      horizon: "medium"
+      resolution: "H"
+    resource_cost:
+      cpu: "medium"
+      memory: "medium"
+      latency: "medium"
+    scenario_tags: ["high_seasonality", "holiday_effect", "residential", "service_area"]
+    business_dims: ["residential", "commercial"]
+
+  - id: "xgboost_reg"
+    type: "regression"
+    family: "tree_boosting"
+    input_schema: ["features_matrix", "target"]
+    output_schema: ["timestamp", "yhat"]
+    metrics: ["RMSE", "MAE", "MAPE"]
+    task_types: ["forecasting"]
+    lifecycle_stage: "active"
+    output_schema_struct: { "timestamp": "datetime", "yhat": "float" }
+    notes: "特征足够时表现稳定，适合充电桩等复杂场景"
+    best_for: ["特征丰富", "充电桩预测", "非线性关系"]
+    input_constraints:
+      features: ["load", "weather", "time_features"]
+      min_samples: 200
+      freq: ["H"]
+    output_constraints:
+      horizon: "any"
+      resolution: "H"
+    resource_cost:
+      cpu: "high"
+      memory: "medium"
+      latency: "medium"
+    scenario_tags: ["complex_features", "non_linear", "charging_station"]
+    business_dims: ["charging", "industrial"]
+
+  - id: "lgbm_reg"
+    type: "regression"
+    family: "tree_boosting"
+    input_schema: ["features_matrix", "target"]
+    output_schema: ["timestamp", "yhat"]
+    metrics: ["RMSE", "MAE", "MAPE"]
+    task_types: ["forecasting"]
+    lifecycle_stage: "active"
+    output_schema_struct: { "timestamp": "datetime", "yhat": "float" }
+    notes: "速度快，适合大规模电力数据特征处理"
+    best_for: ["大规模数据", "快速训练", "实时预测"]
+    input_constraints:
+      features: ["load", "weather", "time_features"]
+      min_samples: 200
+      freq: ["H"]
+    output_constraints:
+      horizon: "any"
+      resolution: "H"
+    resource_cost:
+      cpu: "medium"
+      memory: "medium"
+      latency: "low"
+    scenario_tags: ["large_scale", "real_time", "high_efficiency"]
+    business_dims: ["general"]
+
+  - id: "catboost_reg"
+    type: "regression"
+    family: "tree_boosting"
+    input_schema: ["features_matrix", "target"]
+    output_schema: ["timestamp", "yhat"]
+    metrics: ["RMSE", "MAE", "MAPE"]
+    task_types: ["forecasting"]
+    lifecycle_stage: "active"
+    output_schema_struct: { "timestamp": "datetime", "yhat": "float" }
+    notes: "类别特征友好，适合区域类型等分类特征"
+    best_for: ["类别特征", "区域分类", "自动特征处理"]
+    input_constraints:
+      features: ["load", "categorical_features"]
+      min_samples: 200
+      freq: ["H"]
+    output_constraints:
+      horizon: "any"
+      resolution: "H"
+    resource_cost:
+      cpu: "high"
+      memory: "high"
+      latency: "medium"
+    scenario_tags: ["categorical_data", "region_specific"]
+    business_dims: ["general"]
+
+  - id: "power_difference"
+    type: "regression"
+    family: "power_specific"
+    input_schema: ["features_matrix", "target", "region_info"]
+    output_schema: ["timestamp", "yhat"]
+    metrics: ["RMSE", "MAE", "MAPE"]
+    task_types: ["forecasting"]
+    lifecycle_stage: "active"
+    output_schema_struct: { "timestamp": "datetime", "yhat": "float" }
+    notes: "电力负荷差异分析模型，专门处理不同区域间的用电差异"
+    best_for: ["多区域差异", "峰谷分析", "区域特征建模"]
+    input_constraints:
+      features: ["load", "region_id"]
+      min_samples: 100
+      freq: ["H"]
+    output_constraints:
+      horizon: "short"
+      resolution: "H"
+    resource_cost:
+      cpu: "low"
+      memory: "low"
+      latency: "low"
+    scenario_tags: ["multi_region", "peak_valley_diff"]
+    business_dims: ["grid_analysis"]
+
+  - id: "multimodal_fusion"
+    type: "fusion"
+    family: "power_specific"
+    input_schema: ["load_features", "weather_features", "time_features"]
+    output_schema: ["timestamp", "yhat"]
+    metrics: ["RMSE", "MAE", "MAPE"]
+    task_types: ["forecasting"]
+    lifecycle_stage: "active"
+    output_schema_struct: { "timestamp": "datetime", "yhat": "float" }
+    notes: "多模态数据融合模型，整合用电、天气、时间等多种数据源"
+    best_for: ["多数据源", "跨模态融合", "综合预测"]
+    input_constraints:
+      features: ["load", "weather", "time"]
+      min_samples: 300
+      freq: ["H"]
+    output_constraints:
+      horizon: "medium"
+      resolution: "H"
+    resource_cost:
+      cpu: "high"
+      memory: "high"
+      latency: "high"
+    scenario_tags: ["multi_modal", "weather_sensitive", "complex_environment"]
+    business_dims: ["general"]
+
+relations:
+  - source: "prophet"
+    target: "xgboost_reg"
+    type: "complementary"
+    weight: 0.7
+    notes: "Prophet处理季节性，XGBoost处理复杂特征关系"
+  - source: "xgboost_reg"
+    target: "lgbm_reg"
+    type: "competitive"
+    weight: 0.4
+    notes: "两者都是树模型，性能相近，可互相替代"
+  - source: "arima"
+    target: "prophet"
+    type: "dependency"
+    weight: 0.5
+    notes: "ARIMA作为基线，Prophet是其增强版本"
+  - source: "multimodal_fusion"
+    target: "prophet"
+    type: "complementary"
+    weight: 0.8
+    notes: "多模态融合与时序预测相互补充"
+  - source: "power_difference"
+    target: "xgboost_reg"
+    type: "complementary"
+    weight: 0.6
+    notes: "差异分析与回归模型结合处理区域特征"
+  - source: "lgbm_reg"
+    target: "catboost_reg"
+    type: "competitive"
+    weight: 0.3
+    notes: "都是梯度提升模型，适用场景相似"
+
+selection_rules:
+  - scenario_filter: { region_type: "residential" }
+    prefer: ["prophet", "multimodal_fusion", "lgbm_reg", "seasonal_naive"]
+    fallback: ["xgboost_reg", "arima"]
+    notes: "住宅用电具有强季节性和天气相关性"
+  - scenario_filter: { region_type: "charging" }
+    prefer: ["xgboost_reg", "lgbm_reg", "power_difference"]
+    fallback: ["multimodal_fusion", "prophet", "seasonal_naive"]
+    notes: "充电桩用电模式复杂，需要强特征学习能力"
+  - scenario_filter: { region_type: "service_area" }
+    prefer: ["prophet", "multimodal_fusion", "xgboost_reg", "seasonal_naive"]
+    fallback: ["power_difference", "arima"]
+    notes: "服务区用电受季节和天气影响显著"
+  - scenario_filter: { seasonal_amplitude: "> 0.3" }
+    prefer: ["prophet", "multimodal_fusion"]
+    fallback: ["arima"]
+    notes: "高季节性场景优先使用时序模型"
+  - scenario_filter: { cv_load: "> 0.2" }
+    prefer: ["xgboost_reg", "lgbm_reg", "catboost_reg"]
+    fallback: ["power_difference"]
+    notes: "高变异性场景使用树模型"

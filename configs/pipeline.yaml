@@ -1,0 +1,165 @@
+data:
+  root: "data/pjm"
+  regions: ["PJME"]
+  freq: "H"
+  horizon_hours: 24
+  horizons: [1, 6, 24]
+  test_days: 30
+  # 训练集尾部划出的验证窗，用于生成 Protocol B 所需的无泄漏候选预测矩阵。
+  # 与 test_days 分开表达：test 始终不可见，validation 只从 train 内部切分。
+  validation_days: 30
+  description: "PJM East 真实电力负荷数据（默认配置，详见 datasets 覆盖）"
+
+# 各数据集的粒度、horizon 与测试窗配置（滚动验证参数仅用于评估/抽样，不改变主流程默认行为）
+datasets:
+  pjm:
+    root: "data/pjm"
+    freq: "H"
+    horizons: [1, 6, 24]
+    test_days: 30
+    rolling_cv:
+      folds: 3
+      window_days: 90
+      step_days: 7
+  aemo_vic:
+    root: "data/external/aemo_vic"
+    freq: "H"
+    horizons: [1, 6, 24]
+    test_days: 30
+    min_samples_for_dynamic: 500
+    rolling_cv:
+      folds: 3
+      window_days: 90
+      step_days: 7
+  aemo_nsw:
+    root: "data/external/aemo_nsw"
+    freq: "H"
+    horizons: [1, 6, 24]
+    test_days: 30
+    min_samples_for_dynamic: 500
+    rolling_cv:
+      folds: 3
+      window_days: 90
+      step_days: 7
+
+features:
+  lags: [1, 2, 24, 168]  # 1小时、2小时、1天、1周滞后
+  rolling:
+    - { window: 24, stat: "mean" }   # 24小时均值
+    - { window: 24, stat: "std" }    # 24小时标准差
+    - { window: 168, stat: "mean" }  # 1周均值
+    - { window: 168, stat: "max" }   # 1周最大值
+    - { window: 168, stat: "min" }   # 1周最小值
+  power_specific:
+    peak_hours: [7, 8, 18, 19, 20]
+    valley_hours: [0, 1, 2, 3, 4, 5]
+    work_hours: [9, 10, 11, 12, 13, 14, 15, 16, 17]
+
+selection:
+  use_rules_first: true
+  combiner: "weighted"  # weighted 或 stacking
+  similarity_threshold: 0.3
+  max_models_per_region: 3
+  weights:
+    prophet: 0.4
+    xgboost_reg: 0.25
+    lgbm_reg: 0.2
+    multimodal_fusion: 0.1
+    power_difference: 0.05
+    seasonal_naive: 0.05
+
+models:
+  prophet:
+    yearly_seasonality: true
+    weekly_seasonality: true
+    daily_seasonality: true
+    seasonality_mode: "multiplicative"
+    changepoint_prior_scale: 0.05
+    seasonality_prior_scale: 10.0
+    holidays_prior_scale: 10.0
+    mcmc_samples: 0
+    interval_width: 0.8
+  xgboost_reg:
+    n_estimators: 300
+    max_depth: 8
+    learning_rate: 0.03
+    subsample: 0.8
+    colsample_bytree: 0.8
+    reg_alpha: 0.1
+    reg_lambda: 1.0
+    random_state: 42
+    n_jobs: -1
+  lgbm_reg:
+    n_estimators: 400
+    num_leaves: 128
+    learning_rate: 0.03
+    subsample: 0.8
+    colsample_bytree: 0.8
+    reg_alpha: 0.1
+    reg_lambda: 1.0
+    random_state: 42
+    n_jobs: -1
+    verbose: -1
+  catboost_reg:
+    depth: 8
+    learning_rate: 0.03
+    n_estimators: 400
+    l2_leaf_reg: 3.0
+    random_state: 42
+    verbose: False
+    thread_count: -1
+  arima:
+    order: [1, 1, 1]
+    seasonal_order: [1, 1, 1, 24]
+    enforce_stationarity: False
+    enforce_invertibility: False
+  power_difference:
+    base_model: "ridge"
+    alpha: 1.0
+    fit_intercept: true
+  multimodal_fusion:
+    fusion_method: "attention"
+    alpha: 1.0
+
+evaluation:
+  metrics: ["RMSE", "MAE", "MAPE", "R2"]
+  cross_validation:
+    enabled: false
+    folds: 5
+    time_series_split: true
+  error_analysis:
+    by_hour: true
+    by_day_of_week: true
+    by_season: true
+    by_region_type: true
+
+# Phase 3: 高级优化配置
+phase3:
+  enable: true
+  
+  # 事件特征提取
+  event_features:
+    enable: true
+    change_point_threshold: 2.0  # Z-score 阈值
+    anomaly_threshold: 3.0       # Z-score 阈值
+    peak_prominence: null        # null 表示自适应
+  
+  # 场景编码器
+  scenario_encoder:
+    enable: true
+    encoding_dim: 16             # 编码维度
+    min_training_samples: 3      # 最小训练样本数
+  
+  # SLA 多目标优化
+  sla_optimizer:
+    enable: false                 # 默认关闭，避免影响现有流程
+    mode: "hybrid"               # pareto | lagrangian | hybrid
+    constraints:
+      max_latency: 500.0         # 最大延迟 (ms)
+      max_memory: 200.0          # 最大内存 (MB)
+      max_cpu: 80.0              # 最大 CPU 使用率 (%)
+      min_accuracy: 0.90         # 最小准确度 (1 - error)
+    preference_weights:          # Pareto 模式下的偏好权重
+      error: 0.6
+      latency: 0.2
+      resource: 0.2

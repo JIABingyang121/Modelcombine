@@ -1,0 +1,9 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+
+[project]
+name = "modelcombine"
+version = "0.1.0"
+description = "Electricity demand forecasting via model combination and graph-based selection"
+requires-python = ">=3.9"
+dependencies = []

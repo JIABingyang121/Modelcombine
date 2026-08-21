@@ -1,0 +1,32 @@
+experiment: comparativetest1
+random_seed: 42
+
+splits:
+  pjm: data/splits/pjm
+  aemo_vic: data/splits/aemo_vic
+  aemo_nsw: data/splits/aemo_nsw
+
+horizons:
+  pjm: [1, 6, 24]            # hours ahead
+  aemo_vic: [1, 6, 24]        # hours ahead (AEMO VIC)
+  aemo_nsw: [1, 6, 24]        # hours ahead (AEMO NSW)
+
+features:
+  time:
+    enabled: true
+    fields: [hour, dayofweek, month, is_weekend]
+  lags:
+    pjm: [1, 2, 6, 12, 24]
+    aemo_vic: [1, 2, 6, 12, 24]
+    aemo_nsw: [1, 2, 6, 12, 24]
+  rolling:
+    pjm: [3, 6, 12, 24]
+    aemo_vic: [3, 6, 12, 24]
+    aemo_nsw: [3, 6, 12, 24]
+  holiday:
+    pjm: {enabled: true, calendar: US}
+    aemo_vic: {enabled: true, calendar: AU}
+    aemo_nsw: {enabled: true, calendar: AU}
+
+notes:
+  scope: "当前实验仅覆盖 PJM、AEMO VIC、AEMO NSW 三个小时级数据集。"

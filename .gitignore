@@ -1,0 +1,33 @@
+__pycache__/
+.ipynb_checkpoints/
+.venv/
+.env
+*.log
+reports/*
+!reports/.gitkeep
+data/*
+!data/.gitkeep
+result/*
+!result/ab_convergence/
+!result/ab_convergence/**
+venv/
+catboost_info/
+delivery_package/
+delivery_package.zip
+changed_code_*.zip
+changed_code_*.zip.sha256
+changed_code_manifest_*.txt
+*.tar.gz
+*.tar.gz.sha256
+*.npy
+*.pt
+*.pth
+
+# System A/B 合一 Task 5 影子基准：小型 JSON 与根因报告纳入版本控制，
+# .prof 与逐行调试日志始终忽略（见 result/ab_convergence/root_cause.md）。
+result/ab_convergence/**/*.prof
+result/ab_convergence/**/*.log
+
+# PyTorch Lightning 在 CWD 落盘的训练日志（informer/autoformer 等深度模型触发）。
+# Task 5 基准运行时发现：这类日志写在仓库根目录，不属于 reports/ 只读快照范围。
+lightning_logs/
