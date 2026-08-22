@@ -8,7 +8,7 @@ from .implementations import (
     ProphetModel, ARIMAModel, SeasonalNaiveModel, PowerLoadDifferenceModel, 
     MultiModalFusionModel, WeightedBlender, StackingBlender
 )
-from .deep_learning import InformerModel, AutoformerModel, PowerGPTModel
+from .deep_learning import InformerModel, AutoformerModel
 
 
 @dataclass
@@ -55,7 +55,8 @@ class ModelRegistry:
         # 深度学习/大模型
         self.register("informer", InformerModel)
         self.register("autoformer", AutoformerModel)
-        self.register("powergpt", PowerGPTModel)
+        # powergpt 未注册：其实现为占位（fit 不训练、predict 返回全零），
+        # 注册即会作为候选进入预测矩阵。实现完成后再恢复注册。
     
     def get_available_models(self) -> list[str]:
         """获取所有可用模型列表"""

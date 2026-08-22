@@ -138,6 +138,10 @@ def test_run_dataset_records_the_per_task_seed_used_before_each_candidate_fit(mo
     )
     monkeypatch.setattr(baselines, "build_model", lambda model_id, freq, params: ConstantModel())
 
+    # 训练集合来自配置（run_dataset 已改为以 model_params 为唯一真源）。
+    # 此处原先只传 lgbm_reg 却断言 7 个模型全部被训练——那是在为
+    # run_dataset 内的硬编码列表背书，等于把缺陷固化成预期。
+    configured = {"lgbm_reg": {"n_jobs": 1}, "seasonal_naive": {"seasonal_period": 24}}
     baselines.run_dataset(
         "pjm",
         dataset_root,
@@ -145,13 +149,11 @@ def test_run_dataset_records_the_per_task_seed_used_before_each_candidate_fit(mo
         [1],
         tmp_path / "out",
         None,
-        {"lgbm_reg": {"n_jobs": 1}},
+        configured,
     )
 
-    expected_models = {
-        "xgboost_reg", "lgbm_reg", "catboost_reg", "prophet", "arima", "power_difference", "multimodal_fusion"
-    }
-    assert set(seed_calls) == {(model_id, "baseline:pjm:h1:fit") for model_id in expected_models}
+    # 本用例的意图是"每个候选 fit 前都重置 per-task 种子"，与训练集合大小无关
+    assert set(seed_calls) == {(model_id, "baseline:pjm:h1:fit") for model_id in configured}
     meta = json.loads((tmp_path / "out" / "pjm" / "model_meta_h1_lgbm_reg.json").read_text(encoding="utf-8"))
     assert meta["training_seed"] == 123
     assert meta["candidate_seed_strategy"] == "sha256(global_seed|model_id|stage)"

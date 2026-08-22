@@ -10,7 +10,15 @@ from .sla_optimizer import SLAOptimizerManager, SLAConstraints, PathCandidate
 
 
 class PowerModelCombinator:
-    """电力模型组合器，专门用于电力需求预测的模型选择和组合"""
+    """电力模型组合器，专门用于电力需求预测的模型选择和组合。
+
+    **迁移期兼容实现（Task 8 起，2026-08-21）**：`run.py` 的默认决策路径已切换到
+    System B 的 Protocol B。本类仅在显式设置
+    `MODELCOMBINE_PIPELINE_BACKEND=combinator` 时被调用，用途限于迁移期回退与
+    黄金对照。**禁止继续向本实现增加功能或修复非阻断缺陷**——新能力一律做在
+    System B 主干上，否则会重新拉开两套决策逻辑的差距。计划在两个连续验收版本
+    通过、并经用户再次确认后删除（Task 9）。
+    """
     
     # 特征组定义：将抽象特征名映射到实际列名
     FEATURE_GROUPS = {

@@ -51,12 +51,12 @@ class DeepLearningBaseModel(BaseEstimator, RegressorMixin):
         else:
             # Fallback if no datetime index
             df['ds'] = pd.date_range(start='2020-01-01', periods=len(X), freq='H')
-        
+
         df['unique_id'] = '1' # Single series
-        
+
         if y is not None:
             df['y'] = y.values
-            
+
         return df
 
     def fit(self, X: pd.DataFrame, y: pd.Series):
@@ -78,15 +78,15 @@ class InformerModel(DeepLearningBaseModel):
         self.input_size = input_size
         self.max_steps = max_steps
         self.nf = None
-        
+
     def fit(self, X: pd.DataFrame, y: pd.Series):
         self._check_torch()
         if NeuralForecast is None:
             raise ImportError("neuralforecast is required. Install with: pip install neuralforecast")
-            
+
         # Prepare data
         train_df = self._prepare_df(X, y)
-        
+
         # Initialize model
         models = [
             Informer(
@@ -97,7 +97,7 @@ class InformerModel(DeepLearningBaseModel):
                 **self.params
             )
         ]
-        
+
         self.nf = NeuralForecast(models=models, freq='H') # Assuming Hourly
         self.nf.fit(df=train_df)
         self.is_fitted_ = True
@@ -106,12 +106,12 @@ class InformerModel(DeepLearningBaseModel):
     def predict(self, X: pd.DataFrame) -> np.ndarray:
         if not hasattr(self, 'is_fitted_'):
             raise RuntimeError("Model must be fitted before prediction")
-            
+
         forecasts = self.nf.predict()
         # forecasts has columns [ds, unique_id, Informer, y]
-        
+
         preds = forecasts['Informer'].values
-        
+
         if len(preds) > len(X):
             return preds[:len(X)]
         elif len(preds) < len(X):
@@ -135,9 +135,9 @@ class AutoformerModel(DeepLearningBaseModel):
         self._check_torch()
         if NeuralForecast is None:
             raise ImportError("neuralforecast is required. Install with: pip install neuralforecast")
-            
+
         train_df = self._prepare_df(X, y)
-        
+
         models = [
             Autoformer(
                 h=self.h,
@@ -147,7 +147,7 @@ class AutoformerModel(DeepLearningBaseModel):
                 **self.params
             )
         ]
-        
+
         self.nf = NeuralForecast(models=models, freq='H')
         self.nf.fit(df=train_df)
         self.is_fitted_ = True
@@ -156,10 +156,10 @@ class AutoformerModel(DeepLearningBaseModel):
     def predict(self, X: pd.DataFrame) -> np.ndarray:
         if not hasattr(self, 'is_fitted_'):
             raise RuntimeError("Model must be fitted before prediction")
-        
+
         forecasts = self.nf.predict()
         preds = forecasts['Autoformer'].values
-        
+
         if len(preds) > len(X):
             return preds[:len(X)]
         elif len(preds) < len(X):
@@ -176,18 +176,16 @@ class PowerGPTModel(DeepLearningBaseModel):
         super().__init__(**params)
         self.model_name = model_name
 
+    _PLACEHOLDER_MSG = (
+        "PowerGPTModel is a placeholder: model loading and fine-tuning are not "
+        "implemented, and predict() used to return all zeros. It is unregistered "
+        "and must not be scheduled as a candidate until actually implemented."
+    )
+
     def fit(self, X: pd.DataFrame, y: pd.Series):
-        self._check_torch()
-        if AutoModel is None:
-             raise ImportError("transformers library is required. Install with: pip install transformers")
-             
-        print(f"Initializing PowerGPT based on {self.model_name}")
-        # self.model = AutoModel.from_pretrained(self.model_name)
-        # Fine-tuning logic would go here
-        self.is_fitted_ = True
-        return self
+        # 原实现只置 is_fitted_ 而不训练，配合返回全零的 predict()，会让一列
+        # 无效数据混进候选矩阵并污染误差相关性/稳定性/drift 判定。改为显式失败。
+        raise NotImplementedError(self._PLACEHOLDER_MSG)
 
     def predict(self, X: pd.DataFrame) -> np.ndarray:
-        if not hasattr(self, 'is_fitted_'):
-            raise RuntimeError("Model must be fitted before prediction")
-        return np.zeros(len(X))
+        raise NotImplementedError(self._PLACEHOLDER_MSG)

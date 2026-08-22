@@ -215,6 +215,16 @@ def test_validate_report_requires_meta_commit_seed_and_environment(tmp_path):
             shadow.validate_shadow_report(bad_report)
 
 
+def test_validate_report_rejects_unverified_baseline_provenance_when_v4_requires_it(tmp_path):
+    """v4 声称配置对齐时，不能缺少或伪造基线来源验证结果。"""
+    report = _valid_report(tmp_path)
+    report["_meta"]["baseline_provenance_required"] = True
+    report["_meta"]["baseline_provenance"] = {"status": "missing"}
+
+    with pytest.raises(ValueError, match="baseline_provenance"):
+        shadow.validate_shadow_report(report, trace_root=tmp_path)
+
+
 def test_validate_report_requires_key_dependency_versions(tmp_path):
     required_deps = [
         "numpy",

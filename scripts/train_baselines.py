@@ -1,9 +1,10 @@
 import argparse
+import hashlib
 import json
 import os
 import sys
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Mapping, Tuple
 
 import numpy as np
 import pandas as pd
@@ -24,6 +25,12 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.models.registry import model_registry
 from src.models.implementations import _XGBRegressor, _CatBoostRegressor
+from src.utils.determinism import global_seed, seed_for_candidate
+from src.utils.io import load_yaml
+
+
+BASELINE_PROVENANCE_FILENAME = "baseline_provenance.json"
+CANDIDATE_SEED_STRATEGY = "sha256(global_seed|model_id|stage)"
 
 
 def ensure_dir(path: Path) -> None:
@@ -207,10 +214,119 @@ def prepare_supervised(df: pd.DataFrame, target_col: str, horizon: int, time_col
     return X, y, ts, freq
 
 
-def build_model(model_id: str, freq: str):
+def load_pipeline_model_params(pipeline_config: Path) -> Dict[str, Dict[str, Any]]:
+    """读取默认入口的模型参数，供 Task 7 v4 基线训练复用。"""
+    raw = load_yaml(str(pipeline_config)) or {}
+    models = raw.get("models", {}) if isinstance(raw, Mapping) else {}
+    if not isinstance(models, Mapping):
+        raise ValueError(f"pipeline config models must be a mapping: {pipeline_config}")
+    return {
+        str(model_id): dict(params)
+        for model_id, params in models.items()
+        if isinstance(params, Mapping)
+    }
+
+
+def _sha256_file(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def build_baseline_provenance(
+    *,
+    pipeline_config: Path,
+    model_params: Mapping[str, Mapping[str, Any]],
+    global_seed: int,
+    artifacts: List[Dict[str, Any]] | None = None,
+) -> Dict[str, Any]:
+    """构造可供影子运行器验证的基线训练来源清单。"""
+    return {
+        "schema_version": 1,
+        "pipeline_config": {
+            "path": str(pipeline_config),
+            "sha256": _sha256_file(pipeline_config),
+        },
+        "candidate_seed_strategy": CANDIDATE_SEED_STRATEGY,
+        "global_seed": int(global_seed),
+        "models": {str(model_id): dict(params) for model_id, params in model_params.items()},
+        "artifacts": list(artifacts or []),
+    }
+
+
+def load_verified_baseline_provenance(pred_root: Path, pipeline_config: Path) -> Dict[str, Any]:
+    """读取并校验基线来源清单与本次默认入口配置是否一致。"""
+    path = pred_root / BASELINE_PROVENANCE_FILENAME
+    if not path.exists():
+        raise ValueError(f"baseline provenance is missing: {path}")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"baseline provenance is invalid JSON: {path}") from exc
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+        raise ValueError("baseline provenance schema_version must be 1")
+    if payload.get("candidate_seed_strategy") != CANDIDATE_SEED_STRATEGY:
+        raise ValueError("baseline provenance candidate_seed_strategy is not aligned")
+    if payload.get("global_seed") != global_seed():
+        raise ValueError("baseline provenance global_seed does not match current default")
+    config = payload.get("pipeline_config")
+    if not isinstance(config, dict):
+        raise ValueError("baseline provenance missing pipeline_config")
+    if config.get("sha256") != _sha256_file(pipeline_config):
+        raise ValueError("baseline provenance pipeline_config sha256 does not match current config")
+    if not isinstance(payload.get("artifacts"), list):
+        raise ValueError("baseline provenance artifacts must be a list")
+    return payload
+
+
+def _artifact_file_names(horizon: int, model_id: str) -> Tuple[str, str, str]:
+    return (
+        f"val_pred_h{horizon}_{model_id}.csv",
+        f"test_pred_h{horizon}_{model_id}.csv",
+        f"model_meta_h{horizon}_{model_id}.json",
+    )
+
+
+def verify_task_artifacts(
+    provenance: Mapping[str, Any],
+    *,
+    pred_root: Path,
+    dataset: str,
+    horizon: int,
+    models: List[str],
+) -> None:
+    """确认影子矩阵实际使用的每个模型都由本轮基线清单绑定。"""
+    artifacts = provenance.get("artifacts")
+    if not isinstance(artifacts, list):
+        raise ValueError("baseline provenance artifacts must be a list")
+    index: Dict[Tuple[str, int, str], Mapping[str, Any]] = {}
+    for record in artifacts:
+        if not isinstance(record, Mapping):
+            continue
+        key = (str(record.get("dataset")), record.get("horizon"), str(record.get("model")))
+        if key in index:
+            raise ValueError(f"baseline provenance duplicate artifact record: {key}")
+        index[key] = record
+    for model_id in models:
+        key = (dataset, int(horizon), str(model_id))
+        record = index.get(key)
+        if record is None:
+            raise ValueError(f"baseline provenance missing artifact for {dataset} h={horizon} {model_id}")
+        files = record.get("files")
+        if not isinstance(files, Mapping):
+            raise ValueError(f"baseline provenance files missing for {dataset} h={horizon} {model_id}")
+        for file_name in _artifact_file_names(horizon, model_id):
+            path = pred_root / dataset / file_name
+            expected_hash = files.get(file_name)
+            if not isinstance(expected_hash, str):
+                raise ValueError(f"baseline provenance hash missing for {dataset} h={horizon} {model_id}: {file_name}")
+            if not path.exists() or _sha256_file(path) != expected_hash:
+                raise ValueError(f"baseline provenance artifact hash mismatch for {dataset} h={horizon} {model_id}: {file_name}")
+
+
+def build_model(model_id: str, freq: str, params: Mapping[str, Any] | None = None):
+    resolved = dict(params or {})
     if model_id == "arima":
-        return model_registry.create(model_id, freq=freq)
-    return model_registry.create(model_id)
+        resolved.setdefault("freq", freq)
+    return model_registry.create(model_id, **resolved)
 
 
 def _extract_fit_status(model: object) -> Dict[str, object]:
@@ -244,7 +360,15 @@ def score_prediction(y_eval: pd.Series, pred: np.ndarray) -> Dict[str, float]:
     return {"mae": mae, "rmse": rmse}
 
 
-def run_dataset(name: str, feature_root: Path, target_col: str, horizons: List[int], out_root: Path, max_rows: int | None) -> Dict:
+def run_dataset(
+    name: str,
+    feature_root: Path,
+    target_col: str,
+    horizons: List[int],
+    out_root: Path,
+    max_rows: int | None,
+    model_params: Mapping[str, Mapping[str, Any]],
+) -> Dict:
     results = {}
     # 同一数据集的 split 对所有 horizon 复用，避免重复 IO。
     train_df = load_split(feature_root, "train")
@@ -269,20 +393,24 @@ def run_dataset(name: str, feature_root: Path, target_col: str, horizons: List[i
             X_train = X_train.iloc[:cap]
             y_train = y_train.iloc[:cap]
 
-        models = [
-            "xgboost_reg",
-            "lgbm_reg",
-            "catboost_reg",
-            "prophet",
-            "arima",
-            "power_difference",
-            "multimodal_fusion",
-        ]
-        results_h = {"val": {}, "test": {}}
+        # 训练集合以 configs/pipeline.yaml 的 models: 段为唯一真源。
+        # 此处原为硬编码 7 个模型，导致配置里新增的候选（如 seasonal_naive）
+        # 永远不会被训练，而 model_params 只被用来取参数——配置与训练集合是
+        # 两份互不校验的清单。本项目已在 model_assets.yaml / registry /
+        # combination_utils.MODELS 上重复踩过同类漂移，故改为单一来源。
+        models = list(model_params.keys())
+        if not models:
+            raise ValueError(
+                "model_params is empty:训练集合来自 pipeline.yaml 的 models: 段，"
+                "不能为空"
+            )
+        results_h = {"val": {}, "test": {}, "artifacts": []}
         for mid in models:
             try:
                 # 每个模型每个 horizon 只训练一次，再分别在 val/test 推理。
-                model = build_model(mid, freq)
+                training_seed = seed_for_candidate(mid, stage=f"baseline:{name}:h{h}:fit")
+                params = dict(model_params.get(mid, {}))
+                model = build_model(mid, freq, params)
                 model.fit(X_train, y_train)
                 pred_val = model.predict(X_val)
                 pred_test = model.predict(X_test)
@@ -318,12 +446,28 @@ def run_dataset(name: str, feature_root: Path, target_col: str, horizons: List[i
                             "dataset": name,
                             "horizon": int(h),
                             "model": mid,
+                            "model_params": params,
+                            "training_seed": training_seed,
+                            "candidate_seed_strategy": CANDIDATE_SEED_STRATEGY,
                             "fit_status": fit_status,
                         },
                         mf,
                         ensure_ascii=False,
                         indent=2,
                     )
+                artifact_names = _artifact_file_names(h, mid)
+                artifact_paths = [out_root / name / file_name for file_name in artifact_names]
+                results_h["artifacts"].append(
+                    {
+                        "dataset": name,
+                        "horizon": int(h),
+                        "model": mid,
+                        "files": {
+                            file_name: _sha256_file(path)
+                            for file_name, path in zip(artifact_names, artifact_paths)
+                        },
+                    }
+                )
 
                 if fit_status.get("convergence_warning_count", 0):
                     print(
@@ -346,6 +490,11 @@ def run_dataset(name: str, feature_root: Path, target_col: str, horizons: List[i
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/exp_comparativetest1.yaml", help="配置文件路径 (未直接使用，预留)")
+    parser.add_argument(
+        "--pipeline-config",
+        default="configs/pipeline.yaml",
+        help="与默认 Protocol B 候选池对齐的模型参数配置",
+    )
     parser.add_argument("--features", default="data/features", help="特征根目录")
     parser.add_argument("--out", default="reports/baselines", help="输出目录")
     parser.add_argument("--datasets", nargs="*", default=None, help="仅运行指定数据集，如 pjm aemo_vic aemo_nsw")
@@ -367,6 +516,10 @@ def main():
 
     out_root = Path(args.out)
     ensure_dir(out_root)
+    pipeline_config = Path(args.pipeline_config)
+    if not pipeline_config.is_absolute():
+        pipeline_config = PROJECT_ROOT / pipeline_config
+    model_params = load_pipeline_model_params(pipeline_config)
 
     # Horizon设定与target映射
     horizons = {
@@ -394,7 +547,15 @@ def main():
         if not root.exists():
             print(f"skip {name}, features not found: {root}")
             continue
-        res = run_dataset(name, root, targets[name], horizons[name], out_root, args.max_rows)
+        res = run_dataset(
+            name,
+            root,
+            targets[name],
+            horizons[name],
+            out_root,
+            args.max_rows,
+            model_params,
+        )
         all_results[name] = res
 
     if not args.allow_partial:
@@ -423,8 +584,29 @@ def main():
         json.dump(val_only, f, ensure_ascii=False, indent=2)
     with metrics_test_path.open("w", encoding="utf-8") as f:
         json.dump(test_only, f, ensure_ascii=False, indent=2)
+    artifacts = [
+        artifact
+        for dataset_results in all_results.values()
+        for horizon_result in dataset_results.values()
+        for artifact in horizon_result.get("artifacts", [])
+    ]
+    provenance_path = out_root / BASELINE_PROVENANCE_FILENAME
+    provenance_path.write_text(
+        json.dumps(
+            build_baseline_provenance(
+                pipeline_config=pipeline_config,
+                model_params=model_params,
+                global_seed=global_seed(),
+                artifacts=artifacts,
+            ),
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
     print(f"saved val metrics to {metrics_val_path}")
     print(f"saved test metrics to {metrics_test_path}")
+    print(f"saved baseline provenance to {provenance_path}")
 
 
 if __name__ == "__main__":

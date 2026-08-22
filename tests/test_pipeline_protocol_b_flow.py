@@ -129,7 +129,11 @@ def _install_pipeline(monkeypatch, tmp_path, recorder, *, protocol_b_yhat=None):
 
     # Protocol B 侧替身：bundle 构建与 adapter
     def fake_bundle(**kwargs):
-        recorder.log("build_region_prediction_bundle", region=kwargs.get("region"))
+        recorder.log(
+            "build_region_prediction_bundle",
+            region=kwargs.get("region"),
+            candidate_models=list(kwargs.get("candidate_models") or []),
+        )
         from src.pipeline.prediction_pool import RegionPredictionBundle
 
         te = kwargs["test"]
@@ -190,7 +194,8 @@ def _read_predictions(tmp_path):
 
 def test_characterize_combinator_default_call_order(monkeypatch, tmp_path):
     """锁定默认流程的调用顺序：选模型 -> 训练预测 -> 评估 -> 反馈 -> 存图谱。"""
-    monkeypatch.delenv("MODELCOMBINE_PIPELINE_BACKEND", raising=False)
+    # Task 8 起 combinator 不再是默认，必须显式指定才走旧路径
+    monkeypatch.setenv("MODELCOMBINE_PIPELINE_BACKEND", "combinator")
     recorder = _Recorder()
     pipeline, *_ = _install_pipeline(monkeypatch, tmp_path, recorder)
 
@@ -207,7 +212,8 @@ def test_characterize_combinator_default_call_order(monkeypatch, tmp_path):
 
 def test_characterize_combinator_default_outputs(monkeypatch, tmp_path):
     """锁定默认流程的产物：predictions.csv 的 yhat、report.json、model_info.json。"""
-    monkeypatch.delenv("MODELCOMBINE_PIPELINE_BACKEND", raising=False)
+    # Task 8 起 combinator 不再是默认，必须显式指定才走旧路径
+    monkeypatch.setenv("MODELCOMBINE_PIPELINE_BACKEND", "combinator")
     recorder = _Recorder()
     pipeline, _, test, combinator_yhat, _ = _install_pipeline(monkeypatch, tmp_path, recorder)
 
@@ -221,7 +227,8 @@ def test_characterize_combinator_default_outputs(monkeypatch, tmp_path):
 
 
 def test_characterize_combinator_feedback_written_exactly_once(monkeypatch, tmp_path):
-    monkeypatch.delenv("MODELCOMBINE_PIPELINE_BACKEND", raising=False)
+    # Task 8 起 combinator 不再是默认，必须显式指定才走旧路径
+    monkeypatch.setenv("MODELCOMBINE_PIPELINE_BACKEND", "combinator")
     recorder = _Recorder()
     pipeline, *_ = _install_pipeline(monkeypatch, tmp_path, recorder)
 
@@ -331,7 +338,8 @@ def test_shadow_mode_runs_both_but_outputs_combinator(monkeypatch, tmp_path):
 def test_shadow_mode_output_identical_to_combinator_mode(monkeypatch, tmp_path):
     """影子模式的 predictions.csv 必须与默认模式逐值一致。"""
     recorder_a = _Recorder()
-    monkeypatch.delenv("MODELCOMBINE_PIPELINE_BACKEND", raising=False)
+    # 基线取显式 combinator（Task 8 后它不再是默认值）
+    monkeypatch.setenv("MODELCOMBINE_PIPELINE_BACKEND", "combinator")
     base_dir = tmp_path / "base"
     base_dir.mkdir()
     p1, *_ = _install_pipeline(monkeypatch, base_dir, recorder_a)
@@ -426,7 +434,8 @@ def test_shadow_mode_protocol_b_failure_still_raises(monkeypatch, tmp_path):
 
 def test_combinator_mode_produces_no_new_artifacts(monkeypatch, tmp_path):
     """默认路径产物集合必须与改造前一致：不得多出 backend_report.json。"""
-    monkeypatch.delenv("MODELCOMBINE_PIPELINE_BACKEND", raising=False)
+    # Task 8 起 combinator 不再是默认，必须显式指定才走旧路径
+    monkeypatch.setenv("MODELCOMBINE_PIPELINE_BACKEND", "combinator")
     recorder = _Recorder()
     pipeline, *_ = _install_pipeline(monkeypatch, tmp_path, recorder)
 
@@ -438,7 +447,8 @@ def test_combinator_mode_produces_no_new_artifacts(monkeypatch, tmp_path):
 
 def test_combinator_report_json_not_polluted_by_backend_key(monkeypatch, tmp_path):
     """report.json 在第 9 步保存，backend 字段只应存在于返回值中。"""
-    monkeypatch.delenv("MODELCOMBINE_PIPELINE_BACKEND", raising=False)
+    # Task 8 起 combinator 不再是默认，必须显式指定才走旧路径
+    monkeypatch.setenv("MODELCOMBINE_PIPELINE_BACKEND", "combinator")
     recorder = _Recorder()
     pipeline, *_ = _install_pipeline(monkeypatch, tmp_path, recorder)
 
@@ -456,3 +466,102 @@ def test_non_default_modes_write_backend_report(monkeypatch, tmp_path):
     pipeline.run_prediction_pipeline()
 
     assert (tmp_path / "reports" / "backend_report.json").exists()
+
+
+# --- Task 8: 默认决策路径切换到 Protocol B ---------------------------------
+
+
+def test_default_backend_is_protocol_b_without_env(monkeypatch):
+    """未设置环境变量时，默认必须是 protocol_b（Task 8 切换的核心断言）。"""
+    from src.pipeline.main import resolve_backend_mode
+
+    monkeypatch.delenv("MODELCOMBINE_PIPELINE_BACKEND", raising=False)
+
+    assert resolve_backend_mode() == "protocol_b"
+
+
+def test_empty_or_whitespace_env_also_defaults_to_protocol_b(monkeypatch):
+    """空串/空白不得被当成"未设置以外的东西"而落回旧引擎。"""
+    from src.pipeline.main import resolve_backend_mode
+
+    for raw in ("", "   "):
+        monkeypatch.setenv("MODELCOMBINE_PIPELINE_BACKEND", raw)
+        assert resolve_backend_mode() == "protocol_b"
+
+
+def test_legacy_combinator_requires_explicit_opt_in(monkeypatch):
+    """只有显式设置 combinator 才走旧路径；旧路径不再是隐式默认。"""
+    from src.pipeline.main import resolve_backend_mode
+
+    monkeypatch.setenv("MODELCOMBINE_PIPELINE_BACKEND", "combinator")
+    assert resolve_backend_mode() == "combinator"
+
+    monkeypatch.setenv("MODELCOMBINE_PIPELINE_BACKEND", "protocol_b_shadow")
+    assert resolve_backend_mode() == "protocol_b_shadow"
+
+
+def test_default_run_uses_protocol_b_path_end_to_end(monkeypatch, tmp_path):
+    """默认（无环境变量）跑主流程时，必须真正走 Protocol B 独立流程。"""
+    monkeypatch.delenv("MODELCOMBINE_PIPELINE_BACKEND", raising=False)
+    recorder = _Recorder()
+    pipeline, _, _, combinator_yhat, pb_yhat = _install_pipeline(monkeypatch, tmp_path, recorder)
+
+    result = pipeline.run_prediction_pipeline()
+
+    assert recorder.count("protocol_b_adapter.select") == 1
+    assert recorder.count("fit_and_predict_region") == 0
+    preds = _read_predictions(tmp_path)
+    np.testing.assert_allclose(preds["yhat"].values, pb_yhat, atol=1e-12)
+    assert result["backend"]["mode"] == "protocol_b"
+    assert result["backend"]["regions"][REGION]["yhat_source"] == "engine"
+    # 反馈仍只写一次
+    assert recorder.count("feedback_loop") == 1
+
+
+def test_default_run_passes_only_release_approved_candidates_to_protocol_b(monkeypatch, tmp_path):
+    """Task 8.1：默认路径不得把未完成服务器验收的深度候选交给预测池。"""
+    monkeypatch.delenv("MODELCOMBINE_PIPELINE_BACKEND", raising=False)
+    recorder = _Recorder()
+    pipeline, *_ = _install_pipeline(monkeypatch, tmp_path, recorder)
+
+    pipeline.run_prediction_pipeline()
+
+    bundle_call = next(details for name, details in recorder.calls if name == "build_region_prediction_bundle")
+    assert {"informer", "autoformer", "powergpt"}.isdisjoint(bundle_call["candidate_models"])
+
+
+def test_default_run_raises_instead_of_silently_using_combinator(monkeypatch, tmp_path):
+    """默认路径下 Protocol B 失败必须报错，禁止静默回退到旧引擎。"""
+    monkeypatch.delenv("MODELCOMBINE_PIPELINE_BACKEND", raising=False)
+    recorder = _Recorder()
+    pipeline, *_ = _install_pipeline(monkeypatch, tmp_path, recorder)
+
+    class _BoomAdapter:
+        def select(self, *a, **k):
+            raise RuntimeError("protocol b exploded under new default")
+
+    monkeypatch.setattr(pipeline_main, "DemoProtocolBAdapter", _BoomAdapter, raising=False)
+
+    with pytest.raises(RuntimeError, match="protocol b exploded under new default"):
+        pipeline.run_prediction_pipeline()
+
+    assert recorder.count("fit_and_predict_region") == 0
+    assert recorder.count("feedback_loop") == 0
+
+
+def test_model_info_records_actual_backend_and_fallback_state(monkeypatch, tmp_path):
+    """model_info.json 必须记录实际后端、是否影子、是否回退与 trace 路径。"""
+    monkeypatch.delenv("MODELCOMBINE_PIPELINE_BACKEND", raising=False)
+    recorder = _Recorder()
+    pipeline, *_ = _install_pipeline(monkeypatch, tmp_path, recorder)
+
+    pipeline.run_prediction_pipeline()
+
+    info = json.loads((tmp_path / "reports" / "model_info.json").read_text(encoding="utf-8"))
+    backend = info.get("backend")
+    assert backend is not None, "model_info.json 必须记录 backend 信息"
+    assert backend["mode"] == "protocol_b"
+    assert backend["is_shadow"] is False
+    assert backend["fell_back_to_combinator"] is False
+    assert REGION in backend["regions"]
+    assert "trace_path" in backend["regions"][REGION]

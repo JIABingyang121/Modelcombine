@@ -36,6 +36,8 @@ def main():
     try:
         # 创建预测流水线
         pipeline = PowerPredictionPipeline()
+        print(f"决策后端: {pipeline.backend_mode}（默认 protocol_b；"
+              f"设置 MODELCOMBINE_PIPELINE_BACKEND=combinator 可显式回退到旧引擎）")
         
         # 运行完整流水线
         results = pipeline.run_prediction_pipeline()
@@ -57,7 +59,14 @@ def main():
             print(f"\n结果文件保存在: {project_root}/reports/")
             print("  - predictions.csv: 详细预测结果")
             print("  - report.json: 完整评估报告")
-            print("  - model_info.json: 模型配置信息")
+            print("  - model_info.json: 模型配置信息（含实际决策后端与 trace 路径）")
+            backend = results.get("backend") or {}
+            if backend:
+                print(f"\n本次决策后端: {backend.get('mode')}")
+                for region, info in (backend.get("regions") or {}).items():
+                    print(f"  - {region}: 输出来自 {info.get('final_output_from')}"
+                          + (f"，yhat_source={info.get('yhat_source')}" if info.get("yhat_source") else "")
+                          + (f"，trace={info.get('trace_path')}" if info.get("trace_path") else ""))
             print("=" * 60)
         else:
             print(f"预测失败: {results['error']}")

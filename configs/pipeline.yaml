@@ -55,6 +55,17 @@ features:
     valley_hours: [0, 1, 2, 3, 4, 5]
     work_hours: [9, 10, 11, 12, 13, 14, 15, 16, 17]
 
+# 决策后端（Task 8：默认已由旧 combinator 切换为 Protocol B / System B）
+# 运行时以环境变量 MODELCOMBINE_PIPELINE_BACKEND 为准，此处仅记录默认值与含义：
+#   protocol_b        默认。System B 为唯一决策主干。
+#   protocol_b_shadow 两套都跑，最终输出仍取 combinator，仅用于审计对照。
+#   combinator        迁移期显式回退，需主动设置；旧 System A 决策引擎，不再接受新功能。
+# 未知取值直接报错，不做静默回退；Protocol B 运行异常同样直接失败。
+backend:
+  default: "protocol_b"
+  legacy_fallback: "combinator"
+  env_var: "MODELCOMBINE_PIPELINE_BACKEND"
+
 selection:
   use_rules_first: true
   combiner: "weighted"  # weighted 或 stacking
@@ -98,8 +109,22 @@ models:
     reg_alpha: 0.1
     reg_lambda: 1.0
     random_state: 42
-    n_jobs: -1
+    # 服务器 Task 8.1 基准（1,500 行、400 trees、CPU deterministic）中，1 线程
+    # 约 0.46s 且两次哈希一致；-1 会占满约 176 核并使同类测试超过 5 分钟。
+    n_jobs: 1
     verbose: -1
+    # Task 8.1 可重复性：LightGBM 官方说明 deterministic=true 仅适用于 CPU，
+    # GPU 训练不保证重复运行一致，故默认发布路径显式固定 CPU。
+    # 这里写死 device_type 还有一个作用：LGBMModel 仅在参数未指定时才按
+    # MODELCOMBINE_USE_GPU(默认 True) 追加 device_type=gpu，显式给出即可关闭该行为。
+    # deterministic 需配合 force_col_wise/force_row_wise 之一才生效。
+    device_type: "cpu"
+    deterministic: true
+    force_col_wise: true
+    seed: 42
+    bagging_seed: 42
+    feature_fraction_seed: 42
+    data_random_seed: 42
   catboost_reg:
     depth: 8
     learning_rate: 0.03
@@ -108,6 +133,11 @@ models:
     random_state: 42
     verbose: False
     thread_count: -1
+  seasonal_naive:
+    # 季节性朴素基线：用上一个周期的观测直接外推。小时级数据 -> 24。
+    # 此前只在 selection.weights 出现、models: 段缺失，导致 train_baselines
+    # 从不训练它，九任务基线里 seasonal naive 实际缺席。
+    seasonal_period: 24
   arima:
     order: [1, 1, 1]
     seasonal_order: [1, 1, 1, 24]

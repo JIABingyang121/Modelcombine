@@ -136,6 +136,12 @@ class ProtocolBBackend(CombinationBackend):
 class CombinatorBackend(CombinationBackend):
     """Adapter around the legacy PowerModelCombinator.
 
+    **迁移期兼容实现（Task 8 起）**：默认决策路径已切换到 `ProtocolBBackend`。
+    本类仅在用户显式设置 `MODELCOMBINE_PIPELINE_BACKEND=combinator` 时启用，
+    用途限于迁移期回退与历史对照。**禁止继续向旧引擎增加功能**；新的调度能力
+    一律实现在 System B 主干上。计划在两个连续验收版本通过、并经用户再次确认后
+    随 `PowerModelCombinator` 一并删除（Task 9）。
+
     This is a golden-reference bridge: it delegates to select_optimal_path and normalizes the
     result without changing the old combinator behavior.
     """

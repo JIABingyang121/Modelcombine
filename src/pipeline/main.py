@@ -57,15 +57,15 @@ _VALID_BACKEND_MODES = (BACKEND_COMBINATOR, BACKEND_PROTOCOL_B_SHADOW, BACKEND_P
 def resolve_backend_mode(value: Optional[str] = None) -> str:
     """解析 `MODELCOMBINE_PIPELINE_BACKEND`。
 
-    - `combinator`（默认）：旧路径。
-    - `protocol_b_shadow`：两套都跑，最终输出仍取 combinator。
-    - `protocol_b`：最终输出取 Protocol B。
+    - `protocol_b`（**默认，Task 8 起**）：System B 为唯一决策主干。
+    - `protocol_b_shadow`：两套都跑，最终输出仍取 combinator（审计用）。
+    - `combinator`：**迁移期显式回退**，必须由用户主动设置，不再是隐式默认。
 
     未知值直接报错——静默回退会让"以为在跑 Protocol B、实际跑的是旧引擎"这类
     误判混进实验记录，这正是本计划要终结的问题。
     """
     raw = value if value is not None else os.environ.get("MODELCOMBINE_PIPELINE_BACKEND", "")
-    mode = (raw or "").strip().lower() or BACKEND_COMBINATOR
+    mode = (raw or "").strip().lower() or BACKEND_PROTOCOL_B
     if mode not in _VALID_BACKEND_MODES:
         raise ValueError(
             f"MODELCOMBINE_PIPELINE_BACKEND={raw!r} is not a valid backend mode; "
@@ -804,8 +804,19 @@ class PowerPredictionPipeline:
         import time
 
         pipe_cfg = self.config["pipeline"]
-        all_models = model_registry.get_available_models()
-        candidate_models = [m for m in all_models if "blender" not in m.lower()]
+        # Task 8.1：默认候选池只收已获准发布的模型；被排除者原因见
+        # src/utils/determinism.DEFAULT_CANDIDATE_EXCLUSIONS，并写入 trace/报告，
+        # 不做静默剔除。
+        from ..utils.determinism import default_candidate_models, default_exclusion_reason
+
+        candidate_models = default_candidate_models(model_registry.get_available_models())
+        excluded = {
+            m: default_exclusion_reason(m)
+            for m in model_registry.get_available_models()
+            if default_exclusion_reason(m)
+        }
+        if excluded:
+            print(f"   [determinism] 默认候选池已排除未获准发布的模型: {sorted(excluded)}")
         validation_days = int(pipe_cfg["data"].get("validation_days", 30))
 
         start = time.perf_counter()
@@ -838,6 +849,7 @@ class PowerPredictionPipeline:
 
         performance = {
             "_profiling": {"elapsed_seconds": round(elapsed_ms / 1000.0, 4)},
+            "_determinism": {"excluded_models": excluded},
             "_protocol_b": {
                 "strategy": adapter_result.get("strategy"),
                 "models": adapter_result.get("models"),
@@ -1062,7 +1074,13 @@ class PowerPredictionPipeline:
         backend_report: Dict[str, Any] = {"mode": backend_mode, "regions": {}}
         run_combinator = backend_mode in (BACKEND_COMBINATOR, BACKEND_PROTOCOL_B_SHADOW)
         run_protocol_b = backend_mode in (BACKEND_PROTOCOL_B, BACKEND_PROTOCOL_B_SHADOW)
-        print(f"   决策后端: {backend_mode}")
+        _explicit = bool(os.environ.get("MODELCOMBINE_PIPELINE_BACKEND", "").strip())
+        print(
+            f"   决策后端: {backend_mode}"
+            f"（{'显式指定' if _explicit else '默认'}；默认值为 {BACKEND_PROTOCOL_B}）"
+        )
+        if backend_mode == BACKEND_COMBINATOR:
+            print("   [注意] 正在使用迁移期回退路径 combinator（旧 System A 决策引擎）")
 
         for i, region in enumerate(regions, 1):
             print(f"\n处理区域 {i}/{len(regions)}: {region}")
@@ -1110,6 +1128,9 @@ class PowerPredictionPipeline:
                 path_id_map[region] = protocol_b_result.get("path_id")
                 region_report: Dict[str, Any] = {
                     "final_output_from": "protocol_b",
+                    "trace_path": str(
+                        Path(PROJECT_ROOT) / "reports" / "traces" / f"protocol_b_demo_{region}.json"
+                    ),
                     "yhat_source": protocol_b_result.get("yhat_source"),
                     "strategy": protocol_b_result.get("strategy"),
                     "models": protocol_b_result.get("models"),
@@ -1124,6 +1145,9 @@ class PowerPredictionPipeline:
                 if backend_mode == BACKEND_PROTOCOL_B_SHADOW:
                     # 影子模式只产审计：最终输出仍是 combinator，逐值不受影响。
                     region_report["yhat_source"] = protocol_b_result.get("yhat_source")
+                    region_report["trace_path"] = str(
+                        Path(PROJECT_ROOT) / "reports" / "traces" / f"protocol_b_demo_{region}.json"
+                    )
                     region_report["comparison"] = build_shadow_comparison(
                         combinator_result=combinator_result,
                         protocol_b_result={
@@ -1176,7 +1200,19 @@ class PowerPredictionPipeline:
                 "test_days": pipe_cfg["data"]["test_days"]
             },
             "regions_processed": regions,
-            "available_models": model_registry.get_available_models()
+            "available_models": model_registry.get_available_models(),
+            # Task 8：记录本次实际使用的决策后端。fell_back_to_combinator 只在用户
+            # 显式设置 combinator 时为真——Protocol B 失败会直接抛错，不存在静默回退。
+            "backend": {
+                "mode": backend_mode,
+                "default_mode": BACKEND_PROTOCOL_B,
+                "is_shadow": backend_mode == BACKEND_PROTOCOL_B_SHADOW,
+                "fell_back_to_combinator": backend_mode == BACKEND_COMBINATOR,
+                "explicitly_set": bool(
+                    os.environ.get("MODELCOMBINE_PIPELINE_BACKEND", "").strip()
+                ),
+                "regions": backend_report.get("regions", {}),
+            },
         }
         save_json(model_info, os.path.join(out_dir, "model_info.json"))
         

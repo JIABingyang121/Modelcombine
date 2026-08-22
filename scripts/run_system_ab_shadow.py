@@ -479,6 +479,7 @@ def build_task_matrix(
         "metadata": {
             "filter": filter_meta,
             "safe_models": list(safe_models),
+            "common_base_models": [m for m in model_cols if m in base_models],
             "eligible_models": list(safe_models),
             "eligible_filter_reasons": eligible_filter_reasons,
             "model_valid_ratio": model_valid_ratio,
@@ -900,6 +901,7 @@ def run_task(
     run_combinator: bool = True,
     combinator_timeout_seconds: float = 900.0,
     feature_root: Optional[Path] = None,
+    baseline_provenance: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     _seed_everything(seed)
     task_out = out_root / dataset / f"h{horizon}"
@@ -922,12 +924,34 @@ def run_task(
             filter_threshold=filter_threshold,
         )
         matrix_seconds = time.perf_counter() - t0
+        if baseline_provenance is not None:
+            from scripts.train_baselines import verify_task_artifacts
+
+            # 验证全部已加载的基础候选，不只验证过滤后的最终 safe_models：
+            # 被过滤的旧 CSV 也可能改变过滤阈值，不能让它绕过来源检查。
+            verified_models = list(matrix["metadata"]["common_base_models"])
+            # seasonal_naive 被 _build_kg_model_candidates() 从基础候选中剔除、
+            # 作为 frozen expert 单独加载，因此不会出现在 common_base_models 里。
+            # 但它现在由 train_baselines 按配置真实训练并产出带哈希的产物
+            # （见 16d2c0a），只要本轮确实加载了它，就必须一并核对来源，
+            # 否则它的预测可以来自与本轮基线无关的旧 CSV。
+            frozen_naive = (matrix["metadata"].get("frozen_naive") or {})
+            if frozen_naive.get("loaded") and "seasonal_naive" not in verified_models:
+                verified_models.append("seasonal_naive")
+            verify_task_artifacts(
+                baseline_provenance,
+                pred_root=pred_root,
+                dataset=dataset,
+                horizon=horizon,
+                models=verified_models,
+            )
         candidate_audit = build_candidate_outcome_audit(matrix["metadata"])
         record["matrix"] = {
             "elapsed_seconds": matrix_seconds,
             "n_val": int(len(matrix["df_val_kg"])),
             "n_test": int(len(matrix["df_test_kg"])),
             "safe_models": list(matrix["safe_models"]),
+            "common_base_models": list(matrix["metadata"]["common_base_models"]),
             **candidate_audit,
             "data_sha_val": _data_sha(matrix["df_val_kg"]),
             "data_sha_test": _data_sha(matrix["df_test_kg"]),
@@ -1495,6 +1519,10 @@ def validate_shadow_report(
     for dep in KEY_DEPENDENCIES:
         if dep not in env:
             raise ValueError(f"_meta.environment missing dependency version {dep}")
+    if meta.get("baseline_provenance_required"):
+        provenance = meta.get("baseline_provenance")
+        if not isinstance(provenance, Mapping) or provenance.get("status") != "verified":
+            raise ValueError("_meta.baseline_provenance is required and must be verified")
 
     recorded_gates = report.get("quality_gates")
     if not isinstance(recorded_gates, Mapping):
@@ -1527,6 +1555,17 @@ def main() -> int:
     parser.add_argument("--horizons", nargs="*", type=int, default=None)
     parser.add_argument("--filter-threshold", type=float, default=DEFAULT_FILTER_THRESHOLD)
     parser.add_argument("--seed", type=int, default=int(os.environ.get("MODELCOMBINE_SEED", "42")))
+    parser.add_argument(
+        "--pipeline-config",
+        type=Path,
+        default=PROJECT_ROOT / "configs" / "pipeline.yaml",
+        help="要求基线来源与此默认入口配置一致",
+    )
+    parser.add_argument(
+        "--require-baseline-provenance",
+        action="store_true",
+        help="仅接受带有当前 pipeline.yaml 哈希和候选种子策略的基线预测",
+    )
     parser.add_argument("--skip-combinator", action="store_true", help="跳过旧 System A 参考（默认运行）")
     parser.add_argument("--combinator-timeout", type=float, default=900.0)
     parser.add_argument("--out-root", type=Path, default=PROJECT_ROOT / "result" / "ab_convergence" / "shadow_9tasks")
@@ -1537,6 +1576,23 @@ def main() -> int:
     feature_root = args.feature_root if args.feature_root.is_absolute() else PROJECT_ROOT / args.feature_root
     output = args.output if args.output.is_absolute() else PROJECT_ROOT / args.output
     out_root = args.out_root if args.out_root.is_absolute() else PROJECT_ROOT / args.out_root
+    pipeline_config = (
+        args.pipeline_config
+        if args.pipeline_config.is_absolute()
+        else PROJECT_ROOT / args.pipeline_config
+    )
+    baseline_provenance: Dict[str, Any] = {"status": "not_required"}
+    if args.require_baseline_provenance:
+        from scripts.train_baselines import load_verified_baseline_provenance
+
+        try:
+            baseline_provenance = {
+                "status": "verified",
+                **load_verified_baseline_provenance(pred_root, pipeline_config),
+            }
+        except ValueError as exc:
+            print(f"[validate] baseline provenance failed: {exc}")
+            return 2
 
     selected_datasets = set(args.datasets) if args.datasets else set(TASK_DATASETS)
     selected_horizons = set(args.horizons) if args.horizons else set(TASK_HORIZONS)
@@ -1570,6 +1626,7 @@ def main() -> int:
             run_combinator=not args.skip_combinator,
             combinator_timeout_seconds=args.combinator_timeout,
             feature_root=feature_root,
+            baseline_provenance=(baseline_provenance if args.require_baseline_provenance else None),
         )
         print(
             f"  status={record['status']} test_mae_on={record.get('test_mae_on')} "
@@ -1612,6 +1669,9 @@ def main() -> int:
             "python": sys.executable,
             "environment": _collect_dependency_versions(),
             "pred_root": str(pred_root),
+            "pipeline_config": str(pipeline_config),
+            "baseline_provenance_required": args.require_baseline_provenance,
+            "baseline_provenance": baseline_provenance,
             "raw_root": str(raw_root),
             "out_root": str(out_root),
             "filter_threshold": args.filter_threshold,

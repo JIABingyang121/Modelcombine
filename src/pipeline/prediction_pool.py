@@ -23,6 +23,7 @@ import numpy as np
 import pandas as pd
 
 from ..features.build_features import build_matrix
+from ..utils.determinism import global_seed, seed_for_candidate
 
 # build_matrix 的目标列；raw frame 需要额外保留 timestamp 供 Protocol B 对齐。
 _TARGET_COL = "load"
@@ -149,12 +150,16 @@ def build_region_prediction_bundle(
     for model_id in candidate_models:
         params = dict(params_map.get(model_id, {}))
         try:
+            # 每个候选的每个训练阶段前重置随机源（Task 8.1）：否则前一个候选
+            # 消耗了多少随机数会改变后一个候选的结果，矩阵整体不可重复。
+            seed_for_candidate(model_id, stage="val")
             # 第一轮：只用 fit 段训练 -> validation 预测（validation 对该模型是"未来"）。
             val_model = registry.create(model_id, **params)
             val_model.fit(X_fit, y_fit)
             val_pred = np.asarray(val_model.predict(X_val), dtype=float)
 
             # 第二轮：在完整 train 上重训 -> test 预测；test 标签始终不参与。
+            seed_for_candidate(model_id, stage="test")
             test_model = registry.create(model_id, **params)
             test_model.fit(X_train, y_train)
             test_pred = np.asarray(test_model.predict(X_test), dtype=float)
@@ -205,6 +210,10 @@ def build_region_prediction_bundle(
         "failed_models": failed_models,
         "fit_end": str(pd.to_datetime(fit_df["timestamp"]).max()),
         "val_start": str(pd.to_datetime(val_df["timestamp"]).min()),
+        "determinism": {
+            "global_seed": global_seed(),
+            "candidate_seed_strategy": "sha256(global_seed|model_id|stage)",
+        },
     }
 
     return RegionPredictionBundle(

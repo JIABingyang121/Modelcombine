@@ -265,12 +265,13 @@ def test_backend_trace_records_guard_removed_models_as_rejections(monkeypatch, t
 # --- Step 3/4: 三态后端开关与影子对照 ----------------------------------------
 
 
-def test_backend_mode_defaults_to_combinator(monkeypatch):
+def test_backend_mode_defaults_to_protocol_b(monkeypatch):
+    """Task 8：默认后端已由 combinator 切换为 protocol_b。"""
     from src.pipeline.main import resolve_backend_mode
 
     monkeypatch.delenv("MODELCOMBINE_PIPELINE_BACKEND", raising=False)
 
-    assert resolve_backend_mode() == "combinator"
+    assert resolve_backend_mode() == "protocol_b"
 
 
 @pytest.mark.parametrize("mode", ["combinator", "protocol_b_shadow", "protocol_b"])
