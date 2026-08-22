@@ -277,12 +277,18 @@ def load_verified_baseline_provenance(pred_root: Path, pipeline_config: Path) ->
     return payload
 
 
-def _artifact_file_names(horizon: int, model_id: str) -> Tuple[str, str, str]:
-    return (
+def _artifact_file_names(horizon: int, model_id: str) -> Tuple[str, ...]:
+    names = [
         f"val_pred_h{horizon}_{model_id}.csv",
         f"test_pred_h{horizon}_{model_id}.csv",
         f"model_meta_h{horizon}_{model_id}.json",
-    )
+    ]
+    if model_id == "seasonal_naive":
+        # 扩展候选安全门（_load_extended_pool_for_split）按 val_pred_*.meta.json
+        # 判定 val_eval_mode；缺失会被判为 unknown 并拦截。seasonal_naive 作为
+        # frozen expert 单独加载，需要这份 sidecar，且必须纳入 provenance 哈希。
+        names.append(f"val_pred_h{horizon}_{model_id}.meta.json")
+    return tuple(names)
 
 
 def verify_task_artifacts(
@@ -455,6 +461,27 @@ def run_dataset(
                         ensure_ascii=False,
                         indent=2,
                     )
+                if mid == "seasonal_naive":
+                    # 扩展候选安全门按 val_pred_h*_<model>.meta.json 判定
+                    # val_eval_mode；缺失会被判为 unknown 并拦截。seasonal_naive
+                    # 是确定性的 frozen expert，显式记录 deterministic，并随
+                    # _artifact_file_names 一并纳入 provenance 逐文件哈希。
+                    val_meta_path = out_root / name / f"val_pred_h{h}_{mid}.meta.json"
+                    with val_meta_path.open("w", encoding="utf-8") as mf:
+                        json.dump(
+                            {
+                                "dataset": name,
+                                "horizon": int(h),
+                                "model": mid,
+                                "val_eval_mode": "deterministic",
+                                "source": "train_baselines",
+                                "candidate_seed_strategy": CANDIDATE_SEED_STRATEGY,
+                                "training_seed": training_seed,
+                            },
+                            mf,
+                            ensure_ascii=False,
+                            indent=2,
+                        )
                 artifact_names = _artifact_file_names(h, mid)
                 artifact_paths = [out_root / name / file_name for file_name in artifact_names]
                 results_h["artifacts"].append(

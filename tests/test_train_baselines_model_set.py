@@ -9,7 +9,7 @@
 **同时暴露的测试盲区**：`tests/test_pipeline_model_params_complete.py` 只校验
 "配置里声明了"，全绿却测不到"训练时真的会跑"。本模块补的正是那条集成路径——
 断言 `run_dataset` 训练的模型集合等于传入的配置集合，并真实产出
-val/test/meta 三个文件与可校验的哈希。
+val/test/meta 文件（seasonal_naive 还产出 val sidecar）与可校验的哈希。
 
 这里用真实模型（seasonal_naive + xgboost_reg，均为秒级），不用假对象：
 被测的是"训练集合与产物"，而项目已有"假对象测试全绿、真实路径空转"的教训。
@@ -77,7 +77,7 @@ def test_run_dataset_trains_exactly_the_configured_model_set(dataset_root):
 
 
 def test_seasonal_naive_artifacts_are_generated_and_hashable(dataset_root):
-    """seasonal_naive 必须真实产出 val/test/meta 三个文件，并带可校验哈希。"""
+    """seasonal_naive 必须真实产出 val/test/meta/sidecar 四个文件，并带可校验哈希。"""
     feature_root, out_root = dataset_root
 
     results = tb.run_dataset(
@@ -129,6 +129,39 @@ def test_provenance_verification_covers_seasonal_naive(dataset_root):
     # 篡改其中一个 seasonal_naive 产物后必须被发现
     victim = out_root / "pjm" / tb._artifact_file_names(1, "seasonal_naive")[0]
     victim.write_text(victim.read_text(encoding="utf-8") + "\n# tampered\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="seasonal_naive"):
+        tb.verify_task_artifacts(
+            provenance, pred_root=out_root, dataset="pjm", horizon=1,
+            models=sorted(CONFIGURED),
+        )
+
+
+def test_seasonal_naive_sidecar_tamper_is_detected(dataset_root):
+    """val sidecar 纳入 provenance 哈希后，篡改 val_eval_mode 必须被来源校验发现。"""
+    feature_root, out_root = dataset_root
+
+    results = tb.run_dataset(
+        name="pjm",
+        feature_root=feature_root,
+        target_col="load",
+        horizons=[1],
+        out_root=out_root,
+        max_rows=None,
+        model_params=CONFIGURED,
+    )
+    provenance = {"artifacts": results[1]["artifacts"]}
+
+    meta_name = "val_pred_h1_seasonal_naive.meta.json"
+    assert meta_name in tb._artifact_file_names(1, "seasonal_naive")
+    meta_path = out_root / "pjm" / meta_name
+    assert meta_path.exists(), "train_baselines 未生成 seasonal_naive 的 val sidecar"
+
+    # 把 deterministic 篡改成 unsafe 模式，必须被逐文件哈希校验发现
+    payload = json.loads(meta_path.read_text(encoding="utf-8"))
+    assert payload.get("val_eval_mode") == "deterministic"
+    payload["val_eval_mode"] = "in_sample"
+    meta_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
     with pytest.raises(ValueError, match="seasonal_naive"):
         tb.verify_task_artifacts(
