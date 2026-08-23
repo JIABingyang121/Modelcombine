@@ -790,6 +790,7 @@ class PowerPredictionPipeline:
         region: str,
         train: pd.DataFrame,
         test: pd.DataFrame,
+        model_graph: Optional[ModelGraph] = None,
     ) -> Tuple[pd.DataFrame, Dict[str, Any], Dict[str, Any]]:
         """Protocol B 独立流程：先生成候选预测矩阵，再交统一 solver 组合。
 
@@ -832,7 +833,9 @@ class PowerPredictionPipeline:
         # Protocol B 失败时直接抛出：静默切回 combinator 会让"以为在跑 B、
         # 实际是旧引擎"混进实验记录，这正是本计划要终结的问题。
         adapter_result = DemoProtocolBAdapter().select(
-            bundle, region=region, horizon=1, trace_path=trace_path
+            bundle, region=region, horizon=1, trace_path=trace_path,
+            # §11#7：把生产图谱传下去，否则关系强度在默认 run.py 路径上恒为中性
+            model_graph=model_graph,
         )
         elapsed_ms = (time.perf_counter() - start) * 1000.0
 
@@ -1118,13 +1121,17 @@ class PowerPredictionPipeline:
             protocol_b_performance = None
             if run_protocol_b:
                 protocol_b_pred, protocol_b_performance, protocol_b_result = (
-                    self._predict_region_with_protocol_b(region, train, test)
+                    self._predict_region_with_protocol_b(
+                        region, train, test, model_graph=model_graph
+                    )
                 )
 
             if backend_mode == BACKEND_PROTOCOL_B:
                 region_pred, region_performance = protocol_b_pred, protocol_b_performance
-                # Protocol B 模式下由其自身的路径标识参与反馈
-                scenario_id_map[region] = f"protocol_b::{region}"
+                # 用 Protocol B 上下文的真实 scenario_id 参与反馈：
+                # 此前写死 protocol_b::{region}，与消费侧按签名派生的场景 id
+                # 不一致，反馈边永远落在一个没人读的场景上。
+                scenario_id_map[region] = protocol_b_result.get("scenario_id")
                 path_id_map[region] = protocol_b_result.get("path_id")
                 region_report: Dict[str, Any] = {
                     "final_output_from": "protocol_b",

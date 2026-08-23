@@ -159,7 +159,7 @@ def _install_pipeline(monkeypatch, tmp_path, recorder, *, protocol_b_yhat=None):
     pb_yhat = protocol_b_yhat if protocol_b_yhat is not None else np.linspace(900.0, 910.0, len(test))
 
     class _FakeAdapter:
-        def select(self, bundle, *, region, horizon=1, trace_path=None):
+        def select(self, bundle, *, region, horizon=1, trace_path=None, model_graph=None):
             recorder.log("protocol_b_adapter.select", region=region)
             return {
                 "models": ["m1"],
@@ -177,6 +177,7 @@ def _install_pipeline(monkeypatch, tmp_path, recorder, *, protocol_b_yhat=None):
                 "linear_reconstruction_match": False,
                 "reconcile_note": None,
                 "feedback_store": object(),
+                "scenario_id": f"scenario::{region}",
                 "raw": {},
             }
 
@@ -280,14 +281,15 @@ def test_protocol_b_mode_rejects_linear_reconstruction_fallback(monkeypatch, tmp
     pipeline, *_ = _install_pipeline(monkeypatch, tmp_path, recorder)
 
     class _LinearAdapter:
-        def select(self, bundle, *, region, horizon=1, trace_path=None):
+        def select(self, bundle, *, region, horizon=1, trace_path=None, model_graph=None):
             return {
                 "models": ["m1"], "weights": {"m1": 1.0}, "strategy": "B_pred_features",
                 "path_id": "B_pred_features", "yhat": np.zeros(len(bundle.df_test)),
                 "yhat_source": "linear_reconstruction", "trace": None, "mae": 1.0,
                 "protocol_b_mae": 1.0, "mae_delta": 0.0, "mae_matches_protocol_b": True,
                 "linear_reconstruction_mae": 1.0, "linear_reconstruction_match": True,
-                "reconcile_note": None, "feedback_store": None, "raw": {},
+                "reconcile_note": None, "feedback_store": None,
+                "scenario_id": f"scenario::{region}", "raw": {},
             }
 
     monkeypatch.setattr(pipeline_main, "DemoProtocolBAdapter", _LinearAdapter, raising=False)

@@ -48,6 +48,15 @@ from ..core.solver import build_protocol_b_context, build_solver
 MAE_RECONCILE_TOLERANCE = 1e-8
 
 
+def _temporal_relations_enabled() -> bool:
+    """与系统 A 既有开关同名，默认关闭。"""
+    import os
+
+    return os.environ.get(
+        "MODELCOMBINE_PIPELINE_ENABLE_TEMPORAL_RELATIONS", ""
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
+
 class DemoProtocolBAdapter:
     """在 demo 数据上调用统一 solver 的 Protocol B 后端。"""
 
@@ -72,6 +81,7 @@ class DemoProtocolBAdapter:
         region: str,
         horizon: int = 1,
         trace_path: Optional[Path] = None,
+        model_graph: Any = None,
     ) -> Dict[str, Any]:
         """对单个区域跑一次 Protocol B 决策。
 
@@ -95,8 +105,18 @@ class DemoProtocolBAdapter:
             # 显式要求引擎交出真实预测：线性重建覆盖不了所有可达分支。
             return_predictions=True,
         )
+        # §11#7：把关系图交给 solver。不传时 ctx.model_graph 为 None，
+        # 引擎内关系项恒为中性，行为与接入前一致。
+        ctx.model_graph = model_graph
 
-        solver = build_solver("protocol_b")
+        # Hawkes 反馈闭环（默认关闭，与既有实验开关一致）：开启时用**同一张图**
+        # 挂载 temporal stage，本轮的选择/拒绝事件才会写回关系边，供下一轮消费。
+        # 不开启时不挂载，行为与接入前完全一致。
+        solver_kwargs: Dict[str, Any] = {}
+        if model_graph is not None and _temporal_relations_enabled():
+            solver_kwargs["temporal_relation_graph"] = model_graph
+            solver_kwargs["temporal_relation_create_missing"] = True
+        solver = build_solver("protocol_b", **solver_kwargs)
         result, trace = solver.solve(ctx, trace_path=trace_path)
 
         models: List[str] = list(result.get("models") or [])
@@ -178,6 +198,9 @@ class DemoProtocolBAdapter:
             # 返回实例本身供调用方做同一性判断；id() 在对象被回收后会被复用，
             # 不能作为"两次调用用了不同实例"的证据。
             "feedback_store": feedback_store,
+            # 供 run.py 反馈阶段使用：必须与消费侧按签名派生的场景 id 完全一致，
+            # 否则反馈边会落在一个没人读的场景上。
+            "scenario_id": ctx.scenario.scenario_id,
             "raw": result.get("raw"),
         }
 

@@ -26,6 +26,8 @@ def _task(
 ) -> dict:
     return {
         "status": "ok",
+        # §11#7 关系证据门槛：成功任务须记录实际消费到的关系边
+        "relation_strength_edges_found": ["lgbm_reg"],
         "dataset": dataset,
         "horizon": horizon,
         "n_val": n_val,
@@ -45,6 +47,25 @@ def _task(
         "test_mae_on": test_mae_on,
         "test_mae_off": test_mae_off,
         "test_mae_delta": test_mae_on - test_mae_off,
+        # §11#7 关系强度对照臂：与 on 臂只差关系项（两臂 interaction 均开）
+        "test_mae_relation_neutral": test_mae_on + 0.1,
+        "test_mae_relation_delta": -0.1,
+        "relation_warmup": {
+            "scenario_id": f"{dataset}_h{horizon}",
+            "selected_models": ["m1", "m2"],
+            "edges_written": ["m1", "m2"],
+            "edges_consumed": [],
+        },
+        "relation_contrast": {
+            "enabled_mae": test_mae_on,
+            "neutral_mae": test_mae_on + 0.1,
+            "delta": -0.1,
+            "enabled_models": ["m1", "m2"],
+            "neutral_models": ["m1"],
+            "models_changed": True,
+            "enabled_edges_found": ["lgbm_reg"],
+            "neutral_edges_found": [],
+        },
         "protocol": "kg_protocol_b",
         "fallback_target": None,
         "selected_models": ["m1", "m2"],

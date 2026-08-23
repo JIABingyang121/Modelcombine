@@ -239,17 +239,20 @@ def events_from_solver_result(
             evidence_ref=event_ref,
             metadata={"selected": final_selection},
         ))
-    else:
-        for model_id in final_selection:
-            events.append(RelationEvent(
-                source=event_source,
-                target=model_id,
-                relation_type="selected_model",
-                timestamp=event_timestamp,
-                polarity="positive",
-                magnitude=abs(float(final_weights.get(model_id, 1.0))),
-                evidence_ref=event_ref,
-            ))
+    # 逐模型的 scenario->model 边**始终**产出，且关系类型与 selected_target 分支
+    # 保持一致（§11#7）：候选评分消费的正是 scenario->model 的 recommended_for。
+    # 原实现只在没有 path_id 时才建逐模型边，且把关系类型硬编码成
+    # "selected_model"，与消费者不匹配，闭环因此断裂。
+    for model_id in final_selection:
+        events.append(RelationEvent(
+            source=event_source,
+            target=model_id,
+            relation_type=selected_relation_type,
+            timestamp=event_timestamp,
+            polarity="positive",
+            magnitude=abs(float(final_weights.get(model_id, 1.0))),
+            evidence_ref=event_ref,
+        ))
 
     for candidate_id, reason in trace.candidates_rejected.items():
         events.append(RelationEvent(

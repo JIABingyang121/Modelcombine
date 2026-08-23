@@ -270,6 +270,17 @@ PROTOCOL_STEPWISE_MIN_IMPROVEMENT = min(
     max(_env_float("MODELCOMBINE_KG_STEPWISE_MIN_IMPROVEMENT", 0.005), 0.0),
     0.05,
 )
+# 前向逐步选择的"并列"判定容差（相对值）。
+# 依据：候选的 CV MAE 由 fit_ridge_robust 的 lbfgs 迭代解算出（tol=1e-4），
+# 本身只有有限精度，MAE 上由此产生的相对差异约在 1e-6 量级及以下。
+# 小于该容差的差异不代表任何一个候选真的更好，却足以改变最终进入组合的模型，
+# 并造成数十个百分点的 MAE 差异（VIC h=24 实测两种结果相差 49%）。
+# 该值比接受新模型的改进门槛（min_improve_ratio，通常 0.5%~1%）小 4 个数量级，
+# 因此不可能吃掉真实改善。
+PROTOCOL_STEPWISE_TIE_RELATIVE_TOLERANCE = min(
+    max(_env_float("MODELCOMBINE_KG_STEPWISE_TIE_REL_TOL", 1e-6), 0.0),
+    1e-3,
+)
 PROTOCOL_B_FEATURE_DIVERSITY_WEIGHT = max(
     _env_float("MODELCOMBINE_KG_B_FEATURE_DIVERSITY_WEIGHT", 0.25),
     0.0,
@@ -333,6 +344,15 @@ PROTOCOL_B_MULTI_WINDOW_GUARD_MAX_DEGRADATION = max(
 PROTOCOL_B_MULTI_WINDOW_GUARD_MAJORITY = _env_int(
     "MODELCOMBINE_KG_B_MULTI_WINDOW_GUARD_MAJORITY", 2,
 )
+
+# 关系强度进入 Protocol B 候选评分的权重（§11#7 的落点）。
+# 公式：score += 权重 * (relation_strength - NEUTRAL)，缺省中性 0.5。
+# 图中没有 recommended_for 边时该项恒为 0，行为与接入前完全一致。
+PROTOCOL_B_RELATION_STRENGTH_WEIGHT = max(
+    _env_float("MODELCOMBINE_KG_B_RELATION_STRENGTH_WEIGHT", 0.30), 0.0
+)
+PROTOCOL_B_RELATION_STRENGTH_NEUTRAL = 0.5
+
 
 def _build_kg_model_candidates() -> List[str]:
     # seasonal_naive 作为扩展候选池节点处理，避免其与基础模型预测在

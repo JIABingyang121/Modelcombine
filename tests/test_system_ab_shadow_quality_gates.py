@@ -291,6 +291,8 @@ def _task(dataset: str, horizon: int, *, b_mae: float = 10.0) -> dict:
     matrix_sha = f"sha-{dataset}-h{horizon}"
     return {
         "status": "ok",
+        # §11#7 关系证据门槛：成功任务须记录实际消费到的关系边
+        "relation_strength_edges_found": ["lgbm_reg"],
         "dataset": dataset,
         "horizon": horizon,
         "n_val": 100,

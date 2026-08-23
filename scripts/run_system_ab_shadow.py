@@ -65,11 +65,15 @@ from src.eval.kg.feedback import KGFeedbackStore
 from src.eval.kg.protocol_a import kg_combination_pred_only
 from src.core.solver import build_protocol_b_context, build_solver
 from src.core.index import IndexManager
+from src.graph.model_graph import ModelGraph
 from src.models.uncertainty import UncertaintyGate
 
 import scripts.train_combinations_kg as kg_runner
 
-REPORT_SCHEMA_VERSION = "task7-shadow.3"
+REPORT_SCHEMA_VERSION = "task7-shadow.4"
+# 关系强度对照与关系证据门槛加入后，quality_gates/aggregates 的**结构**变了。
+# 旧版报告（v4d 等）必须仍按旧口径可复核，否则已发布的验收证据会失去可验证性。
+LEGACY_REPORT_SCHEMA_VERSIONS = ("task7-shadow.3",)
 RANDOM_SEED = 42
 INTERACTION_TIE_TOLERANCE = 1e-12
 
@@ -547,6 +551,16 @@ def _interaction_disabled_for(dataset: str):
         protocol_b.PROTOCOL_B_DISABLE_INTERACTION_DATASETS = original_protocol_b
 
 
+def _relation_edges_found(raw: Mapping[str, Any]) -> List[str]:
+    """本次运行实际消费到的关系边（scenario->model 的 recommended_for）。"""
+    meta = (
+        ((raw.get("val") or {}).get("weight_meta") or {})
+        .get("protocol_b_selection_meta", {})
+        .get("relation_strength")
+    ) or {}
+    return list(meta.get("edges_found") or [])
+
+
 def _run_protocol_b_on_matrix(
     *,
     dataset: str,
@@ -554,6 +568,8 @@ def _run_protocol_b_on_matrix(
     matrix: Mapping[str, Any],
     feedback_store: KGFeedbackStore,
     trace_path: Optional[Path],
+    relation_graph: Any = None,
+    write_relations: bool = False,
 ) -> Tuple[Dict[str, Any], Dict[str, Any], Any]:
     """在已构建好的矩阵上运行 Protocol B（solver 路径），开启运行时精确预测。
 
@@ -575,12 +591,20 @@ def _run_protocol_b_on_matrix(
         feedback_store=feedback_store,
         return_predictions=True,
     )
-    solver = build_solver(
-        "protocol_b",
-        manifests=manifests,
-        index_manager=index_manager,
-        uncertainty_gate=UncertaintyGate(threshold=float("inf")),
-    )
+    # §11#7：把关系图交给 solver 的**消费**侧。未传时关系项恒为中性，
+    # v5 将无法评估本功能，故报告层会断言至少有任务 edges_found 非空。
+    ctx.model_graph = relation_graph
+    solver_kwargs: Dict[str, Any] = {
+        "manifests": manifests,
+        "index_manager": index_manager,
+        "uncertainty_gate": UncertaintyGate(threshold=float("inf")),
+    }
+    # 写入侧（Hawkes temporal stage）只在 warm-up 打开。正式测量必须只读：
+    # 一旦测量也写图，任务的运行顺序就会改变关系状态，结果不可复现。
+    if relation_graph is not None and write_relations:
+        solver_kwargs["temporal_relation_graph"] = relation_graph
+        solver_kwargs["temporal_relation_create_missing"] = True
+    solver = build_solver("protocol_b", **solver_kwargs)
     normalized, trace = solver.solve(
         ctx,
         trace_path=str(trace_path) if trace_path is not None else None,
@@ -902,6 +926,7 @@ def run_task(
     combinator_timeout_seconds: float = 900.0,
     feature_root: Optional[Path] = None,
     baseline_provenance: Optional[Mapping[str, Any]] = None,
+    relation_graph: Any = None,
 ) -> Dict[str, Any]:
     _seed_everything(seed)
     task_out = out_root / dataset / f"h{horizon}"
@@ -964,6 +989,37 @@ def run_task(
 
         feedback_store = KGFeedbackStore(learning_rate=0.1)
 
+        # §11#7 关系强度 warm-up（同任务，只写不测）。
+        # 九个任务的 dataset/horizon 不同 -> scenario_id 不同，而消费侧按当前
+        # scenario_id 精确匹配，所以"前一个任务写、后一个任务读"不成立：
+        # PJM h=1 写的边 PJM h=6 根本读不到。闭环只能落在同一个任务上。
+        # warm-up 之后立即停止写入，让正式测量在同一份冻结的关系状态上进行，
+        # 任务运行顺序才不会改变结果。预测矩阵仍只构建一次。
+        if relation_graph is not None:
+            warm_raw, warm_pred, warm_trace = _run_protocol_b_on_matrix(
+                dataset=dataset,
+                horizon=horizon,
+                matrix=matrix,
+                feedback_store=KGFeedbackStore(learning_rate=0.1),
+                trace_path=task_out / "protocol_b_trace_relation_warmup.json",
+                relation_graph=relation_graph,
+                write_relations=True,
+            )
+            warm_scenario_id = getattr(warm_trace, "scenario_id", None)
+            edges_written: List[str] = []
+            if warm_scenario_id and relation_graph.G.has_node(warm_scenario_id):
+                edges_written = sorted(
+                    tgt
+                    for _s, tgt, d in relation_graph.G.out_edges(warm_scenario_id, data=True)
+                    if d.get("edge_type") == "recommended_for"
+                )
+            record["relation_warmup"] = {
+                "scenario_id": warm_scenario_id,
+                "selected_models": list(_protocol_b_split_summary(warm_raw, warm_pred)["models"]),
+                "edges_written": edges_written,
+                "edges_consumed": _relation_edges_found(warm_raw),
+            }
+
         # Protocol B：interaction 开（默认）
         t0 = time.perf_counter()
         raw_on, pred_on, trace_on = _run_protocol_b_on_matrix(
@@ -972,9 +1028,12 @@ def run_task(
             matrix=matrix,
             feedback_store=feedback_store,
             trace_path=task_out / "protocol_b_trace_on.json",
+            relation_graph=relation_graph,
         )
         protocol_b_on_seconds = time.perf_counter() - t0
         b_on = _protocol_b_split_summary(raw_on, pred_on)
+        # §11#7：记录本任务实际消费到的关系边，供"实验是否有效"门槛判定
+        record["relation_strength_edges_found"] = _relation_edges_found(raw_on)
         y_test = np.asarray(matrix["df_test_kg"]["y"].values, dtype=float)
         pred_test_on = (
             np.asarray(b_on["predictions"]["test"], dtype=float)
@@ -1010,6 +1069,7 @@ def run_task(
                 matrix=matrix,
                 feedback_store=KGFeedbackStore(learning_rate=0.1),
                 trace_path=task_out / "protocol_b_trace_off.json",
+                relation_graph=relation_graph,
             )
         protocol_b_off_seconds = time.perf_counter() - t0
         b_off = _protocol_b_split_summary(raw_off, pred_off)
@@ -1038,6 +1098,54 @@ def run_task(
             "elapsed_seconds": protocol_b_off_seconds,
             "trace_stages": [s.get("stage") for s in getattr(trace_off, "stages", [])],
         }
+
+        # §11#7 关系强度对照臂：与上面的 on 臂**只差关系强度项**
+        # （interaction 两臂都开）。现有 on/off 是 interaction 对照，两臂的关系
+        # 强度完全一样，不能冒充关系强度收益对照，故单独跑一次中性臂。
+        record["test_mae_relation_neutral"] = None
+        record["test_mae_relation_delta"] = None
+        record["relation_contrast"] = None
+        if relation_graph is not None:
+            t0 = time.perf_counter()
+            raw_neutral, pred_neutral, _trace_neutral = _run_protocol_b_on_matrix(
+                dataset=dataset,
+                horizon=horizon,
+                matrix=matrix,
+                feedback_store=KGFeedbackStore(learning_rate=0.1),
+                trace_path=task_out / "protocol_b_trace_relation_neutral.json",
+                relation_graph=None,
+                write_relations=False,
+            )
+            relation_neutral_seconds = time.perf_counter() - t0
+            b_neutral = _protocol_b_split_summary(raw_neutral, pred_neutral)
+            pred_test_neutral = (
+                np.asarray(b_neutral["predictions"]["test"], dtype=float)
+                if isinstance(b_neutral["predictions"], dict) and "test" in b_neutral["predictions"]
+                else None
+            )
+            if pred_test_neutral is None:
+                raise RuntimeError(
+                    "Protocol B relation-neutral arm did not return runtime test predictions"
+                )
+            record["test_mae_relation_neutral"] = _safe_mae(y_test, pred_test_neutral)
+            record["test_mae_relation_delta"] = (
+                record["test_mae_on"] - record["test_mae_relation_neutral"]
+            )
+            record["relation_contrast"] = {
+                "arm_definition": (
+                    "enabled=消费当前场景 recommended_for 边；neutral=关系项恒为中性；"
+                    "两臂 interaction 均开启；delta<0 表示关系强度带来收益"
+                ),
+                "enabled_mae": record["test_mae_on"],
+                "neutral_mae": record["test_mae_relation_neutral"],
+                "delta": record["test_mae_relation_delta"],
+                "enabled_models": list(b_on["models"]),
+                "neutral_models": list(b_neutral["models"]),
+                "models_changed": list(b_on["models"]) != list(b_neutral["models"]),
+                "enabled_edges_found": list(record["relation_strength_edges_found"]),
+                "neutral_edges_found": _relation_edges_found(raw_neutral),
+                "elapsed_seconds": relation_neutral_seconds,
+            }
 
         # 逐任务必填的 interaction 字段（来自 interaction 开的那次）
         record["interaction_applied"] = bool(b_on["interaction_applied"])
@@ -1170,31 +1278,48 @@ NUMERIC_AGG_FIELDS = (
     "cv_oof_coverage",
 )
 
+# 关系强度对照（schema >= task7-shadow.4）。与 interaction 对照分开统计：
+# 两者的对照变量不同，混在一起会让"关系强度收益"读起来像 interaction 收益。
+RELATION_AGG_FIELDS = (
+    "test_mae_relation_neutral",
+    "test_mae_relation_delta",
+)
 
-def aggregate_summary(tasks: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+
+def aggregate_summary(
+    tasks: Sequence[Mapping[str, Any]],
+    *,
+    include_relation: bool = True,
+) -> Dict[str, Any]:
     task_details = []
     for t in tasks:
-        task_details.append(
-            {
-                "dataset": t.get("dataset"),
-                "horizon": t.get("horizon"),
-                "n_val": t.get("n_val"),
-                "interaction_applied": t.get("interaction_applied"),
-                "test_mae_on": t.get("test_mae_on"),
-                "test_mae_off": t.get("test_mae_off"),
-                "test_mae_delta": t.get("test_mae_delta"),
-                "val_mae_delta": t.get("val_mae_delta"),
-                "oof_mae_delta": t.get("oof_mae_delta"),
-                "cv_oof_coverage": t.get("cv_oof_coverage"),
-                "protocol": t.get("protocol"),
-                "fallback_target": t.get("fallback_target"),
-                "selected_models": t.get("selected_models"),
-            }
-        )
+        detail = {
+            "dataset": t.get("dataset"),
+            "horizon": t.get("horizon"),
+            "n_val": t.get("n_val"),
+            "interaction_applied": t.get("interaction_applied"),
+            "test_mae_on": t.get("test_mae_on"),
+            "test_mae_off": t.get("test_mae_off"),
+            "test_mae_delta": t.get("test_mae_delta"),
+            "val_mae_delta": t.get("val_mae_delta"),
+            "oof_mae_delta": t.get("oof_mae_delta"),
+            "cv_oof_coverage": t.get("cv_oof_coverage"),
+            "protocol": t.get("protocol"),
+            "fallback_target": t.get("fallback_target"),
+            "selected_models": t.get("selected_models"),
+        }
+        if include_relation:
+            detail["test_mae_relation_neutral"] = t.get("test_mae_relation_neutral")
+            detail["test_mae_relation_delta"] = t.get("test_mae_relation_delta")
+            detail["relation_strength_edges_found"] = list(
+                t.get("relation_strength_edges_found") or []
+            )
+        task_details.append(detail)
 
+    agg_fields = NUMERIC_AGG_FIELDS + (RELATION_AGG_FIELDS if include_relation else ())
     equal_weight_average: Dict[str, Optional[float]] = {}
     sample_weighted_average: Dict[str, Optional[float]] = {}
-    for field in NUMERIC_AGG_FIELDS:
+    for field in agg_fields:
         values = []
         for t in tasks:
             v = t.get(field)
@@ -1226,7 +1351,7 @@ def aggregate_summary(tasks: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
         else:
             ties += 1
 
-    return {
+    summary: Dict[str, Any] = {
         "task_details": task_details,
         "equal_weight_average": equal_weight_average,
         "sample_weighted_average": sample_weighted_average,
@@ -1237,6 +1362,25 @@ def aggregate_summary(tasks: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
             "total_tasks": len(task_details),
         },
     }
+    if include_relation:
+        r_wins = r_losses = r_ties = 0
+        for t in tasks:
+            delta = t.get("test_mae_relation_delta")
+            if delta is None or not np.isfinite(delta):
+                r_ties += 1
+            elif delta < -INTERACTION_TIE_TOLERANCE:
+                r_wins += 1
+            elif delta > INTERACTION_TIE_TOLERANCE:
+                r_losses += 1
+            else:
+                r_ties += 1
+        summary["relation_win_loss_count"] = {
+            "relation_wins": r_wins,
+            "relation_losses": r_losses,
+            "relation_ties": r_ties,
+            "total_tasks": len(task_details),
+        }
+    return summary
 
 
 def _finite_metric(payload: Any, *path: str) -> Optional[float]:
@@ -1254,12 +1398,44 @@ def _finite_metric(payload: Any, *path: str) -> Optional[float]:
     return value if np.isfinite(value) else None
 
 
+def evaluate_relation_evidence_gate(
+    tasks: Sequence[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    """至少一个成功任务真的消费到了关系边，否则本轮无法评估关系强度功能。
+
+    字段缺失一律按"无证据"处理：旧版报告没有该字段，不能因此蒙混通过。
+    """
+    with_edges = [
+        f"{t.get('dataset')} h={t.get('horizon')}"
+        for t in tasks
+        if t.get("status") == "ok" and (t.get("relation_strength_edges_found") or [])
+    ]
+    issues = []
+    if not with_edges:
+        issues.append(
+            "no successful task consumed any relation edge "
+            "(relation_strength_edges_found empty or missing for all tasks); "
+            "this run cannot evaluate relation-strength scoring"
+        )
+    return {
+        "passed": bool(with_edges),
+        "issues": issues,
+        "tasks_with_edges": len(with_edges),
+        "tasks": with_edges,
+    }
+
+
 def evaluate_quality_gates(
     tasks: Sequence[Mapping[str, Any]],
     *,
     trace_root: Path,
+    include_relation_gate: bool = True,
 ) -> Dict[str, Any]:
-    """按 Task 7 预先写定口径计算可机器判定的质量门槛。"""
+    """按 Task 7 预先写定口径计算可机器判定的质量门槛。
+
+    ``include_relation_gate=False`` 复现关系强度接入前的门槛集合，供旧 schema
+    报告（task7-shadow.3）复核使用。
+    """
     task_keys = {(task.get("dataset"), task.get("horizon")) for task in tasks}
     expected_keys = {(spec["dataset"], spec["horizon"]) for spec in build_task_specs()}
     task_issues = []
@@ -1415,6 +1591,9 @@ def evaluate_quality_gates(
         "numeric_consistency": numeric_consistency,
         "trace_integrity": trace_integrity,
     }
+    if include_relation_gate:
+        # §11#7：没有任何关系边被消费时，本轮无法评估关系强度，判失败而非通过
+        gates["relation_strength_evidence"] = evaluate_relation_evidence_gate(tasks)
     gates["status"] = "passed" if all(gate["passed"] for gate in gates.values()) else "failed"
     return gates
 
@@ -1424,8 +1603,14 @@ def validate_shadow_report(
     *,
     trace_root: Optional[Path] = None,
 ) -> None:
-    if report.get("schema_version") != REPORT_SCHEMA_VERSION:
-        raise ValueError(f"unexpected schema_version: {report.get('schema_version')}")
+    version = report.get("schema_version")
+    if version == REPORT_SCHEMA_VERSION:
+        relation_required = True
+    elif version in LEGACY_REPORT_SCHEMA_VERSIONS:
+        # 旧版报告按接入关系强度之前的口径复核，其证据仍然有效
+        relation_required = False
+    else:
+        raise ValueError(f"unexpected schema_version: {version}")
 
     specs = report.get("task_specs")
     if specs != build_task_specs():
@@ -1478,6 +1663,14 @@ def validate_shadow_report(
         "guard",
         "selection_diff",
     )
+    if relation_required:
+        per_task_required = per_task_required + (
+            "relation_warmup",
+            "relation_contrast",
+            "relation_strength_edges_found",
+            "test_mae_relation_neutral",
+            "test_mae_relation_delta",
+        )
     for i, task in enumerate(tasks):
         if task.get("status") != "ok":
             raise ValueError(f"task {i} not successful: {task.get('error')}")
@@ -1498,7 +1691,7 @@ def validate_shadow_report(
             raise ValueError(f"aggregates missing {key}")
     if len(aggregates["task_details"]) != 9:
         raise ValueError("aggregates.task_details must contain 9 rows")
-    recomputed_aggregates = aggregate_summary(tasks)
+    recomputed_aggregates = aggregate_summary(tasks, include_relation=relation_required)
     if aggregates != recomputed_aggregates:
         raise ValueError("aggregates do not match recomputed task metrics")
     win_loss = aggregates["interaction_win_loss_count"]
@@ -1534,7 +1727,9 @@ def validate_shadow_report(
             resolved_trace_root = candidate
     if resolved_trace_root is None:
         raise ValueError("quality_gates validation requires an existing trace_root")
-    recomputed_gates = evaluate_quality_gates(tasks, trace_root=resolved_trace_root)
+    recomputed_gates = evaluate_quality_gates(
+        tasks, trace_root=resolved_trace_root, include_relation_gate=relation_required
+    )
     if dict(recorded_gates) != recomputed_gates:
         raise ValueError("quality_gates do not match recomputed metrics or trace files")
     if recomputed_gates.get("status") != "passed":
@@ -1581,6 +1776,15 @@ def main() -> int:
         if args.pipeline_config.is_absolute()
         else PROJECT_ROOT / args.pipeline_config
     )
+    # §11#7：v5 全程共用一张关系图，作为九个任务关系状态的**统一容器**。
+    # 注意它不是"前一个任务写、后一个任务读"：消费侧按当前 scenario_id 精确
+    # 匹配，而九个任务的 dataset/horizon 不同、场景 ID 也不同，跨任务读不到。
+    # 闭环靠的是每个任务内部的 warm-up（写）→ 正式测量（只读）两轮。
+    # 图为空时关系项恒为中性，报告的 relation_strength_evidence 门槛会判失败，
+    # 提示该轮无法评估本功能，而不是让它悄悄显示通过。
+    relation_graph = ModelGraph()
+    print("关系图: 已创建（九任务共用容器；闭环为每任务内 warm-up -> 只读测量两轮）")
+
     baseline_provenance: Dict[str, Any] = {"status": "not_required"}
     if args.require_baseline_provenance:
         from scripts.train_baselines import load_verified_baseline_provenance
@@ -1615,6 +1819,7 @@ def main() -> int:
         dataset, horizon = spec["dataset"], spec["horizon"]
         print(f"\n[{index}/{len(specs)}] {dataset} h={horizon}")
         record = run_task(
+            relation_graph=relation_graph,
             dataset=dataset,
             horizon=horizon,
             models=models,

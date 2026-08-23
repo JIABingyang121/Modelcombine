@@ -15,6 +15,9 @@ from .config import (
     KG_HIGH_DRIFT_EXTENDED_SCORE_FACTOR,
     KG_RIDGE_TEMPORAL_DECAY,
     KG_ZERO_WEIGHT_CLEANUP_THRESHOLD,
+    PROTOCOL_B_RELATION_STRENGTH_NEUTRAL,
+    PROTOCOL_B_RELATION_STRENGTH_WEIGHT,
+    PROTOCOL_STEPWISE_TIE_RELATIVE_TOLERANCE,
     PROTOCOL_STEPWISE_MIN_IMPROVEMENT,
 )
 from .conflict import _lookup_pair_corr, check_conflict, compute_error_correlations
@@ -291,6 +294,35 @@ def _fit_ridge_and_mae(
         return float("inf")
     return float(np.mean(fold_scores))
 
+def _is_better_beyond_tolerance(
+    trial_mae: float,
+    incumbent_mae: float,
+    tie_rel_tol: float,
+) -> bool:
+    """trial 是否**确实**优于在位者，而不是落在数值噪声里。
+
+    候选的 CV MAE 来自 lbfgs 迭代解（tol=1e-4），差异小于 ``tie_rel_tol`` 时
+    两者实质并列，此时保留在位者——在位者由调用方给定的候选顺序决定，
+    因此结果可复现，且 Protocol B 的 base_score 排序仍然说了算。
+    """
+    if not np.isfinite(trial_mae):
+        return False
+    if not np.isfinite(incumbent_mae):
+        return True
+    return trial_mae < incumbent_mae - abs(incumbent_mae) * tie_rel_tol
+
+
+def _is_tied_within_tolerance(
+    trial_mae: float,
+    incumbent_mae: float,
+    tie_rel_tol: float,
+) -> bool:
+    """两项有限 MAE 是否落在 stepwise 的相对并列容差内。"""
+    if not (np.isfinite(trial_mae) and np.isfinite(incumbent_mae)):
+        return False
+    return abs(trial_mae - incumbent_mae) <= abs(incumbent_mae) * tie_rel_tol
+
+
 def forward_stepwise_select(
     df_val: pd.DataFrame,
     candidate_models: List[str],
@@ -301,6 +333,8 @@ def forward_stepwise_select(
     sample_weight: Optional[np.ndarray] = None,
     conflict_checker: Optional[Callable[[List[str]], bool]] = None,
     alpha: float = 1.0,
+    respect_candidate_order: bool = False,
+    tie_rel_tol: float = PROTOCOL_STEPWISE_TIE_RELATIVE_TOLERANCE,
 ) -> Tuple[List[str], Dict[str, float]]:
     """
     前向逐步选择：每一步仅在组合 MAE 相对改善达到阈值时才扩展。
@@ -310,7 +344,14 @@ def forward_stepwise_select(
     if len(candidate_models) == 1:
         return candidate_models.copy(), {"stopped_early": True, "reason": "single_candidate"}
 
-    ordered = sorted(candidate_models, key=lambda m: base_maes.get(m, float("inf")))
+    # respect_candidate_order 仅由 Protocol B 传真：它已按 (-base_score, mae)
+    # 排好序，base_score 含关系强度项（§11#7）；此处若无条件按 MAE 重排，
+    # 会把调用方算好的排序整个丢弃，关系强度永远影响不到最终选择。
+    # 默认仍按 MAE 排序，以保持 Protocol A 与既有 guard 基线行为不变。
+    if respect_candidate_order:
+        ordered = list(candidate_models)
+    else:
+        ordered = sorted(candidate_models, key=lambda m: base_maes.get(m, float("inf")))
     best_single = ordered[0]
     selected = [best_single]
     best_mae = _fit_ridge_and_mae(
@@ -323,9 +364,12 @@ def forward_stepwise_select(
     trace = [{"step": 0, "selected": best_single, "mae": best_mae}]
     y_val = df_val["y"].values
 
+    candidate_failures: Dict[str, str] = {}
+    candidate_evaluations: List[Dict[str, Any]] = []
     while len(selected) < max_models:
         best_candidate = None
         best_candidate_mae = best_mae
+        evaluations: List[Dict[str, Any]] = []
         for m in ordered:
             if m in selected:
                 continue
@@ -340,11 +384,35 @@ def forward_stepwise_select(
                     horizon=horizon,
                     sample_weight=sample_weight,
                 )
-            except Exception:
+            except Exception as exc:
+                # 静默 continue 会让间歇性求解失败无法定位：同一份数据两次运行
+                # 选出不同组合，却查不到任何线索。失败必须留痕。
+                error = f"{type(exc).__name__}: {exc}"
+                candidate_failures[m] = error
+                evaluations.append({"model": m, "decision": "failure", "error": error})
                 continue
-            if trial_mae < best_candidate_mae:
+            comparison_mae = best_candidate_mae
+            if _is_better_beyond_tolerance(trial_mae, best_candidate_mae, tie_rel_tol):
                 best_candidate_mae = trial_mae
                 best_candidate = m
+                decision = "new_best"
+            elif _is_tied_within_tolerance(trial_mae, comparison_mae, tie_rel_tol):
+                decision = "tie_kept"
+            else:
+                decision = "not_better"
+            evaluations.append({
+                "model": m,
+                "trial_mae": float(trial_mae),
+                "comparison_mae": float(comparison_mae),
+                "decision": decision,
+            })
+
+        candidate_evaluations.append({
+            "step": len(selected),
+            "incumbent_models": list(selected),
+            "incumbent_mae": float(best_mae),
+            "evaluations": evaluations,
+        })
 
         if best_candidate is None:
             trace.append({"step": len(selected), "selected": None, "mae": best_mae, "stop": "no_valid_candidate"})
@@ -369,6 +437,9 @@ def forward_stepwise_select(
         "stopped_early": len(selected) < max_models,
         "final_mae": best_mae,
         "min_improve_ratio": float(min_improve_ratio),
+        "tie_rel_tol": float(tie_rel_tol),
+        "candidate_failures": candidate_failures,
+        "candidate_evaluations": candidate_evaluations,
         "trace": trace,
     }
 
@@ -386,6 +457,7 @@ def select_models_protocol_b(
     feature_diversity_weight: float = 0.25,
     beam_width: int = 3,
     drift_level: str = "low",
+    relation_strength_weight: float = PROTOCOL_B_RELATION_STRENGTH_WEIGHT,
 ) -> Tuple[List[str], Dict[str, float], Dict[str, float], Dict]:
     """
     Protocol B 专用模型选择：
@@ -406,13 +478,43 @@ def select_models_protocol_b(
     base_max = max(base_raw.values()) if base_raw else 1.0
     base_scores = {}
     high_drift_penalty_models = _extended_pool_penalty_models() if drift_level == "high" else set()
+
+    # 关系强度（§11#7）：Hawkes/反馈写在 scenario->model 的 recommended_for 边上，
+    # 此前没有任何决策路径读它。这里把它作为逐模型加分项计入候选评分。
+    # 取 dynamic_strength 优先、否则 weight；无边时用中性值，使该项恰好为 0。
+    relation_strength: Dict[str, float] = {}
+    for m in model_cols:
+        values = []
+        if mg.G.has_node(m):
+            for src, _tgt, data in mg.G.in_edges(m, data=True):
+                if data.get("edge_type") != "recommended_for":
+                    continue
+                raw = data.get("dynamic_strength", data.get("weight"))
+                if raw is None:
+                    continue
+                val = float(raw)
+                if np.isfinite(val):
+                    values.append(val)
+        relation_strength[m] = (
+            float(np.mean(values)) if values else PROTOCOL_B_RELATION_STRENGTH_NEUTRAL
+        )
+    relation_contribution = {
+        m: relation_strength_weight * (relation_strength[m] - PROTOCOL_B_RELATION_STRENGTH_NEUTRAL)
+        for m in model_cols
+    }
+
     for m in model_cols:
         base_norm = base_raw[m] / (base_max + 1e-10)
         comp_bonus = 0.0
         for neighbor in mg.neighbors_by_type(m, "complementary"):
             if neighbor in model_cols:
                 comp_bonus += float(mg.G[m][neighbor].get("weight", 0.5))
-        score = base_norm + comp_bonus + feature_bonus_weight * feature_bonus[m]
+        score = (
+            base_norm
+            + comp_bonus
+            + feature_bonus_weight * feature_bonus[m]
+            + relation_contribution[m]
+        )
         if m in high_drift_penalty_models:
             score *= KG_HIGH_DRIFT_EXTENDED_SCORE_FACTOR
         base_scores[m] = score
@@ -526,6 +628,8 @@ def select_models_protocol_b(
             sample_weight=sample_weight,
             conflict_checker=lambda trial: len(check_conflict(mg, trial)) > 0,
             alpha=stepwise_alpha,
+            # 仅 Protocol B 使用含关系强度的候选排序；Protocol A 保持按 MAE 排序
+            respect_candidate_order=True,
         )
         if len(stepwise_selected) >= 2:
             selected = stepwise_selected
@@ -538,6 +642,18 @@ def select_models_protocol_b(
         "stepwise_alpha": float(stepwise_alpha),
         "stepwise_min_improve_ratio": float(stepwise_min_improve),
         "stepwise_meta": stepwise_meta,
+        # 关系强度评分项（§11#7）：留痕以便回答"为什么这条候选排在前面"。
+        # by_model 为读到的强度，contribution 为已乘权重、已减中性的实际加分。
+        "relation_strength": {
+            "weight": float(relation_strength_weight),
+            "neutral": float(PROTOCOL_B_RELATION_STRENGTH_NEUTRAL),
+            "by_model": {m: float(relation_strength[m]) for m in model_cols},
+            "contribution": {m: float(relation_contribution[m]) for m in model_cols},
+            "edges_found": sorted(
+                m for m in model_cols
+                if relation_strength[m] != PROTOCOL_B_RELATION_STRENGTH_NEUTRAL
+            ),
+        },
     }
     return selected, base_scores, feature_bonus, meta
 

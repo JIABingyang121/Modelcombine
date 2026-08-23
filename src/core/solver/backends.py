@@ -42,9 +42,14 @@ class ProtocolBBackend(CombinationBackend):
             base_model_cols=ctx.base_model_cols,
             feedback_store=ctx.feedback_store,
             return_predictions=bool(getattr(ctx, "return_predictions", False)),
+            # §11#7 生产接线：把当前场景的关系强度交给引擎。
+            # 此前未传，引擎内部新建空图，关系项在真实路径上恒为中性。
+            relation_graph=ctx.model_graph,
+            relation_scenario_id=getattr(ctx.scenario, "scenario_id", None),
         )
         normalized = self._normalize(raw)
         audit = self._guard_audit(raw)
+        relation_audit = self._relation_scoring_audit(raw)
         trace.consider(list(ctx.model_cols))
         for model_id, reason in audit["removed_models"].items():
             trace.reject(model_id, reason)
@@ -67,9 +72,66 @@ class ProtocolBBackend(CombinationBackend):
                 "fallback_target": audit["fallback_target"],
                 "fallback_reason": audit["fallback_reason"],
                 "removed_models": audit["removed_models"],
+                # 关系强度如何参与本次评分与排序（§11#7）
+                "relation_strength": relation_audit["relation_strength"],
+                "candidate_ranking": relation_audit["candidate_ranking"],
+                "candidate_scores": relation_audit["candidate_scores"],
+                # 逐步选择轨迹：每步选了谁、CV MAE 多少、是否发生并列。
+                # 缺了它，两次运行选出不同组合时无法定位到分歧发生在哪一步。
+                "stepwise": relation_audit["stepwise"],
             },
         )
         return normalized
+
+    @staticmethod
+    def _relation_scoring_audit(raw: Dict[str, Any]) -> Dict[str, Any]:
+        """提取关系强度评分项、候选排序与最终选择（§11#7 可审计性要求）。
+
+        关系强度写进图谱后必须能回溯到决策，否则又会回到"信号已更新、决策不消费"
+        的状态。回退分支不带 selection meta 时记为 None，不抛错。
+        """
+        # 真实引擎把 model_scores_b 与 selection meta 写在 **val** 里
+        # （protocol_b.py 的最终返回与 guarded_val 均如此），test 只带指标与选择。
+        # 此前一律先读 test，导致生产路径上候选得分/排序恒为空。
+        def _pick(key: str):
+            for split_name in ("val", "test"):
+                split = raw.get(split_name)
+                if isinstance(split, dict) and split.get(key):
+                    return split[key]
+            return None
+
+        split = raw.get("test") or raw.get("val") or {}
+        if not isinstance(split, dict):
+            split = {}
+        weight_meta = _pick("weight_meta") or {}
+        if not isinstance(weight_meta, dict):
+            weight_meta = {}
+        selection_meta = weight_meta.get("protocol_b_selection_meta") or {}
+        if not isinstance(selection_meta, dict):
+            selection_meta = {}
+
+        relation = selection_meta.get("relation_strength")
+        scores = _pick("model_scores_b") or {}
+        # 得分相同时按名称定序：否则审计出来的排序取决于字典插入顺序，
+        # 同一份结果两次读可能给出不同排序，反而妨碍定位。
+        ranking = (
+            [m for m, _ in sorted(scores.items(), key=lambda kv: (-float(kv[1]), kv[0]))]
+            if isinstance(scores, dict) else []
+        )
+        stepwise = selection_meta.get("stepwise_meta")
+        if isinstance(stepwise, dict):
+            stepwise = {
+                **stepwise,
+                "alpha": selection_meta.get("stepwise_alpha"),
+                "min_improve_ratio": selection_meta.get("stepwise_min_improve_ratio"),
+            }
+        return {
+            "relation_strength": relation if isinstance(relation, dict) else None,
+            "candidate_scores": dict(scores) if isinstance(scores, dict) else {},
+            "candidate_ranking": ranking,
+            "stepwise": stepwise if isinstance(stepwise, dict) else None,
+            "final_selection": list(split.get("selected_models") or []),
+        }
 
     @staticmethod
     def _guard_audit(raw: Dict[str, Any]) -> Dict[str, Any]:

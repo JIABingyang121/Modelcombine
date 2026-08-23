@@ -146,12 +146,18 @@ def test_events_from_selection_trace_and_record_update_summary():
         evidence_ref="trace:p1",
     )
 
+    # §11#7 起：除 scenario->path 边外，**始终**同时产出 scenario->model 边，
+    # 且关系类型与 selected_relation_type 一致——候选评分消费的正是后者。
     assert [(e.source, e.target, e.relation_type, e.polarity) for e in events] == [
         ("scenario_pjm_h1", "path_m1_m2", "selected_for", "positive"),
+        ("scenario_pjm_h1", "m1", "selected_for", "positive"),
+        ("scenario_pjm_h1", "m2", "selected_for", "positive"),
         ("scenario_pjm_h1", "m_bad", "rejected_candidate", "negative"),
     ]
     assert events[0].magnitude == 1.0
-    assert events[1].metadata["reason"].startswith("uncertainty_bypass")
+    # 拒绝事件现在排在逐模型边之后，按关系类型定位而不是按固定下标
+    rejected = next(e for e in events if e.relation_type == "rejected_candidate")
+    assert rejected.metadata["reason"].startswith("uncertainty_bypass")
 
     record_temporal_update(
         trace,
@@ -192,11 +198,14 @@ def test_events_from_solver_result_do_not_require_final_trace_to_be_set():
     )
 
     assert trace.final_selection == []
+    # 逐模型 recommended_for 边一并产出（§11#7 闭环所需）
     assert [(e.target, e.relation_type, e.polarity) for e in events] == [
         ("path_m1_m2", "recommended_for", "positive"),
+        ("m1", "recommended_for", "positive"),
+        ("m2", "recommended_for", "positive"),
         ("m_bad", "rejected_candidate", "negative"),
     ]
-    assert events[1].magnitude == 1.0
+    assert events[-1].magnitude == 1.0
 
 
 def test_temporal_relation_stage_updates_graph_and_trace_from_solver_result():

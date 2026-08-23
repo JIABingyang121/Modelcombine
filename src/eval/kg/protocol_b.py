@@ -108,7 +108,9 @@ def kg_combination_with_features(df_val: pd.DataFrame, df_test: pd.DataFrame,
                                   dataset_name: Optional[str] = None,
                                   base_model_cols: Optional[List[str]] = None,
                                   feedback_store: Optional[KGFeedbackStore] = None,
-                                  return_predictions: bool = False) -> Dict:
+                                  return_predictions: bool = False,
+                                  relation_graph: Optional[ModelGraph] = None,
+                                  relation_scenario_id: Optional[str] = None) -> Dict:
     """
     KG 组合 - 使用预测+原始特征
 
@@ -219,6 +221,29 @@ def kg_combination_with_features(df_val: pd.DataFrame, df_test: pd.DataFrame,
     
     for m in model_cols:
         mg.add_model_node(m, {"mae": maes[m]})
+
+    # 注入**当前场景**的关系强度边（§11#7 生产接线）。
+    # 只复制 relation_scenario_id 指向的 recommended_for 边：若把所有场景的边
+    # 都读进来取平均，无关场景会改变本次决策。未提供图或场景时不复制任何边，
+    # 此时评分中的关系项恒为中性、行为与接入前一致。
+    relation_edges_injected = 0
+    if relation_graph is not None and relation_scenario_id:
+        src_graph = relation_graph.G
+        if src_graph.has_node(relation_scenario_id):
+            for _src, tgt, data in src_graph.out_edges(relation_scenario_id, data=True):
+                if data.get("edge_type") != "recommended_for" or tgt not in model_cols:
+                    continue
+                strength = data.get("dynamic_strength", data.get("weight"))
+                if strength is None:
+                    continue
+                mg.G.add_edge(
+                    relation_scenario_id,
+                    tgt,
+                    edge_type="recommended_for",
+                    weight=float(strength),
+                    dynamic_strength=float(strength),
+                )
+                relation_edges_injected += 1
     
     for (m1, m2), corr in error_corrs.items():
         if corr < corr_threshold:
@@ -1227,6 +1252,24 @@ def kg_combination_with_features(df_val: pd.DataFrame, df_test: pd.DataFrame,
             split_payload["core_route"] = naming_b["core_route"]
             weight_meta = split_payload.setdefault("weight_meta", {})
             if isinstance(weight_meta, dict):
+                # 回退分支的 weight_meta 来自 Protocol A（best_single 时为空），
+                # 不含 B 的 selection meta。把关系强度评分项回填进来，否则
+                # "B 本来按什么排序、关系强度起了多大作用"在回退时无法回溯。
+                b_meta_src = ridge_meta.get("protocol_b_selection_meta") or {}
+                # stepwise 轨迹同理：回退时更需要知道 B 走了哪几步、
+                # 是否在并列容差内做了取舍，否则两次运行结果不同时无从定位。
+                for _key in (
+                    "relation_strength",
+                    "stepwise_meta",
+                    "stepwise_alpha",
+                    "stepwise_min_improve_ratio",
+                ):
+                    _val = b_meta_src.get(_key)
+                    if _val is None:
+                        continue
+                    b_sel_meta = weight_meta.setdefault("protocol_b_selection_meta", {})
+                    if isinstance(b_sel_meta, dict):
+                        b_sel_meta[_key] = _val
                 # 最终输出已经回退，但仍保留 B 候选分支的 interaction 审计信息。
                 # 单独命名，避免误写成最终预测实际包含了 interaction。
                 weight_meta["interaction_branch_candidate"] = copy.deepcopy(
