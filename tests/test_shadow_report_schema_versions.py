@@ -23,8 +23,9 @@ V4D_DIR = PROJECT_ROOT / "result" / "ab_convergence" / "shadow_9tasks_v4d"
 
 def test_current_schema_version_is_bumped_for_the_new_gate():
     """门槛结构变化必须伴随 schema 升级，否则新旧报告无法区分。"""
-    assert shadow.REPORT_SCHEMA_VERSION != "task7-shadow.3"
+    assert shadow.REPORT_SCHEMA_VERSION == "task8-v6.1"
     assert "task7-shadow.3" in shadow.LEGACY_REPORT_SCHEMA_VERSIONS
+    assert "task7-shadow.4" in shadow.LEGACY_REPORT_SCHEMA_VERSIONS
 
 
 def test_legacy_gates_exclude_relation_evidence():

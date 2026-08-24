@@ -14,6 +14,7 @@ import pytest
 from scripts.run_protocol_b_candidate_diagnostic import (
     select_validation_best_pair,
     summarize_diagnostic_coverage,
+    validate_diagnostic_schema,
     verify_sha256,
 )
 
@@ -114,3 +115,126 @@ def test_default_task_specs_are_consumable_by_diagnostic_builder(monkeypatch):
     )
     assert len(report["tasks"]) == 9
     assert all(t["task_id"] for t in report["tasks"])
+
+
+def _schema_task(dataset, horizon, *, best_pair=None, pairs=None):
+    default_pairs = [
+        {"models": ["m1", "m2"], "validation_mae": 1.0, "test_mae": 1.0, "eligible_pair": True},
+    ]
+    return {
+        "task_id": f"{dataset}_h{horizon}",
+        "dataset": dataset, "horizon": horizon,
+        "matrix_hashes": {"df_val_kg": "x", "df_test_kg": "x"},
+        "safe_models": ["m1", "m2", "m3"],
+        "singles": [], "pairs": pairs if pairs is not None else default_pairs,
+        "best_single": {},
+        "best_pair": best_pair,
+        "protocol_b": {"models": ["m1", "m2"]},
+        "best_pair_same_as_protocol_b": True,
+        "explicit_conflict_edges_consumed": 0,
+    }
+
+
+def _valid_best_pair(models=("m1", "m2"), *, validation_mae=1.0, test_mae=1.0):
+    return {
+        "models": list(models),
+        "validation_mae": validation_mae,
+        "selection_uses_test_labels": False,
+        "selection_source": "validation_mae_only",
+        "test": {"mae": test_mae},
+    }
+
+
+def _nine_unique_tasks():
+    tasks = []
+    for dataset in ("pjm", "aemo_vic", "aemo_nsw"):
+        for horizon in (1, 6, 24):
+            tasks.append(_schema_task(dataset, horizon, best_pair=_valid_best_pair()))
+    return tasks
+
+
+def _schema_report(tasks):
+    return {"schema_version": "task83-candidate-diagnostic.1", "tasks": tasks}
+
+
+def test_diagnostic_schema_rejects_duplicate_tasks():
+    """九条记录必须唯一；重复 (dataset,horizon) 会被字典覆盖，必须拒绝。"""
+    tasks = _nine_unique_tasks()
+    tasks[8] = _schema_task("pjm", 1, best_pair=_valid_best_pair())  # 重复 pjm_h1
+    with pytest.raises(ValueError, match="unique"):
+        validate_diagnostic_schema(_schema_report(tasks))
+
+
+def test_diagnostic_schema_rejects_missing_best_pair():
+    """每条都必须存在有效 best pair。"""
+    tasks = _nine_unique_tasks()
+    tasks[0] = _schema_task("pjm", 1, best_pair=None)
+    with pytest.raises(ValueError, match="best_pair"):
+        validate_diagnostic_schema(_schema_report(tasks))
+
+
+def test_diagnostic_schema_rejects_best_pair_not_validation_selected():
+    """best_pair 必须是其 pair 列表按 validation 选出的结果。"""
+    pairs = [
+        {"models": ["m1", "m2"], "validation_mae": 1.0, "eligible_pair": True},
+        {"models": ["m1", "m3"], "validation_mae": 0.5, "eligible_pair": True},
+    ]
+    tasks = _nine_unique_tasks()
+    # 把最佳 pair 硬写成 ["m1","m2"]，但按 validation 应选 ["m1","m3"]。
+    tasks[0] = _schema_task(
+        "pjm", 1, best_pair=_valid_best_pair(("m1", "m2")), pairs=pairs,
+    )
+    with pytest.raises(ValueError, match="validation-selected"):
+        validate_diagnostic_schema(_schema_report(tasks))
+
+
+def test_diagnostic_schema_accepts_validation_selected_best_pair():
+    """正确场景：best_pair 与按 validation 选出的结果一致（含数值）。"""
+    pairs = [
+        {"models": ["m1", "m2"], "validation_mae": 1.0, "test_mae": 2.0, "eligible_pair": True},
+        {"models": ["m1", "m3"], "validation_mae": 0.5, "test_mae": 1.5, "eligible_pair": True},
+    ]
+    tasks = _nine_unique_tasks()
+    tasks[0] = _schema_task(
+        "pjm", 1,
+        best_pair=_valid_best_pair(("m1", "m3"), validation_mae=0.5, test_mae=1.5),
+        pairs=pairs,
+    )
+    validate_diagnostic_schema(_schema_report(tasks))
+
+
+def test_diagnostic_schema_rejects_best_pair_validation_mae_mismatch():
+    """best_pair.models 正确但 validation_mae 伪造时，必须拒绝。"""
+    pairs = [
+        {"models": ["m1", "m2"], "validation_mae": 1.0, "test_mae": 2.0, "eligible_pair": True},
+    ]
+    tasks = _nine_unique_tasks()
+    bp = _valid_best_pair(("m1", "m2"), validation_mae=0.5, test_mae=2.0)
+    tasks[0] = _schema_task("pjm", 1, best_pair=bp, pairs=pairs)
+    with pytest.raises(ValueError, match="validation_mae"):
+        validate_diagnostic_schema(_schema_report(tasks))
+
+
+def test_diagnostic_schema_rejects_best_pair_test_mae_mismatch():
+    """best_pair.test.mae 是 pair 门槛分母，伪造时必须拒绝。"""
+    pairs = [
+        {"models": ["m1", "m2"], "validation_mae": 1.0, "test_mae": 2.0, "eligible_pair": True},
+    ]
+    tasks = _nine_unique_tasks()
+    bp = _valid_best_pair(("m1", "m2"), validation_mae=1.0, test_mae=0.1)
+    tasks[0] = _schema_task("pjm", 1, best_pair=bp, pairs=pairs)
+    with pytest.raises(ValueError, match="test.mae"):
+        validate_diagnostic_schema(_schema_report(tasks))
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_diagnostic_schema_rejects_non_finite_best_pair_metrics(bad):
+    """NaN/Inf 会使 abs() 比较恒为 False，必须显式拒绝非有限数值。"""
+    pairs = [
+        {"models": ["m1", "m2"], "validation_mae": bad, "test_mae": bad, "eligible_pair": True},
+    ]
+    tasks = _nine_unique_tasks()
+    bp = _valid_best_pair(("m1", "m2"), validation_mae=bad, test_mae=bad)
+    tasks[0] = _schema_task("pjm", 1, best_pair=bp, pairs=pairs)
+    with pytest.raises(ValueError, match="finite"):
+        validate_diagnostic_schema(_schema_report(tasks))

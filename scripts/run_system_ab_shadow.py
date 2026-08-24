@@ -70,10 +70,10 @@ from src.models.uncertainty import UncertaintyGate
 
 import scripts.train_combinations_kg as kg_runner
 
-REPORT_SCHEMA_VERSION = "task7-shadow.4"
-# 关系强度对照与关系证据门槛加入后，quality_gates/aggregates 的**结构**变了。
-# 旧版报告（v4d 等）必须仍按旧口径可复核，否则已发布的验收证据会失去可验证性。
-LEGACY_REPORT_SCHEMA_VERSIONS = ("task7-shadow.3",)
+REPORT_SCHEMA_VERSION = "task8-v6.1"
+# v6 加入最佳二模型固定枚举门槛与关系资格后，quality_gates/aggregates 结构变了。
+# 旧版报告（v4d/v5）必须仍按旧口径可复核，否则已发布的验收证据会失去可验证性。
+LEGACY_REPORT_SCHEMA_VERSIONS = ("task7-shadow.3", "task7-shadow.4")
 RANDOM_SEED = 42
 INTERACTION_TIE_TOLERANCE = 1e-12
 
@@ -927,6 +927,7 @@ def run_task(
     feature_root: Optional[Path] = None,
     baseline_provenance: Optional[Mapping[str, Any]] = None,
     relation_graph: Any = None,
+    candidate_diagnostic: Optional[Mapping[Any, Any]] = None,
 ) -> Dict[str, Any]:
     _seed_everything(seed)
     task_out = out_root / dataset / f"h{horizon}"
@@ -1203,6 +1204,28 @@ def run_task(
                 for m in matrix["safe_models"]
             },
         }
+
+        # 候选诊断注入（Task 8.3 Task 7）：
+        # - best_pair_reference 是静态诊断基准，来自候选诊断报告；
+        # - best_pair_same_as_protocol_b 与 explicit_conflict_edges_consumed 必须
+        #   反映本轮实际运行，不能原样复制诊断字段。
+        diag_task = (candidate_diagnostic or {}).get((dataset, horizon))
+        if isinstance(diag_task, Mapping):
+            record["best_pair_reference"] = diag_task.get("best_pair")
+            bp_models = set((diag_task.get("best_pair") or {}).get("models") or [])
+            record["best_pair_same_as_protocol_b"] = bool(
+                bp_models and bp_models == set(record["selected_models"])
+            )
+            raw_val = raw_on.get("val") if isinstance(raw_on, Mapping) else {}
+            wm = raw_val.get("weight_meta") if isinstance(raw_val, Mapping) else {}
+            sm = wm.get("protocol_b_selection_meta") if isinstance(wm, Mapping) else {}
+            record["explicit_conflict_edges_consumed"] = int(
+                sm.get("explicit_conflict_edges_consumed") or 0
+            )
+        else:
+            record["best_pair_reference"] = None
+            record["best_pair_same_as_protocol_b"] = False
+            record["explicit_conflict_edges_consumed"] = 0
 
         # System A/combinator 参考：真实场景选择 + 同一 horizon 冻结预测矩阵评估。
         if run_combinator:
@@ -1598,6 +1621,216 @@ def evaluate_quality_gates(
     return gates
 
 
+def evaluate_relation_qualification(
+    tasks: Sequence[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    """关系启用臂相对中性臂的资格判定（§6.2），与核心决策链验收拆开。
+
+    相对变化 = (MAE_enabled - MAE_neutral) / MAE_neutral；|delta|<=1e-8 记平并归零。
+    等权平均 <= 0 且胜场 >= 负场才 `qualified`；该状态不影响核心 passed/failed。
+    """
+    wins = losses = ties = 0
+    relative_deltas: List[float] = []
+    enabled_maes: List[float] = []
+    neutral_maes: List[float] = []
+    weighted_enabled = 0.0
+    weighted_neutral = 0.0
+    weighted_total = 0.0
+    for task in tasks:
+        enabled = _finite_metric(task, "test_mae_on")
+        neutral = _finite_metric(task, "test_mae_relation_neutral")
+        if enabled is None or neutral is None:
+            continue
+        relative_delta = (enabled - neutral) / neutral if neutral > 1e-12 else 0.0
+        if abs(relative_delta) <= 1e-8:
+            relative_delta = 0.0
+        relative_deltas.append(relative_delta)
+        enabled_maes.append(enabled)
+        neutral_maes.append(neutral)
+        if relative_delta < -1e-8:
+            wins += 1
+        elif relative_delta > 1e-8:
+            losses += 1
+        else:
+            ties += 1
+        n_val = task.get("n_val")
+        if isinstance(n_val, (int, float)) and n_val > 0:
+            weighted_enabled += enabled * float(n_val)
+            weighted_neutral += neutral * float(n_val)
+            weighted_total += float(n_val)
+    mean_relative_delta = float(np.mean(relative_deltas)) if relative_deltas else 0.0
+    if len(relative_deltas) < 9:
+        status = "invalid"
+    else:
+        status = "qualified" if mean_relative_delta <= 0 and wins >= losses else "unqualified"
+    result = {
+        "status": status,
+        "valid_tasks": len(relative_deltas),
+        "wins": wins,
+        "losses": losses,
+        "ties": ties,
+        "mean_relative_delta": mean_relative_delta,
+        "equal_weight_mae_enabled": float(np.mean(enabled_maes)) if enabled_maes else None,
+        "equal_weight_mae_neutral": float(np.mean(neutral_maes)) if neutral_maes else None,
+        "sample_weighted_mae_enabled": (
+            weighted_enabled / weighted_total if weighted_total > 0 else None
+        ),
+        "sample_weighted_mae_neutral": (
+            weighted_neutral / weighted_total if weighted_total > 0 else None
+        ),
+    }
+    if status == "invalid":
+        result["reason"] = (
+            f"only {len(relative_deltas)}/9 tasks have valid relation contrast data"
+        )
+    return result
+
+
+def evaluate_v6_core_gates(
+    tasks: Sequence[Mapping[str, Any]],
+    *,
+    trace_root: Path,
+) -> Dict[str, Any]:
+    """v6 核心决策链验收门槛（§6.1）。
+
+    同时以 validation 选定最佳单模型与最佳二模型为硬门槛；System A 与 v4d 只作
+    参照，不进入 status。
+    """
+    task_keys = {(task.get("dataset"), task.get("horizon")) for task in tasks}
+    expected_keys = {(spec["dataset"], spec["horizon"]) for spec in build_task_specs()}
+    task_issues = []
+    if len(tasks) != 9 or task_keys != expected_keys:
+        task_issues.append("tasks are not the fixed nine-task set")
+    task_issues.extend(
+        f"{task.get('dataset')} h={task.get('horizon')}: status={task.get('status')}"
+        for task in tasks
+        if task.get("status") != "ok"
+    )
+    all_tasks = {"passed": not task_issues, "issues": task_issues}
+
+    numeric_issues = []
+    for task in tasks:
+        label = f"{task.get('dataset')} h={task.get('horizon')}"
+        on = _finite_metric(task, "test_mae_on")
+        off = _finite_metric(task, "test_mae_off")
+        delta = _finite_metric(task, "test_mae_delta")
+        protocol_b_on = _finite_metric(task, "protocol_b", "on", "mae")
+        if on is None or off is None or delta is None:
+            numeric_issues.append(f"{label}: on/off/delta is missing or non-finite")
+        elif not np.isclose(delta, on - off, rtol=0.0, atol=1e-9):
+            numeric_issues.append(f"{label}: test_mae_delta does not equal on-off")
+        if protocol_b_on is None:
+            numeric_issues.append(f"{label}: Protocol B MAE is missing or non-finite")
+        elif on is not None and not np.isclose(on, protocol_b_on, rtol=0.0, atol=1e-9):
+            numeric_issues.append(f"{label}: protocol_b.on.mae differs from test_mae_on")
+        if _finite_metric(task, "best_single", "test", "mae") is None:
+            numeric_issues.append(f"{label}: best-single MAE is missing or non-finite")
+        best_pair = task.get("best_pair_reference")
+        if not isinstance(best_pair, Mapping) or _finite_metric(best_pair, "test", "mae") is None:
+            numeric_issues.append(f"{label}: best-pair reference MAE is missing or non-finite")
+    numeric_consistency = {"passed": not numeric_issues, "issues": numeric_issues}
+
+    v6_modes = ("relation_warmup", "on", "off", "relation_neutral")
+    trace_issues = []
+    valid_traces = 0
+    for spec in build_task_specs():
+        for mode in v6_modes:
+            relative = Path(spec["dataset"]) / f"h{spec['horizon']}" / f"protocol_b_trace_{mode}.json"
+            path = trace_root / relative
+            if not path.exists():
+                trace_issues.append(f"missing:{relative}")
+                continue
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                trace_issues.append(f"invalid:{relative}:{type(exc).__name__}")
+                continue
+            if not isinstance(payload, Mapping) or not isinstance(payload.get("stages"), list):
+                trace_issues.append(f"invalid_schema:{relative}")
+                continue
+            pb = next(
+                (s for s in payload["stages"] if isinstance(s, Mapping) and s.get("stage") == "ProtocolBBackend"),
+                None,
+            )
+            if pb is None:
+                trace_issues.append(f"missing_protocol_b_stage:{relative}")
+                continue
+            outputs = pb.get("outputs") if isinstance(pb, Mapping) else {}
+            sf = outputs.get("selection_flow") if isinstance(outputs, Mapping) else None
+            if not isinstance(sf, Mapping) or not sf:
+                trace_issues.append(f"empty_selection_flow:{relative}")
+                continue
+            if not sf.get("selector_output"):
+                trace_issues.append(f"missing_selector_output:{relative}")
+                continue
+            valid_traces += 1
+    trace_integrity = {
+        "passed": not trace_issues and valid_traces == 36,
+        "expected": 36,
+        "valid": valid_traces,
+        "issues": trace_issues,
+    }
+
+    single_ratios: List[float] = []
+    pair_ratios: List[float] = []
+    per_single_failures: List[str] = []
+    per_pair_failures: List[str] = []
+    for task in tasks:
+        label = f"{task.get('dataset')} h={task.get('horizon')}"
+        b_mae = _finite_metric(task, "protocol_b", "on", "mae")
+        single_mae = _finite_metric(task, "best_single", "test", "mae")
+        pair_mae = _finite_metric(task, "best_pair_reference", "test", "mae")
+        if b_mae is None or single_mae is None or single_mae <= 0:
+            per_single_failures.append(label)
+        else:
+            single_ratio = b_mae / single_mae
+            single_ratios.append(single_ratio)
+            if single_ratio > 1.03:
+                per_single_failures.append(label)
+        if b_mae is None or pair_mae is None or pair_mae <= 0:
+            per_pair_failures.append(label)
+        else:
+            pair_ratio = b_mae / pair_mae
+            pair_ratios.append(pair_ratio)
+            if pair_ratio > 1.03:
+                per_pair_failures.append(label)
+
+    mean_single_passed = bool(single_ratios) and float(np.mean(single_ratios)) <= 1.01
+    mean_pair_passed = bool(pair_ratios) and float(np.mean(pair_ratios)) <= 1.01
+    mean_vs_single = {
+        "passed": mean_single_passed,
+        "threshold_ratio": 1.01,
+        "mean_ratio": float(np.mean(single_ratios)) if single_ratios else None,
+    }
+    mean_vs_pair = {
+        "passed": mean_pair_passed,
+        "threshold_ratio": 1.01,
+        "mean_ratio": float(np.mean(pair_ratios)) if pair_ratios else None,
+    }
+    per_task_vs_single = {
+        "passed": not per_single_failures,
+        "threshold_ratio": 1.03,
+        "failures": per_single_failures,
+    }
+    per_task_vs_pair = {
+        "passed": not per_pair_failures,
+        "threshold_ratio": 1.03,
+        "failures": per_pair_failures,
+    }
+
+    gates = {
+        "all_tasks_successful": all_tasks,
+        "numeric_consistency": numeric_consistency,
+        "trace_integrity": trace_integrity,
+        "mean_vs_best_single_1pct": mean_vs_single,
+        "per_task_vs_best_single_3pct": per_task_vs_single,
+        "mean_vs_best_pair_1pct": mean_vs_pair,
+        "per_task_vs_best_pair_3pct": per_task_vs_pair,
+    }
+    gates["status"] = "passed" if all(gate["passed"] for gate in gates.values()) else "failed"
+    return gates
+
+
 def validate_shadow_report(
     report: Mapping[str, Any],
     *,
@@ -1605,9 +1838,15 @@ def validate_shadow_report(
 ) -> None:
     version = report.get("schema_version")
     if version == REPORT_SCHEMA_VERSION:
+        # v6：36 traces + 最佳二模型固定枚举门槛 + 关系资格
+        is_v6 = True
         relation_required = True
-    elif version in LEGACY_REPORT_SCHEMA_VERSIONS:
+    elif version == "task7-shadow.4":
+        is_v6 = False
+        relation_required = True
+    elif version == "task7-shadow.3":
         # 旧版报告按接入关系强度之前的口径复核，其证据仍然有效
+        is_v6 = False
         relation_required = False
     else:
         raise ValueError(f"unexpected schema_version: {version}")
@@ -1671,6 +1910,12 @@ def validate_shadow_report(
             "test_mae_relation_neutral",
             "test_mae_relation_delta",
         )
+    if is_v6:
+        per_task_required = per_task_required + (
+            "best_pair_reference",
+            "best_pair_same_as_protocol_b",
+            "explicit_conflict_edges_consumed",
+        )
     for i, task in enumerate(tasks):
         if task.get("status") != "ok":
             raise ValueError(f"task {i} not successful: {task.get('error')}")
@@ -1703,7 +1948,10 @@ def validate_shadow_report(
     meta = report.get("_meta")
     if not isinstance(meta, dict):
         raise ValueError("report missing _meta")
-    for key in ("code_commit", "random_seed", "data_hashes", "python", "environment"):
+    _meta_keys = ["code_commit", "random_seed", "data_hashes", "python", "environment"]
+    if is_v6:
+        _meta_keys.append("candidate_diagnostic_sha256")
+    for key in _meta_keys:
         if key not in meta:
             raise ValueError(f"_meta missing {key}")
     env = meta.get("environment")
@@ -1727,13 +1975,24 @@ def validate_shadow_report(
             resolved_trace_root = candidate
     if resolved_trace_root is None:
         raise ValueError("quality_gates validation requires an existing trace_root")
-    recomputed_gates = evaluate_quality_gates(
-        tasks, trace_root=resolved_trace_root, include_relation_gate=relation_required
-    )
+    if is_v6:
+        recomputed_gates = evaluate_v6_core_gates(tasks, trace_root=resolved_trace_root)
+    else:
+        recomputed_gates = evaluate_quality_gates(
+            tasks, trace_root=resolved_trace_root, include_relation_gate=relation_required
+        )
     if dict(recorded_gates) != recomputed_gates:
         raise ValueError("quality_gates do not match recomputed metrics or trace files")
     if recomputed_gates.get("status") != "passed":
         raise ValueError("quality_gates failed")
+
+    if is_v6:
+        recorded_relation = report.get("relation_qualification")
+        if not isinstance(recorded_relation, Mapping):
+            raise ValueError("report missing relation_qualification")
+        recomputed_relation = evaluate_relation_qualification(tasks)
+        if dict(recorded_relation) != recomputed_relation:
+            raise ValueError("relation_qualification does not match recomputed task metrics")
 
 
 # ---------------------------------------------------------------------------
@@ -1763,6 +2022,7 @@ def main() -> int:
     )
     parser.add_argument("--skip-combinator", action="store_true", help="跳过旧 System A 参考（默认运行）")
     parser.add_argument("--combinator-timeout", type=float, default=900.0)
+    parser.add_argument("--candidate-diagnostic", type=Path, default=None, help="候选诊断报告（task83-candidate-diagnostic.1）")
     parser.add_argument("--out-root", type=Path, default=PROJECT_ROOT / "result" / "ab_convergence" / "shadow_9tasks")
     args = parser.parse_args()
 
@@ -1807,7 +2067,58 @@ def main() -> int:
     if not specs:
         parser.error("selected datasets/horizons produce no tasks")
 
+    full_run = len(specs) == len(build_task_specs())
+
+    # v6 完整九任务必须在运行前完成预检，失败立即停止，不先跑完九任务。
+    if full_run:
+        if args.candidate_diagnostic is None:
+            parser.error("完整 9 任务 v6 运行要求 --candidate-diagnostic")
+        if not args.require_baseline_provenance:
+            parser.error("完整 9 任务 v6 运行要求 --require-baseline-provenance")
+        if args.seed != 42:
+            parser.error("完整 9 任务 v6 运行要求 --seed 42")
+
     models = _build_kg_model_candidates()
+
+    # 候选诊断（Task 8.3 Task 7）：按 (dataset, horizon) 索引，供任务注入
+    # best_pair_reference / best_pair_same_as_protocol_b / explicit_conflict_edges_consumed。
+    candidate_diagnostic: Dict[Tuple[str, int], Mapping[str, Any]] = {}
+    candidate_diagnostic_sha256: Optional[str] = None
+    if args.candidate_diagnostic is not None:
+        diag_path = (
+            args.candidate_diagnostic
+            if args.candidate_diagnostic.is_absolute()
+            else PROJECT_ROOT / args.candidate_diagnostic
+        )
+        if not diag_path.exists():
+            parser.error(f"--candidate-diagnostic 文件不存在: {diag_path}")
+        diag_report = json.loads(diag_path.read_text(encoding="utf-8"))
+        from scripts.run_protocol_b_candidate_diagnostic import validate_diagnostic_schema
+
+        try:
+            validate_diagnostic_schema(diag_report)
+        except ValueError as exc:
+            parser.error(f"候选诊断 schema 不合法: {exc}")
+        diag_tasks = diag_report.get("tasks") or []
+        diag_keys = {(dt["dataset"], int(dt["horizon"])) for dt in diag_tasks}
+        expected_keys = {(s["dataset"], s["horizon"]) for s in build_task_specs()}
+        if diag_keys != expected_keys:
+            parser.error(
+                "候选诊断未覆盖恰好九个唯一任务；缺失: "
+                f"{sorted((k[0], k[1]) for k in (expected_keys - diag_keys))}"
+            )
+        if full_run:
+            # 锁定来源校验：固定 baselines_v5 的 pipeline/数据/provenance 哈希与
+            # 72 artifacts + 225 文件哈希（Global Constraints 写定值）。
+            from scripts.run_protocol_b_candidate_diagnostic import verify_locked_sources
+
+            verify_locked_sources(
+                pred_root=pred_root, pipeline_config=pipeline_config, feature_root=feature_root
+            )
+        candidate_diagnostic_sha256 = _sha256_file(diag_path)
+        for dt in diag_tasks:
+            candidate_diagnostic[(dt["dataset"], int(dt["horizon"]))] = dt
+
     print(f"KG 基础候选模型: {models}")
     print(f"任务数: {len(specs)}（完整 9 任务需要 {len(build_task_specs())} 个）")
     print(f"run_combinator: {not args.skip_combinator}")
@@ -1832,6 +2143,7 @@ def main() -> int:
             combinator_timeout_seconds=args.combinator_timeout,
             feature_root=feature_root,
             baseline_provenance=(baseline_provenance if args.require_baseline_provenance else None),
+            candidate_diagnostic=candidate_diagnostic,
         )
         print(
             f"  status={record['status']} test_mae_on={record.get('test_mae_on')} "
@@ -1853,7 +2165,15 @@ def main() -> int:
 
     full_run = len(specs) == len(full_specs)
     quality_gates = (
-        evaluate_quality_gates(tasks, trace_root=out_root)
+        evaluate_v6_core_gates(tasks, trace_root=out_root)
+        if full_run
+        else {
+            "status": "not_evaluated",
+            "reason": f"subset run contains {len(specs)}/9 tasks",
+        }
+    )
+    relation_qualification = (
+        evaluate_relation_qualification(tasks)
         if full_run
         else {
             "status": "not_evaluated",
@@ -1867,6 +2187,7 @@ def main() -> int:
         "tasks": tasks,
         "aggregates": aggregate_summary(tasks),
         "quality_gates": quality_gates,
+        "relation_qualification": relation_qualification,
         "_meta": {
             "code_commit": _git_commit(),
             "random_seed": args.seed,
@@ -1881,6 +2202,7 @@ def main() -> int:
             "out_root": str(out_root),
             "filter_threshold": args.filter_threshold,
             "run_combinator": not args.skip_combinator,
+            "candidate_diagnostic_sha256": candidate_diagnostic_sha256,
             "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         },
     }

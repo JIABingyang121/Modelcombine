@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -415,3 +417,346 @@ def test_quality_gates_reject_a_missing_or_malformed_trace(tmp_path):
     assert gates["trace_integrity"]["passed"] is False
     assert gates["trace_integrity"]["valid"] == 16
     assert len(gates["trace_integrity"]["issues"]) == 2
+
+
+# --- v6 核心门槛（Task 8.3 Task 7） -----------------------------------------
+
+
+def _add_pair_references(tasks):
+    for task in tasks:
+        b_mae = task["protocol_b"]["on"]["mae"]
+        task["best_pair_reference"] = {
+            "models": ["m1", "m2"],
+            "validation_mae": 9.0,
+            "selection_uses_test_labels": False,
+            "test": {"mae": b_mae},
+        }
+        task["best_pair_same_as_protocol_b"] = True
+        task["explicit_conflict_edges_consumed"] = 0
+    return tasks
+
+
+def _write_v6_traces(root: Path) -> None:
+    for dataset in ("pjm", "aemo_vic", "aemo_nsw"):
+        for horizon in (1, 6, 24):
+            task_dir = root / dataset / f"h{horizon}"
+            task_dir.mkdir(parents=True)
+            for mode in ("relation_warmup", "on", "off", "relation_neutral"):
+                (task_dir / f"protocol_b_trace_{mode}.json").write_text(
+                    json.dumps({"stages": [{
+                        "stage": "ProtocolBBackend",
+                        "outputs": {"selection_flow": {
+                            "selector_output": ["m1", "m2"],
+                            "final_selected_before_fit": ["m1", "m2"],
+                        }},
+                    }]}),
+                    encoding="utf-8",
+                )
+
+
+def test_pair_gate_catches_regression_that_best_single_allows(tmp_path):
+    tasks = _add_pair_references(_nine_tasks())
+    _write_v6_traces(tmp_path)
+    task = tasks[0]
+    task["protocol_b"]["on"]["mae"] = 518.0
+    task["best_single"]["test"]["mae"] = 586.0
+    task["best_pair_reference"] = {
+        "models": ["catboost_reg", "lgbm_reg"],
+        "validation_mae": 250.0,
+        "selection_uses_test_labels": False,
+        "test": {"mae": 347.0},
+    }
+    gates = shadow.evaluate_v6_core_gates(tasks, trace_root=tmp_path)
+    assert gates["per_task_vs_best_pair_3pct"]["passed"] is False
+
+
+def test_relation_qualification_uses_relative_delta_and_win_loss():
+    tasks = []
+    for index in range(9):
+        neutral = 100.0 if index < 3 else 10.0
+        relative = -0.01 if index < 5 else 0.005
+        tasks.append({
+            "status": "ok", "n_val": 100 + index,
+            "test_mae_on": neutral * (1.0 + relative),
+            "test_mae_relation_neutral": neutral,
+        })
+    qualification = shadow.evaluate_relation_qualification(tasks)
+    assert qualification["mean_relative_delta"] <= 0
+    assert qualification["wins"] >= qualification["losses"]
+    assert qualification["status"] == "qualified"
+
+
+def test_relation_failure_does_not_fail_core_chain(tmp_path):
+    tasks = _add_pair_references(_nine_tasks())
+    _write_v6_traces(tmp_path)
+    core = shadow.evaluate_v6_core_gates(tasks, trace_root=tmp_path)
+    relation = shadow.evaluate_relation_qualification([
+        {**task, "test_mae_on": 11.0, "test_mae_relation_neutral": 10.0}
+        for task in tasks
+    ])
+    assert core["status"] == "passed"
+    assert relation["status"] == "unqualified"
+
+
+def test_run_task_injects_candidate_diagnostic_fields(monkeypatch, tmp_path):
+    """走真实 run_task 入口：候选诊断字段必须注入到任务记录。"""
+    ts_val = pd.date_range("2026-01-01", periods=20, freq="h")
+    ts_test = pd.date_range("2026-02-01", periods=10, freq="h")
+    df_val = pd.DataFrame({"timestamp": ts_val, "y": np.ones(20), "m1": np.ones(20), "m2": np.ones(20)})
+    df_test = pd.DataFrame({"timestamp": ts_test, "y": np.ones(10), "m1": np.ones(10), "m2": np.ones(10)})
+    matrix = {
+        "df_val_kg": df_val, "df_test_kg": df_test,
+        "df_raw_val": None, "df_raw_test": None,
+        "safe_models": ["m1", "m2"],
+        "base_model_cols": ["m1", "m2"],
+        "metadata": {
+            "filter": {}, "eligible_filter_reasons": {"m1": [], "m2": []},
+            "frozen_naive": {"loaded": False},
+            "common_base_models": ["m1", "m2"],
+            "raw": {"val_loaded": True, "test_loaded": True},
+        },
+    }
+    raw = {
+        "protocol": "B_pred_features",
+        "val": {
+            "weight_meta": {
+                "protocol_b_selection_meta": {"explicit_conflict_edges_consumed": 2},
+            },
+        },
+        "test": {
+            "selected_models": ["m1", "m2"],
+            "weights": {"m1": 0.5, "m2": 0.5},
+            "weight_meta": {
+                "protocol_b_guard": {"fallback_target": None, "reason": None},
+                "guard_config": {},
+                "interaction_branch": {
+                    "applied": True, "enabled": True,
+                    "val_mae_raw": 9.0, "val_mae_interaction": 8.5,
+                    "cv_mae_raw_guard": 9.4, "cv_mae_interaction_guard": 8.9,
+                    "cv_guard_source": "oof_blocked_cv", "cv_oof_coverage": 0.8,
+                },
+                "post_adjustment": {"applied": False},
+            },
+        },
+    }
+    pred = {"test": np.ones(10)}
+    trace = SimpleNamespace(stages=[{"stage": "ProtocolBBackend"}])
+
+    monkeypatch.setattr(shadow, "build_task_matrix", lambda **kwargs: matrix)
+    monkeypatch.setattr(shadow, "_run_protocol_b_on_matrix", lambda **kwargs: (raw, pred, trace))
+    monkeypatch.setattr(shadow, "_run_protocol_a_on_matrix", lambda *a, **k: {"mae": 10.0, "rmse": 12.0})
+
+    candidate_diagnostic = {
+        ("pjm", 1): {
+            "best_pair": {
+                "models": ["m1", "m2"], "validation_mae": 8.0,
+                "selection_uses_test_labels": False, "selection_source": "validation_mae_only",
+                "test": {"mae": 9.0},
+            },
+            "best_pair_same_as_protocol_b": True,
+            "explicit_conflict_edges_consumed": 2,
+        },
+    }
+    record = shadow.run_task(
+        dataset="pjm", horizon=1, models=["m1", "m2"],
+        pred_root=tmp_path, raw_root=None, out_root=tmp_path,
+        filter_threshold=0.0, seed=42, run_combinator=False,
+        candidate_diagnostic=candidate_diagnostic,
+    )
+    assert record["status"] == "ok"
+    assert record["best_pair_reference"]["models"] == ["m1", "m2"]
+    assert record["best_pair_reference"]["test"]["mae"] == 9.0
+    assert record["best_pair_same_as_protocol_b"] is True
+    assert record["explicit_conflict_edges_consumed"] == 2
+
+
+def test_main_requires_candidate_diagnostic_for_full_run(monkeypatch, tmp_path):
+    """完整九任务运行前必须强制 candidate diagnostic，失败立即停止，不先跑完九任务。"""
+    import sys
+
+    monkeypatch.setattr(sys, "argv", [
+        "run_system_ab_shadow.py",
+        "--pred-root", str(tmp_path),
+        "--raw-root", str(tmp_path),
+        "--feature-root", str(tmp_path),
+        "--output", str(tmp_path / "report.json"),
+        "--skip-combinator",
+    ])
+    with pytest.raises(SystemExit) as exc:
+        shadow.main()
+    assert exc.value.code == 2
+
+
+def test_main_assembles_v6_report_through_cli(monkeypatch, tmp_path):
+    """走 main() 完整报告组装路径：CLI 预检 → 9 任务 → v6 quality_gates +
+    relation_qualification → validate_shadow_report 复核通过（main 返回 0）。
+
+    这补上此前只测 run_task / evaluate_v6_core_gates 单点、未经过 CLI 与最终
+    report 结构的缺口。
+    """
+    import sys
+
+    from tests.test_system_ab_shadow_report import _task as _v5_task
+
+    records = []
+    for dataset in ("pjm", "aemo_vic", "aemo_nsw"):
+        for horizon in (1, 6, 24):
+            task = _v5_task(dataset=dataset, horizon=horizon, n_val=100 + horizon)
+            b_mae = task["test_mae_on"]
+            task["best_pair_reference"] = {
+                "models": ["m1", "m2"],
+                "validation_mae": 9.0,
+                "selection_uses_test_labels": False,
+                "test": {"mae": b_mae},
+            }
+            task["best_pair_same_as_protocol_b"] = True
+            task["explicit_conflict_edges_consumed"] = 0
+            records.append(task)
+
+    out_root = tmp_path / "out"
+    _write_v6_traces(out_root)
+
+    diag_path = tmp_path / "candidate_diagnostic.json"
+    diag_path.write_text(
+        json.dumps({
+            "schema_version": "task83-candidate-diagnostic.1",
+            "tasks": [
+                {
+                    "task_id": f"{dataset}_h{horizon}",
+                    "dataset": dataset,
+                    "horizon": horizon,
+                    "matrix_hashes": {"df_val_kg": "x", "df_test_kg": "x"},
+                    "safe_models": ["m1", "m2"],
+                    "singles": [],
+                    "pairs": [
+                        {"models": ["m1", "m2"], "validation_mae": 9.0,
+                         "test_mae": 10.0, "eligible_pair": True},
+                    ],
+                    "best_single": {},
+                    "best_pair": {
+                        "models": ["m1", "m2"],
+                        "validation_mae": 9.0,
+                        "selection_uses_test_labels": False,
+                        "selection_source": "validation_mae_only",
+                        "test": {"mae": 10.0},
+                    },
+                    "protocol_b": {"models": ["m1", "m2"]},
+                    "best_pair_same_as_protocol_b": True,
+                    "explicit_conflict_edges_consumed": 0,
+                }
+                for dataset in ("pjm", "aemo_vic", "aemo_nsw")
+                for horizon in (1, 6, 24)
+            ],
+        }),
+        encoding="utf-8",
+    )
+
+    import scripts.run_protocol_b_candidate_diagnostic as diag_mod
+    import scripts.train_baselines as tb
+
+    monkeypatch.setattr(shadow, "_build_kg_model_candidates", lambda: ["m1", "m2"])
+    monkeypatch.setattr(
+        diag_mod, "verify_locked_sources",
+        lambda pred_root, pipeline_config, feature_root: {"status": "verified"},
+    )
+    monkeypatch.setattr(
+        tb, "load_verified_baseline_provenance",
+        lambda pred_root, pipeline_config: {"pipeline_sha256": "x", "data_hashes": {}},
+    )
+    monkeypatch.setattr(shadow, "run_task", lambda **kwargs: records.pop(0))
+
+    output = tmp_path / "report.json"
+    monkeypatch.setattr(sys, "argv", [
+        "run_system_ab_shadow.py",
+        "--pred-root", str(tmp_path),
+        "--raw-root", str(tmp_path),
+        "--feature-root", str(tmp_path),
+        "--output", str(output),
+        "--skip-combinator",
+        "--candidate-diagnostic", str(diag_path),
+        "--require-baseline-provenance",
+        "--seed", "42",
+        "--out-root", str(out_root),
+    ])
+
+    exit_code = shadow.main()
+
+    assert exit_code == 0
+    report = json.loads(output.read_text(encoding="utf-8"))
+    assert report["schema_version"] == "task8-v6.1"
+    gates = report["quality_gates"]
+    assert gates["status"] == "passed"
+    assert gates["trace_integrity"]["expected"] == 36
+    assert "per_task_vs_best_pair_3pct" in gates
+    assert report["relation_qualification"]["status"] == "qualified"
+    assert report["_meta"]["candidate_diagnostic_sha256"]
+
+
+def _v6_records():
+    from tests.test_system_ab_shadow_report import _task as _v5_task
+
+    records = []
+    for dataset in ("pjm", "aemo_vic", "aemo_nsw"):
+        for horizon in (1, 6, 24):
+            task = _v5_task(dataset=dataset, horizon=horizon, n_val=100 + horizon)
+            b_mae = task["test_mae_on"]
+            task["best_pair_reference"] = {
+                "models": ["m1", "m2"],
+                "validation_mae": 9.0,
+                "selection_uses_test_labels": False,
+                "test": {"mae": b_mae},
+            }
+            task["best_pair_same_as_protocol_b"] = True
+            task["explicit_conflict_edges_consumed"] = 0
+            records.append(task)
+    return records
+
+
+def _v6_report(trace_root):
+    records = _v6_records()
+    _write_v6_traces(trace_root)
+    return {
+        "schema_version": "task8-v6.1",
+        "task_specs": shadow.build_task_specs(),
+        "tasks": records,
+        "aggregates": shadow.aggregate_summary(records),
+        "quality_gates": shadow.evaluate_v6_core_gates(records, trace_root=trace_root),
+        "relation_qualification": shadow.evaluate_relation_qualification(records),
+        "_meta": {
+            "code_commit": "test",
+            "random_seed": 42,
+            "data_hashes": {"pjm": "a", "aemo_vic": "b", "aemo_nsw": "c"},
+            "python": "/tmp/python",
+            "out_root": str(trace_root),
+            "environment": {dep: "1.0" for dep in shadow.KEY_DEPENDENCIES},
+            "candidate_diagnostic_sha256": "abc",
+        },
+    }
+
+
+def test_v6_core_gates_reject_empty_selection_flow(tmp_path):
+    """空 selection_flow 或缺 selector_output 的 trace 必须让 trace 门槛失败。"""
+    tasks = _add_pair_references(_nine_tasks())
+    _write_v6_traces(tmp_path)
+    bad = tmp_path / "pjm" / "h1" / "protocol_b_trace_on.json"
+    bad.write_text(json.dumps({
+        "stages": [{"stage": "ProtocolBBackend", "outputs": {"selection_flow": {}}}],
+    }), encoding="utf-8")
+
+    gates = shadow.evaluate_v6_core_gates(tasks, trace_root=tmp_path)
+
+    assert gates["trace_integrity"]["passed"] is False
+    assert any("empty_selection_flow" in issue for issue in gates["trace_integrity"]["issues"])
+
+
+def test_validate_shadow_report_recomputes_relation_qualification(tmp_path):
+    """validate 必须重算 relation_qualification，记录值与重算不符时拒绝。"""
+    report = _v6_report(tmp_path)
+    assert report["relation_qualification"]["status"] == "qualified"
+    report["relation_qualification"] = {
+        **report["relation_qualification"],
+        "status": "unqualified",
+    }
+
+    with pytest.raises(ValueError, match="relation_qualification"):
+        shadow.validate_shadow_report(report, trace_root=tmp_path)

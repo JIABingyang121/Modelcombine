@@ -14,6 +14,7 @@ import argparse
 import hashlib
 import itertools
 import json
+import math
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
@@ -315,12 +316,16 @@ def build_diagnostic_report(
 
 
 def validate_diagnostic_schema(report: Dict[str, Any]) -> None:
-    """要求九条记录包含固定字段；最佳 pair 选择不得读 test 标签。"""
+    """要求九条唯一任务记录；最佳 pair 不得读 test 标签且须为 validation 选出。"""
     if report.get("schema_version") != SCHEMA_VERSION:
         raise ValueError(f"schema_version must be {SCHEMA_VERSION}")
     tasks = report.get("tasks")
     if not isinstance(tasks, list) or len(tasks) != 9:
         raise ValueError("expected exactly 9 task records")
+    # 九条唯一任务：重复 (dataset,horizon) 会被下游字典覆盖，必须拒绝。
+    keys = [(t.get("dataset"), t.get("horizon")) for t in tasks]
+    if len(set(keys)) != 9:
+        raise ValueError("tasks must cover 9 unique (dataset, horizon)")
     required = (
         "task_id", "dataset", "horizon", "matrix_hashes", "safe_models",
         "singles", "pairs", "best_single", "best_pair", "protocol_b",
@@ -331,13 +336,49 @@ def validate_diagnostic_schema(report: Dict[str, Any]) -> None:
             if key not in task:
                 raise ValueError(f"task {task.get('task_id')} missing key {key}")
         bp = task["best_pair"]
-        if bp is not None:
-            if bp.get("selection_uses_test_labels") is not False:
-                raise ValueError("best_pair must not use test labels")
-            if bp.get("selection_source") != "validation_mae_only":
-                raise ValueError("best_pair selection_source must be validation_mae_only")
-            if "test" not in bp:
-                raise ValueError("best_pair must record test only after selection")
+        if bp is None:
+            raise ValueError(f"task {task.get('task_id')} missing valid best_pair")
+        if bp.get("selection_uses_test_labels") is not False:
+            raise ValueError("best_pair must not use test labels")
+        if bp.get("selection_source") != "validation_mae_only":
+            raise ValueError("best_pair selection_source must be validation_mae_only")
+        if "test" not in bp:
+            raise ValueError("best_pair must record test only after selection")
+        # best_pair 必须是其 pair 列表按 validation 选出的结果，且数值也要一致：
+        # test.mae 是 v6 pair 门槛的分母，validation_mae 决定选择，伪造会直接改变验收。
+        expected = select_validation_best_pair(task.get("pairs") or [])
+        if expected is None:
+            raise ValueError(f"task {task.get('task_id')} has no eligible pair")
+        if sorted(bp.get("models") or []) != sorted(expected.get("models") or []):
+            raise ValueError(
+                f"task {task.get('task_id')} best_pair models {bp.get('models')} "
+                f"do not match validation-selected {expected.get('models')}"
+            )
+        try:
+            bp_val_mae = float(bp.get("validation_mae"))
+            exp_val_mae = float(expected.get("validation_mae"))
+            bp_test_mae = float((bp.get("test") or {}).get("mae"))
+            exp_test_mae = float(expected.get("test_mae"))
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise ValueError(
+                f"task {task.get('task_id')} best_pair metrics non-numeric: {exc}"
+            )
+        # NaN/Inf 会使 abs(a-b) 恒为 False 从而通过，必须显式拒绝非有限数值。
+        if not all(
+            math.isfinite(value)
+            for value in (bp_val_mae, exp_val_mae, bp_test_mae, exp_test_mae)
+        ):
+            raise ValueError(f"task {task.get('task_id')} best_pair metrics must be finite")
+        if abs(bp_val_mae - exp_val_mae) > 1e-9:
+            raise ValueError(
+                f"task {task.get('task_id')} best_pair.validation_mae {bp_val_mae} "
+                f"!= validation-selected {exp_val_mae}"
+            )
+        if abs(bp_test_mae - exp_test_mae) > 1e-9:
+            raise ValueError(
+                f"task {task.get('task_id')} best_pair.test.mae {bp_test_mae} "
+                f"!= validation-selected test_mae {exp_test_mae}"
+            )
 
 
 def main() -> int:

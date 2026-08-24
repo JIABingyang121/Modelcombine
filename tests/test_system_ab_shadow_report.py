@@ -118,7 +118,9 @@ def _valid_report(trace_root) -> dict:
         for horizon in (1, 6, 24):
             tasks.append(_task(dataset=dataset, horizon=horizon, n_val=100 + horizon))
     report = {
-        "schema_version": shadow.REPORT_SCHEMA_VERSION,
+        # 本文件固定 v5 报告结构（task7-shadow.4）；v6 结构由
+        # test_system_ab_shadow_quality_gates.py 与 test_protocol_b_v6_validation.py 覆盖。
+        "schema_version": "task7-shadow.4",
         "task_specs": shadow.build_task_specs(),
         "tasks": tasks,
         "aggregates": shadow.aggregate_summary(tasks),
