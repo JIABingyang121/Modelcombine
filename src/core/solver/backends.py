@@ -79,6 +79,8 @@ class ProtocolBBackend(CombinationBackend):
                 # 逐步选择轨迹：每步选了谁、CV MAE 多少、是否发生并列。
                 # 缺了它，两次运行选出不同组合时无法定位到分歧发生在哪一步。
                 "stepwise": relation_audit["stepwise"],
+                # stepwise 之后 reasoning/hybrid 是否覆盖了候选集合。
+                "selection_flow": relation_audit["selection_flow"],
             },
         )
         return normalized
@@ -130,6 +132,21 @@ class ProtocolBBackend(CombinationBackend):
             "candidate_scores": dict(scores) if isinstance(scores, dict) else {},
             "candidate_ranking": ranking,
             "stepwise": stepwise if isinstance(stepwise, dict) else None,
+            "score_components": (
+                selection_meta.get("score_components")
+                if isinstance(selection_meta.get("score_components"), dict)
+                else None
+            ),
+            "pair_diagnostics": (
+                selection_meta.get("pair_diagnostics")
+                if isinstance(selection_meta.get("pair_diagnostics"), dict)
+                else None
+            ),
+            "selection_flow": (
+                selection_meta.get("selection_flow")
+                if isinstance(selection_meta.get("selection_flow"), dict)
+                else None
+            ),
             "final_selection": list(split.get("selected_models") or []),
         }
 
@@ -175,11 +192,36 @@ class ProtocolBBackend(CombinationBackend):
             "removed_models": removed,
         }
 
+    @staticmethod
+    def _relation_feedback_audit(raw: Dict[str, Any]) -> Dict[str, Any]:
+        """提取带符号关系反馈证据（Task 8.3 Task 5）。
+
+        引擎在 raw 顶层与 val.weight_meta 均写入 relation_feedback；缺失时返回
+        不可用 payload 而非伪造 eligible=True。
+        """
+        fb = raw.get("relation_feedback")
+        if isinstance(fb, dict):
+            return fb
+        for split_name in ("val", "test"):
+            split = raw.get(split_name)
+            if isinstance(split, dict):
+                wm = split.get("weight_meta")
+                if isinstance(wm, dict) and isinstance(wm.get("relation_feedback"), dict):
+                    return wm["relation_feedback"]
+        return {
+            "eligible": False,
+            "skip_reason": "no_relation_feedback",
+            "deadband": 0.005,
+            "evidence_mode": None,
+            "by_model": {},
+        }
+
     def _normalize(self, raw: Dict[str, Any]) -> Dict[str, Any]:
         split = raw.get("test") or raw.get("val") or {}
         models = list(split.get("selected_models", []))
         weights = dict(split.get("weights", {}))
         protocol = raw.get("protocol", "protocol_b")
+        relation_feedback = self._relation_feedback_audit(raw)
         # 运行时预测（若引擎按 ctx.return_predictions 交出）从 raw 中**移出**，
         # 保证 raw 始终是可 JSON 序列化的、不含数组的实验载荷；预测另走
         # normalized["predictions"]，由调用方直接取用，绝不进 trace/实验 JSON。
@@ -190,6 +232,7 @@ class ProtocolBBackend(CombinationBackend):
             "strategy": protocol,
             "path_id": protocol,
             "protocol": protocol,
+            "relation_feedback": relation_feedback,
             "predictions": predictions,
             "raw": raw,
         }

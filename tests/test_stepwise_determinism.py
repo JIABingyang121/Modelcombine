@@ -215,3 +215,10 @@ def test_protocol_b_trace_exposes_stepwise_trajectory():
     assert stepwise.get("trace"), "stepwise 轨迹为空"
     assert "tie_rel_tol" in stepwise, "未记录并列容差，无法判断是否发生并列"
     assert "candidate_failures" in stepwise, "未记录候选评估失败"
+
+    selection_flow = outputs.get("selection_flow")
+    assert selection_flow, "trace 未记录 selection_flow"
+    assert selection_flow["selector_output"]
+    assert "used" in selection_flow["reasoning"]
+    assert selection_flow["post_selector_mutations"] == []
+    assert selection_flow["selector_output"] == selection_flow["final_selected_before_fit"]

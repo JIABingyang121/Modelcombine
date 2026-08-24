@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -15,12 +15,23 @@ from .config import (
     KG_HIGH_DRIFT_EXTENDED_SCORE_FACTOR,
     KG_RIDGE_TEMPORAL_DECAY,
     KG_ZERO_WEIGHT_CLEANUP_THRESHOLD,
+    PROTOCOL_B_ENFORCE_BASE_MODEL_DATASETS,
+    PROTOCOL_B_ENFORCE_BASE_MODEL_IN_SELECTION,
+    PROTOCOL_B_ENFORCE_BASE_MODEL_MIN_H,
+    PROTOCOL_B_ENFORCE_BASE_MODEL_MODE,
+    PROTOCOL_B_HIGH_DRIFT_SINGLE_MODEL_DIRECT_PASS_RATIO,
+    PROTOCOL_B_MIN_SELECTED_MODELS,
     PROTOCOL_B_RELATION_STRENGTH_NEUTRAL,
     PROTOCOL_B_RELATION_STRENGTH_WEIGHT,
     PROTOCOL_STEPWISE_TIE_RELATIVE_TOLERANCE,
     PROTOCOL_STEPWISE_MIN_IMPROVEMENT,
 )
-from .conflict import _lookup_pair_corr, check_conflict, compute_error_correlations
+from .conflict import (
+    _lookup_pair_corr,
+    check_conflict,
+    compute_error_correlations,
+    filter_conflicting_models,
+)
 from .data_io import _resolve_cv_config
 from .drift import _compute_temporal_weights
 from .stability import _adaptive_stepwise_min_improve
@@ -443,6 +454,23 @@ def forward_stepwise_select(
         "trace": trace,
     }
 
+def _compute_feature_bonus_map(
+    model_cols: List[str],
+    feat_model_corrs: Dict[Tuple[str, str], float],
+) -> Dict[str, float]:
+    """逐模型特征关联奖励（与 selector 内部同一公式，固定二模型诊断复用）。"""
+    feature_bonus = {m: 0.0 for m in model_cols}
+    feat_cnt = {m: 0 for m in model_cols}
+    for (_, m), corr in feat_model_corrs.items():
+        if m in feature_bonus:
+            feature_bonus[m] += float(corr)
+            feat_cnt[m] += 1
+    for m in model_cols:
+        if feat_cnt[m] > 0:
+            feature_bonus[m] = feature_bonus[m] / feat_cnt[m]
+    return feature_bonus
+
+
 def select_models_protocol_b(
     mg: ModelGraph,
     model_cols: List[str],
@@ -458,21 +486,16 @@ def select_models_protocol_b(
     beam_width: int = 3,
     drift_level: str = "low",
     relation_strength_weight: float = PROTOCOL_B_RELATION_STRENGTH_WEIGHT,
+    reasoning_contribution: Optional[Mapping[str, float]] = None,
+    dataset_name: Optional[str] = None,
+    base_model_cols: Optional[List[str]] = None,
 ) -> Tuple[List[str], Dict[str, float], Dict[str, float], Dict]:
     """
     Protocol B 专用模型选择：
     - 基础性能 + 互补边奖励 + 特征关联奖励
     - 与已选模型高相关时惩罚（鼓励误差多样性）
     """
-    feature_bonus = {m: 0.0 for m in model_cols}
-    feat_cnt = {m: 0 for m in model_cols}
-    for (_, m), corr in feat_model_corrs.items():
-        if m in feature_bonus:
-            feature_bonus[m] += float(corr)
-            feat_cnt[m] += 1
-    for m in model_cols:
-        if feat_cnt[m] > 0:
-            feature_bonus[m] = feature_bonus[m] / feat_cnt[m]
+    feature_bonus = _compute_feature_bonus_map(model_cols, feat_model_corrs)
 
     base_raw = {m: 1.0 / (maes[m] + 1e-6) for m in model_cols}
     base_max = max(base_raw.values()) if base_raw else 1.0
@@ -503,21 +526,33 @@ def select_models_protocol_b(
         for m in model_cols
     }
 
+    # reasoning 证据（Task 8.3 Task 2）：有来源的历史路径先验，冷启动为 0。
+    reasoning = {m: float((reasoning_contribution or {}).get(m, 0.0)) for m in model_cols}
+
+    score_components: Dict[str, Dict[str, float]] = {}
     for m in model_cols:
         base_norm = base_raw[m] / (base_max + 1e-10)
         comp_bonus = 0.0
         for neighbor in mg.neighbors_by_type(m, "complementary"):
             if neighbor in model_cols:
                 comp_bonus += float(mg.G[m][neighbor].get("weight", 0.5))
-        score = (
-            base_norm
-            + comp_bonus
-            + feature_bonus_weight * feature_bonus[m]
-            + relation_contribution[m]
-        )
-        if m in high_drift_penalty_models:
-            score *= KG_HIGH_DRIFT_EXTENDED_SCORE_FACTOR
-        base_scores[m] = score
+        feature_bonus_term = feature_bonus_weight * feature_bonus[m]
+        relation_term = relation_contribution[m]
+        reasoning_term = reasoning[m]
+        total = base_norm + comp_bonus + feature_bonus_term + relation_term + reasoning_term
+        high_drift_factor = KG_HIGH_DRIFT_EXTENDED_SCORE_FACTOR if m in high_drift_penalty_models else 1.0
+        final_score = total * high_drift_factor
+        score_components[m] = {
+            "base_norm": float(base_norm),
+            "complementary_bonus": float(comp_bonus),
+            "feature_bonus": float(feature_bonus_term),
+            "relation_strength": float(relation_term),
+            "reasoning": float(reasoning_term),
+            "total": float(total),
+            "high_drift_factor": float(high_drift_factor),
+            "final_score": float(final_score),
+        }
+        base_scores[m] = final_score
 
     # 基于 Feature->Model 相关性的“特征画像”差异，用于鼓励在不同特征区域互补的模型组合。
     feature_names = sorted({feat for feat, _ in feat_model_corrs.keys()})
@@ -596,6 +631,13 @@ def select_models_protocol_b(
     else:
         selected = []
 
+    # 唯一候选排序：(-base_score) 降序、MAE 升序作次级键。stepwise 的候选顺序
+    # 由此决定，也是 selector_output 之后所有约束阶段共同消费的顺序。
+    candidate_order = sorted(
+        model_cols,
+        key=lambda m: (-(base_scores.get(m, 0.0)), maes.get(m, float("inf"))),
+    )
+
     # 在图打分基础上再做一次前向逐步选择，直接优化验证集 MAE。
     stepwise_meta = {}
     stepwise_alpha = 1.0
@@ -613,10 +655,6 @@ def select_models_protocol_b(
             sample_weight=sample_weight,
             horizon=horizon,
             default_alpha=1.0,
-        )
-        candidate_order = sorted(
-            model_cols,
-            key=lambda m: (-(base_scores.get(m, 0.0)), maes.get(m, float("inf"))),
         )
         stepwise_selected, stepwise_meta = forward_stepwise_select(
             df_val=df_val,
@@ -636,12 +674,180 @@ def select_models_protocol_b(
 
     if len(selected) < 2:
         selected = sorted(model_cols, key=lambda m: maes[m])[:min(3, len(model_cols))]
+
+    # === 拟合前候选约束：唯一候选选择权在此收口（Task 8.3 Task 3）。===
+    # 这些决策原先散落在 protocol_b.py 的 selector 调用之后，现在全部移入本
+    # selector，并逐条记录 constraint_decisions，使选择流程可完整追溯。
+    constraint_decisions: List[Dict[str, Any]] = []
+    min_selected_models = min(
+        max(PROTOCOL_B_MIN_SELECTED_MODELS, 2), len(model_cols), max(2, max_models)
+    )
+
+    # 1) minimum-model fallback
+    if len(selected) < min_selected_models:
+        fallback = _fallback_selection(mg, model_cols, maes, max_models=max_models)
+        constraint_decisions.append({
+            "stage": "minimum_model_fallback",
+            "before": list(selected),
+            "after": list(fallback),
+        })
+        selected = fallback
+
+    # 2) explicit-conflict filtering（只过滤显式 conflict 边）
+    conflict_pairs = check_conflict(mg, selected)
+    if conflict_pairs:
+        filtered = filter_conflicting_models(mg, selected, maes=maes)
+        constraint_decisions.append({
+            "stage": "explicit_conflict_filtering",
+            "conflicts": [list(p) for p in conflict_pairs],
+            "before": list(selected),
+            "after": list(filtered),
+        })
+        selected = filtered
+    if len(selected) < min_selected_models:
+        # conflict 优先于最小数量：只补充与当前选择不冲突的模型；
+        # 找不到非冲突补充时允许少于最小数量，并留痕。
+        before_refill = list(selected)
+        for m in sorted(model_cols, key=lambda m: maes.get(m, float("inf"))):
+            if m in selected:
+                continue
+            if check_conflict(mg, selected + [m]):
+                continue
+            selected.append(m)
+            if len(selected) >= min_selected_models:
+                break
+        if len(selected) < min_selected_models:
+            constraint_decisions.append({
+                "stage": "minimum_not_met_due_to_explicit_conflict",
+                "requested": int(min_selected_models),
+                "achieved": int(len(selected)),
+                "before": before_refill,
+                "after": list(selected),
+            })
+        else:
+            constraint_decisions.append({
+                "stage": "minimum_model_refill",
+                "before": before_refill,
+                "after": list(selected),
+            })
+
+    # 3) max-model truncation
+    if len(selected) > max_models:
+        truncated = selected[:max_models]
+        constraint_decisions.append({
+            "stage": "max_model_truncation",
+            "before": list(selected),
+            "after": list(truncated),
+        })
+        selected = truncated
+
+    # 4) high-drift single-model direct pass
+    single_model_direct_pass_meta: Dict[str, Any] = {"applied": False}
+    if drift_level == "high" and len(selected) <= 2 and len(model_cols) > 0:
+        best_single = min(model_cols, key=lambda m: maes.get(m, float("inf")))
+        best_selected_mae = (
+            min([maes.get(m, float("inf")) for m in selected]) if selected else float("inf")
+        )
+        if maes.get(best_single, float("inf")) <= best_selected_mae * PROTOCOL_B_HIGH_DRIFT_SINGLE_MODEL_DIRECT_PASS_RATIO:
+            before = list(selected)
+            selected = [best_single]
+            single_model_direct_pass_meta = {
+                "applied": True,
+                "best_single": best_single,
+                "best_single_mae": float(maes.get(best_single, float("inf"))),
+                "best_selected_mae": float(best_selected_mae),
+                "ratio": float(PROTOCOL_B_HIGH_DRIFT_SINGLE_MODEL_DIRECT_PASS_RATIO),
+            }
+            constraint_decisions.append({
+                "stage": "high_drift_single_model_direct_pass",
+                "before": before,
+                "after": list(selected),
+            })
+
+    # 5) base-model injection / best-base-single mode
+    base_model_candidates = [m for m in (base_model_cols or []) if m in model_cols]
+    best_base_model = (
+        min(base_model_candidates, key=lambda m: maes.get(m, float("inf")))
+        if base_model_candidates
+        else None
+    )
+    base_selection_guard_meta: Dict[str, Any] = {
+        "enabled": bool(PROTOCOL_B_ENFORCE_BASE_MODEL_IN_SELECTION),
+        "triggered": False,
+        "mode": str(PROTOCOL_B_ENFORCE_BASE_MODEL_MODE),
+        "best_base_model": best_base_model,
+        "horizon": int(horizon),
+    }
+    enforce_dataset_ok = (
+        not PROTOCOL_B_ENFORCE_BASE_MODEL_DATASETS
+        or (dataset_name in PROTOCOL_B_ENFORCE_BASE_MODEL_DATASETS)
+    )
+    if (
+        PROTOCOL_B_ENFORCE_BASE_MODEL_IN_SELECTION
+        and PROTOCOL_B_ENFORCE_BASE_MODEL_MODE != "off"
+        and enforce_dataset_ok
+        and int(horizon) >= int(PROTOCOL_B_ENFORCE_BASE_MODEL_MIN_H)
+        and selected
+    ):
+        selected_base = [m for m in selected if m in set(base_model_cols or [])]
+        base_selection_guard_meta["selected_base_count_before"] = int(len(selected_base))
+        base_selection_guard_meta["selected_before"] = list(selected)
+        if not selected_base and best_base_model is not None:
+            base_selection_guard_meta["triggered"] = True
+            before = list(selected)
+            if PROTOCOL_B_ENFORCE_BASE_MODEL_MODE == "best_base_single":
+                selected = [best_base_model]
+            else:
+                # 移除与 best_base_model 显式冲突的现有模型，避免注入重新引入冲突。
+                conflicting_existing = [
+                    m for m in selected if check_conflict(mg, [m, best_base_model])
+                ]
+                if conflicting_existing:
+                    selected = [m for m in selected if m not in conflicting_existing]
+                    base_selection_guard_meta["removed_conflicting_existing"] = list(conflicting_existing)
+                selected = [best_base_model] + [m for m in selected if m != best_base_model]
+                if len(selected) > max_models:
+                    selected = selected[:max_models]
+            base_selection_guard_meta["selected_after"] = list(selected)
+            base_selection_guard_meta["reason"] = (
+                "ext_only_selection_guard: no base model selected in Protocol B candidate set"
+            )
+            constraint_decisions.append({
+                "stage": "base_model_injection",
+                "before": before,
+                "after": list(selected),
+            })
+
+    # 逐模型对的冲突/相关性诊断（Task 8.3 Task 3）：hard_conflict 只来自显式
+    # conflict 边；correlation_penalty 来自连续误差相关性，不构成硬排除。
+    ordered_cols = sorted(model_cols)
+    pair_diagnostics: Dict[str, Dict[str, Any]] = {}
+    for i in range(len(ordered_cols)):
+        for j in range(i + 1, len(ordered_cols)):
+            m1, m2 = ordered_cols[i], ordered_cols[j]
+            corr = _lookup_pair_corr(error_corrs, m1, m2, default=0.0)
+            pair_diagnostics[f"{m1}|{m2}"] = {
+                "hard_conflict": bool(check_conflict(mg, [m1, m2])),
+                "error_corr": float(corr),
+                "correlation_penalty": float(abs(corr)),
+            }
+
     meta = {
         "feature_diversity_weight": float(feature_diversity_weight),
         "drift_level": drift_level,
+        "min_selected_models": int(min_selected_models),
+        "candidate_order": list(candidate_order),
+        "selector_output": list(selected),
+        "constraint_decisions": constraint_decisions,
+        "pair_diagnostics": pair_diagnostics,
+        "single_model_direct_pass": single_model_direct_pass_meta,
+        "base_selection_guard": base_selection_guard_meta,
         "stepwise_alpha": float(stepwise_alpha),
         "stepwise_min_improve_ratio": float(stepwise_min_improve),
         "stepwise_meta": stepwise_meta,
+        # 逐模型评分分解（Task 8.3 Task 2/3）：五项之和为 total；
+        # final_score = total * high_drift_factor 才是真实候选排序分数。
+        "score_components": score_components,
         # 关系强度评分项（§11#7）：留痕以便回答"为什么这条候选排在前面"。
         # by_model 为读到的强度，contribution 为已乘权重、已减中性的实际加分。
         "relation_strength": {

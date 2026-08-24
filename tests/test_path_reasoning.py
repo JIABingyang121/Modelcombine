@@ -1,4 +1,7 @@
 import json
+import os
+import subprocess
+import sys
 from types import SimpleNamespace
 
 from src.core.solver.backends import CombinatorBackend
@@ -67,6 +70,38 @@ def test_infer_optimal_path_by_reasoning_can_return_details():
     assert all(isinstance(item, ReasoningPath) for item in results)
     scores = [item.final_score for item in results]
     assert scores == sorted(scores, reverse=True)
+
+
+def test_reasoning_tie_break_is_stable_across_hash_seeds():
+    """等分路径的首选不能随 Python 进程哈希种子改变。
+
+    生产中的 Protocol B 默认使用 reasoning=hybrid；若多个冷启动路径同分，首条
+    推理路径会参与后续模型合并。因此这里必须跨独立进程验证，而不只测单进程。
+    当前实现遍历 set，seed=1/2 会分别产生不同首路径。
+    """
+    program = """
+from src.graph.model_graph import ModelGraph
+graph = ModelGraph()
+graph.add_scenario_node('s', {})
+graph.add_feature_node('f')
+for model in ['arima', 'catboost_reg', 'lgbm_reg', 'xgboost_reg']:
+    graph.add_model_node(model, {'input_constraints': {'features': ['f']}})
+    graph.add_feature_model_edge('f', model)
+graph.add_scenario_feature_edge('s', 'f')
+print(graph.infer_optimal_path_by_reasoning('s', {'f'})[0][0])
+"""
+    project_root = os.path.dirname(os.path.dirname(__file__))
+    chosen = []
+    for seed in ('1', '2'):
+        env = {**os.environ, 'PYTHONHASHSEED': seed, 'PYTHONPATH': project_root}
+        output = subprocess.check_output(
+            [sys.executable, '-c', program], text=True, env=env,
+        ).strip()
+        chosen.append(output)
+
+    assert chosen[0] == chosen[1], (
+        f"同分推理路径随 hash seed 改变：{chosen[0]} vs {chosen[1]}"
+    )
 
 
 class _StubCombinator:

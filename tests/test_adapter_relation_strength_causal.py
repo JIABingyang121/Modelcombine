@@ -185,7 +185,15 @@ def test_feedback_stage_emits_scenario_to_model_recommended_for_edges():
     from src.graph.temporal_relations import events_from_solver_result
 
     trace = SelectionTrace(scenario_id="scenario_x")
-    result = {"models": ["cand_a", "cand_b"], "weights": {"cand_a": 0.6, "cand_b": 0.4}}
+    result = {
+        "relation_feedback": {
+            "eligible": True,
+            "by_model": {
+                "cand_a": {"polarity": "positive", "magnitude": 0.6, "skip_reason": None},
+                "cand_b": {"polarity": "negative", "magnitude": 0.4, "skip_reason": None},
+            },
+        }
+    }
 
     from src.graph.temporal_relations import make_temporal_relation_stage  # noqa: F401
 

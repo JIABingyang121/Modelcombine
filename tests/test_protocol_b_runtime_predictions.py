@@ -79,8 +79,9 @@ def test_default_off_returns_no_runtime_predictions_and_is_json_serializable():
     result, _, _ = _run()
 
     assert RUNTIME_PREDICTIONS_KEY not in result
-    # B_pred_features 分支还带 feedback_apply_meta；这里锁定"不因本改动多出键"
-    assert set(result.keys()) == {"val", "test", "protocol", "feedback_apply_meta"}
+    # B_pred_features 分支带 feedback_apply_meta 与 relation_feedback（Task 8.3 Task 5）；
+    # 这里锁定"不因本改动多出键"（runtime predictions 不进结果）。
+    assert set(result.keys()) == {"val", "test", "protocol", "feedback_apply_meta", "relation_feedback"}
     for split in ("val", "test"):
         assert RUNTIME_PREDICTIONS_KEY not in result[split]
     # 结构未被污染：默认路径仍可直接 JSON 序列化，体积不含预测数组

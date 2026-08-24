@@ -192,7 +192,7 @@ class ModelGraph:
 
         # Step 1: 从可用特征出发，找到所有可以使用这些特征的模型
         candidate_models = set()
-        for feat in available_features:
+        for feat in sorted(available_features):
             if self.G.has_node(feat):
                 for _, model, data in self.G.out_edges(feat, data=True):
                     if data.get('edge_type') == 'input_to':
@@ -208,7 +208,7 @@ class ModelGraph:
         candidate_paths = {}
 
         # 2.1 查找图谱中已存在的路径
-        for model in candidate_models:
+        for model in sorted(candidate_models):
             for _, path, data in self.G.out_edges(model, data=True):
                 if data.get('edge_type') == 'part_of':
                     if path not in candidate_paths:
@@ -216,7 +216,7 @@ class ModelGraph:
                     candidate_paths[path].append(model)
 
         # 2.2 动态生成单模型路径（解决冷启动问题）
-        for model in candidate_models:
+        for model in sorted(candidate_models):
             single_path_id = f"single_{model}"
             if single_path_id not in candidate_paths:
                 # 注册到图谱 (确保节点存在)
@@ -224,22 +224,24 @@ class ModelGraph:
                 candidate_paths[single_path_id] = [model]
 
         # 2.3 基于图谱关系动态生成组合路径
-        for model_a in candidate_models:
-            # 查找互补关系
+        # 先收集、后实例化：instantiate_path 会给 model_a 新增 part_of 出边，
+        # 若边遍历边实例化会触发 NetworkX 的 "dictionary changed size during
+        # iteration"（历史上被调用方 try/except 静默吞掉，导致 reasoning 失效）。
+        generated_paths = []
+        for model_a in sorted(candidate_models):
             for _, target, data in self.G.out_edges(model_a, data=True):
                 if data.get('edge_type') == 'complementary' and target in candidate_models:
-                    combo_path_id = f"complementary_{model_a}_{target}"
-                    if combo_path_id not in candidate_paths:
-                        self.instantiate_path(combo_path_id, [model_a, target], "weighted_mean")
-                        candidate_paths[combo_path_id] = [model_a, target]
-
-            # 查找依赖关系
-            for _, target, data in self.G.out_edges(model_a, data=True):
-                if data.get('edge_type') == 'dependency' and target in candidate_models:
-                    dep_path_id = f"serial_{model_a}_{target}"
-                    if dep_path_id not in candidate_paths:
-                        self.instantiate_path(dep_path_id, [model_a, target], "stacking")
-                        candidate_paths[dep_path_id] = [model_a, target]
+                    generated_paths.append(
+                        (f"complementary_{model_a}_{target}", [model_a, target], "weighted_mean")
+                    )
+                elif data.get('edge_type') == 'dependency' and target in candidate_models:
+                    generated_paths.append(
+                        (f"serial_{model_a}_{target}", [model_a, target], "stacking")
+                    )
+        for path_id, members, strategy in generated_paths:
+            if path_id not in candidate_paths:
+                self.instantiate_path(path_id, members, strategy)
+                candidate_paths[path_id] = members
 
         # Step 3: 为每条路径计算历史性能得分
         path_scores = []
@@ -254,7 +256,10 @@ class ModelGraph:
             path_scores.append((path_id, hist_score))
 
         # Step 4: 按得分排序返回
-        path_scores.sort(key=lambda x: x[1], reverse=True)
+        # 冷启动路径没有历史分差时，必须用路径 ID 作为稳定次级键。
+        # 否则 candidate_models 的 set 遍历顺序会让 hybrid reasoning 在不同
+        # Python 进程中选到不同首路径，进而改写最终模型集合。
+        path_scores.sort(key=lambda item: (-item[1], item[0]))
 
         if return_details:
             from .path_reasoning import PathReasoningScorer
@@ -499,4 +504,3 @@ class ModelGraph:
             self.G.add_edge(source, target, **attrs)
 
         print(f"图谱已从 {path} 加载，节点数: {self.G.number_of_nodes()}, 边数: {self.G.number_of_edges()}")
-

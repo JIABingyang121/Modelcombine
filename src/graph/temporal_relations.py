@@ -195,6 +195,12 @@ def events_from_selection_trace(
     selected_relation_type: str = "selected_for",
     rejected_relation_type: str = "rejected_candidate",
 ) -> List[RelationEvent]:
+    """遗留接口（Task 8.3 Task 5 起失效）。
+
+    事件现在只来自 `result["relation_feedback"]`（blocked-CV/OOF 边际贡献），而本
+    接口只传 trace 的最终选择/权重、不含 relation_feedback，因此恒返回空列表。
+    当前仓库无调用者；请改用 `events_from_solver_result`。
+    """
     return events_from_solver_result(
         trace,
         {
@@ -221,51 +227,41 @@ def events_from_solver_result(
     selected_relation_type: str = "selected_for",
     rejected_relation_type: str = "rejected_candidate",
 ) -> List[RelationEvent]:
+    """从带符号关系反馈证据生成事件（Task 8.3 Task 5）。
+
+    只读 `result["relation_feedback"]["by_model"]`：每个非中性条目产出**一条**
+    scenario->model 事件，方向与幅度来自 blocked-CV/OOF 边际贡献。不再从最终
+    选择成员、Ridge 权重或 trace.candidates_rejected 生成事件。缺失或不具资格
+    的证据返回空列表。
+    """
     event_source = source or trace.scenario_id
     event_timestamp = timestamp or trace.timestamp
     event_ref = evidence_ref or f"trace:{trace.scenario_id}:{trace.timestamp}"
-    final_selection = list(result.get("models") or [])
-    final_weights = dict(result.get("weights") or {})
-    events: List[RelationEvent] = []
 
-    if selected_target is not None:
-        events.append(RelationEvent(
-            source=event_source,
-            target=selected_target,
-            relation_type=selected_relation_type,
-            timestamp=event_timestamp,
-            polarity="positive",
-            magnitude=_selection_magnitude(final_weights),
-            evidence_ref=event_ref,
-            metadata={"selected": final_selection},
-        ))
-    # 逐模型的 scenario->model 边**始终**产出，且关系类型与 selected_target 分支
-    # 保持一致（§11#7）：候选评分消费的正是 scenario->model 的 recommended_for。
-    # 原实现只在没有 path_id 时才建逐模型边，且把关系类型硬编码成
-    # "selected_model"，与消费者不匹配，闭环因此断裂。
-    for model_id in final_selection:
+    feedback = result.get("relation_feedback")
+    if not isinstance(feedback, dict):
+        return []
+    by_model = feedback.get("by_model")
+    if not isinstance(by_model, dict):
+        return []
+
+    events: List[RelationEvent] = []
+    for model_id, item in by_model.items():
+        if not isinstance(item, dict):
+            continue
+        polarity = item.get("polarity")
+        if polarity not in ("positive", "negative"):
+            continue
         events.append(RelationEvent(
             source=event_source,
             target=model_id,
             relation_type=selected_relation_type,
             timestamp=event_timestamp,
-            polarity="positive",
-            magnitude=abs(float(final_weights.get(model_id, 1.0))),
+            polarity=polarity,
+            magnitude=float(item.get("magnitude", 0.0)),
             evidence_ref=event_ref,
+            metadata={"skip_reason": item.get("skip_reason")},
         ))
-
-    for candidate_id, reason in trace.candidates_rejected.items():
-        events.append(RelationEvent(
-            source=event_source,
-            target=candidate_id,
-            relation_type=rejected_relation_type,
-            timestamp=event_timestamp,
-            polarity="negative",
-            magnitude=_rejection_magnitude(reason),
-            evidence_ref=event_ref,
-            metadata={"reason": reason},
-        ))
-
     return events
 
 
@@ -306,6 +302,27 @@ def make_temporal_relation_stage(
             timestamp=event_time,
             selected_relation_type=selected_relation_type,
             rejected_relation_type=rejected_relation_type,
+        )
+        # 关系反馈证据留痕（Task 8.3 Task 5）：eligibility、事件数与逐模型方向。
+        feedback = result.get("relation_feedback")
+        eligible = bool(isinstance(feedback, dict) and feedback.get("eligible"))
+        relation_summary = {
+            "eligible": eligible,
+            "events_written": len(events),
+            "by_model": {
+                m: {"polarity": item.get("polarity"), "magnitude": item.get("magnitude")}
+                for m, item in (feedback.get("by_model") or {}).items()
+                if isinstance(item, dict)
+            } if isinstance(feedback, dict) else {},
+        }
+        if not eligible:
+            relation_summary["relation_event_skipped_reason"] = (
+                feedback.get("skip_reason") if isinstance(feedback, dict) else "no_relation_feedback"
+            )
+        trace.add_stage(
+            "RelationFeedback",
+            outputs=relation_summary,
+            metadata={"method": "blocked_cv_oof_marginal_gain"},
         )
         if selected_target is not None and _is_path_target(graph, selected_target):
             from .hyperpath import apply_hyperpath_temporal_update

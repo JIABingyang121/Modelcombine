@@ -132,7 +132,8 @@ def test_model_graph_exposes_temporal_relation_update_entrypoint():
     assert graph.G["scenario_pjm_h1"]["path_a"]["dynamic_strength"] == 0.3
 
 
-def test_events_from_selection_trace_and_record_update_summary():
+def test_events_from_solver_result_reads_relation_feedback_and_record_update_summary():
+    """事件只从 relation_feedback 的非中性条目生成；不再读最终选择/权重/拒绝。"""
     trace = SelectionTrace(
         scenario_id="scenario_pjm_h1",
         timestamp="2026-07-02T12:00:00Z",
@@ -140,24 +141,29 @@ def test_events_from_selection_trace_and_record_update_summary():
     trace.set_final(["m1", "m2"], {"m1": 0.7, "m2": 0.3})
     trace.reject("m_bad", "uncertainty_bypass: score=0.9 exceeds threshold")
 
-    events = events_from_selection_trace(
+    events = events_from_solver_result(
         trace,
-        selected_target="path_m1_m2",
+        {
+            "relation_feedback": {
+                "eligible": True,
+                "by_model": {
+                    "m1": {"polarity": "positive", "magnitude": 0.7, "skip_reason": None},
+                    "m2": {"polarity": "negative", "magnitude": 0.3, "skip_reason": None},
+                    "m3": {"polarity": "neutral", "magnitude": 0.0, "skip_reason": "oof_gain_in_deadband"},
+                },
+            }
+        },
+        selected_relation_type="recommended_for",
         evidence_ref="trace:p1",
     )
 
-    # §11#7 起：除 scenario->path 边外，**始终**同时产出 scenario->model 边，
-    # 且关系类型与 selected_relation_type 一致——候选评分消费的正是后者。
+    # 只产出非中性条目的 scenario->model 事件；neutral 与 rejected 不产生事件。
     assert [(e.source, e.target, e.relation_type, e.polarity) for e in events] == [
-        ("scenario_pjm_h1", "path_m1_m2", "selected_for", "positive"),
-        ("scenario_pjm_h1", "m1", "selected_for", "positive"),
-        ("scenario_pjm_h1", "m2", "selected_for", "positive"),
-        ("scenario_pjm_h1", "m_bad", "rejected_candidate", "negative"),
+        ("scenario_pjm_h1", "m1", "recommended_for", "positive"),
+        ("scenario_pjm_h1", "m2", "recommended_for", "negative"),
     ]
-    assert events[0].magnitude == 1.0
-    # 拒绝事件现在排在逐模型边之后，按关系类型定位而不是按固定下标
-    rejected = next(e for e in events if e.relation_type == "rejected_candidate")
-    assert rejected.metadata["reason"].startswith("uncertainty_bypass")
+    assert events[0].magnitude == 0.7
+    assert events[1].magnitude == 0.3
 
     record_temporal_update(
         trace,
@@ -166,7 +172,7 @@ def test_events_from_selection_trace_and_record_update_summary():
             "edge_updates": [
                 {
                     "source": "scenario_pjm_h1",
-                    "target": "path_m1_m2",
+                    "target": "m1",
                     "dynamic_strength": 0.8,
                 }
             ],
@@ -189,23 +195,24 @@ def test_events_from_solver_result_do_not_require_final_trace_to_be_set():
     events = events_from_solver_result(
         trace,
         {
-            "models": ["m1", "m2"],
-            "weights": {"m1": 0.6, "m2": 0.4},
+            "relation_feedback": {
+                "eligible": True,
+                "by_model": {
+                    "m1": {"polarity": "positive", "magnitude": 0.6},
+                    "m2": {"polarity": "positive", "magnitude": 0.4},
+                },
+            }
         },
-        selected_target="path_m1_m2",
         selected_relation_type="recommended_for",
         evidence_ref="trace:p1",
     )
 
     assert trace.final_selection == []
-    # 逐模型 recommended_for 边一并产出（§11#7 闭环所需）
     assert [(e.target, e.relation_type, e.polarity) for e in events] == [
-        ("path_m1_m2", "recommended_for", "positive"),
         ("m1", "recommended_for", "positive"),
         ("m2", "recommended_for", "positive"),
-        ("m_bad", "rejected_candidate", "negative"),
     ]
-    assert events[-1].magnitude == 1.0
+    assert events[-1].magnitude == 0.4
 
 
 def test_temporal_relation_stage_updates_graph_and_trace_from_solver_result():
@@ -213,8 +220,6 @@ def test_temporal_relation_stage_updates_graph_and_trace_from_solver_result():
     graph.add_scenario_node("scenario_pjm_h1", {"signature": {}})
     graph.add_model_node("m1", {})
     graph.add_model_node("m2", {})
-    graph.add_path_node("path_a", ["m1", "m2"], "weighted_mean")
-    graph.add_scenario_path_edge("scenario_pjm_h1", "path_a", performance_score=0.5)
     ctx = SolveContext(
         scenario=_scenario(),
         available_features={"load"},
@@ -224,27 +229,33 @@ def test_temporal_relation_stage_updates_graph_and_trace_from_solver_result():
         "models": ["m1", "m2"],
         "weights": {"m1": 0.6, "m2": 0.4},
         "strategy": "weighted_mean",
-        "path_id": "path_a",
+        "relation_feedback": {
+            "eligible": True,
+            "by_model": {
+                "m1": {"polarity": "positive", "magnitude": 0.6, "skip_reason": None},
+                "m2": {"polarity": "positive", "magnitude": 0.4, "skip_reason": None},
+            },
+        },
     }
     trace = SelectionTrace(
         scenario_id="scenario_pjm_h1",
         timestamp="2026-07-02T12:00:00Z",
     )
-    trace.reject("m_bad", "uncertainty_bypass: score=0.9 exceeds threshold")
     stage = make_temporal_relation_stage(
         graph,
         updater=HawkesRelationUpdater(base_strength=0.5, alpha=0.3, beta=0.0),
         now=NOW,
+        create_missing=True,
     )
 
     stage(ctx, trace)
 
-    assert graph.G["scenario_pjm_h1"]["path_a"]["dynamic_strength"] == 0.8
-    assert graph.G["m1"]["path_a"]["dynamic_strength"] == 0.65
-    assert graph.G["m2"]["path_a"]["dynamic_strength"] == 0.65
-    assert ctx.extras["temporal_relation_update"]["updated_edges"] == 1
-    assert ctx.extras["temporal_relation_update"]["hyperpath"]["member_event_count"] == 2
+    # 非中性条目各写一条 scenario->model 的 recommended_for 事件。
+    assert abs(graph.G["scenario_pjm_h1"]["m1"]["dynamic_strength"] - (0.5 + 0.3 * 0.6)) < 1e-9
+    assert abs(graph.G["scenario_pjm_h1"]["m2"]["dynamic_strength"] - (0.5 + 0.3 * 0.4)) < 1e-9
+    assert ctx.extras["temporal_relation_update"]["updated_edges"] == 2
     assert any(s["stage"] == "TemporalRelationUpdate" for s in trace.stages)
+    assert any(s["stage"] == "RelationFeedback" for s in trace.stages)
     assert trace.evidence_refs == ["trace:scenario_pjm_h1:2026-07-02T12:00:00Z"]
 
 

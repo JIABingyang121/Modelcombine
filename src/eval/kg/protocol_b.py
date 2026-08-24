@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import copy
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -17,9 +17,7 @@ from src.utils.blocked_cv import blocked_cv_select_alpha, blocked_cv_splits
 from .config import *
 from .conflict import (
     _lookup_pair_corr,
-    check_conflict,
     compute_feature_model_correlation_safe,
-    filter_conflicting_models,
 )
 from .data_io import _align_raw_to_pred, _blocked_cv_mae_from_pred, _resolve_cv_config
 from .drift import (
@@ -29,10 +27,12 @@ from .drift import (
 )
 from .model_selection import (
     _cleanup_zero_weight_models_and_refit,
-    _fallback_selection,
+    _compute_feature_bonus_map,
     fit_static_weight_ridge,
     select_models_protocol_b,
 )
+from .reasoning_evidence import build_reasoning_evidence
+from .relation_feedback import compute_relation_feedback_evidence
 from .feedback import KGFeedbackStore
 from .protocol_a import kg_combination_pred_only
 from .stability import _dedup_and_stability_filter, adaptive_max_models
@@ -110,7 +110,9 @@ def kg_combination_with_features(df_val: pd.DataFrame, df_test: pd.DataFrame,
                                   feedback_store: Optional[KGFeedbackStore] = None,
                                   return_predictions: bool = False,
                                   relation_graph: Optional[ModelGraph] = None,
-                                  relation_scenario_id: Optional[str] = None) -> Dict:
+                                  relation_scenario_id: Optional[str] = None,
+                                  _fixed_selected_models: Optional[List[str]] = None,
+                                  _skip_final_guard: bool = False) -> Dict:
     """
     KG 组合 - 使用预测+原始特征
 
@@ -128,6 +130,10 @@ def kg_combination_with_features(df_val: pd.DataFrame, df_test: pd.DataFrame,
                 "test": np.asarray(pred_test_arr, dtype=float),
             }
         return result
+
+    # 诊断私有控制（Task 8.3 Task 4）：跳过 guard 必须有固定候选，否则没有意义。
+    if _skip_final_guard and _fixed_selected_models is None:
+        raise ValueError("_skip_final_guard requires _fixed_selected_models (diagnostic fixed pair)")
 
     # Protocol A 作为稳定参考与回退候选（用于 Protocol B 保护机制）
     # 回退分支要交出精确预测，A 侧也需同步产出。
@@ -249,9 +255,21 @@ def kg_combination_with_features(df_val: pd.DataFrame, df_test: pd.DataFrame,
         if corr < corr_threshold:
             mg.add_relation(m1, m2, "complementary", weight=1.0 - corr)
             mg.add_relation(m2, m1, "complementary", weight=1.0 - corr)
-        elif corr > 0.9:
-            mg.add_relation(m1, m2, "conflict", weight=corr)
-            mg.add_relation(m2, m1, "conflict", weight=corr)
+    # 高误差相关只作连续惩罚（在 selector 的 corr_penalty 里），不再写成硬 conflict。
+
+    # 复制外部图谱的显式 conflict 边（Task 8.3 Task 3）：只有两端都是当前候选、
+    # edge_type == "conflict" 的模型间边才被复制，来源记为 external_graph。
+    explicit_conflict_edges_consumed = 0
+    if relation_graph is not None:
+        for src, tgt, data in relation_graph.G.edges(data=True):
+            if data.get("edge_type") != "conflict":
+                continue
+            if src not in model_cols or tgt not in model_cols:
+                continue
+            weight = float(data.get("weight", 1.0))
+            mg.G.add_edge(src, tgt, edge_type="conflict", weight=weight, source="external_graph")
+            mg.G.add_edge(tgt, src, edge_type="conflict", weight=weight, source="external_graph")
+            explicit_conflict_edges_consumed += 1
 
     # 闭环反馈：将上一步长的历史性能分注入互补边权重
     feedback_apply_meta: Dict[str, Any] = {"enabled": False}
@@ -302,41 +320,32 @@ def kg_combination_with_features(df_val: pd.DataFrame, df_test: pd.DataFrame,
     for feat in feature_cols[:10]:  # 限制数量
         mg.add_scenario_feature_edge(scenario_id, feat, weight=1.0)
     
-    # 显式推理路径（可控启用）：
-    # - off: 完全关闭
-    # - hybrid: 推理结果与 Protocol B 选择融合
-    # - prefer: 推理路径优先（如果有效）
-    reasoning_paths = []
-    reasoning_selected_models: List[str] = []
-    reasoning_used = False
-    if PROTOCOL_B_REASONING_MODE != "off":
-        try:
-            reasoning_paths = mg.infer_optimal_path_by_reasoning(
-                scenario_id=scenario_id,
-                available_features=set(feature_cols),
-                constraints={"max_models": max(2, max_models)},
-            )
-            for path_id, score in reasoning_paths:
-                path_models = mg.get_node_attr(path_id, "composition", default=[]) or []
-                path_models = [m for m in path_models if m in model_cols]
-                # 即使路径只返回单模型，也允许作为 Protocol B 的先验种子。
-                if len(path_models) >= 1:
-                    reasoning_selected_models = path_models
-                    reasoning_used = True
-                    break
-        except Exception:
-            reasoning_paths = []
-            reasoning_selected_models = []
-            reasoning_used = False
+    # 显式推理证据（可控启用）：
+    # - off: 完全关闭（disabled，贡献为 0）
+    # - hybrid / prefer: 都只提供有来源的评分证据，不再覆盖 stepwise 结果。
+    reasoning_evidence = build_reasoning_evidence(
+        graph=mg,
+        scenario_id=scenario_id,
+        available_features=set(feature_cols),
+        model_cols=model_cols,
+        max_models=max(2, max_models),
+        mode=PROTOCOL_B_REASONING_MODE,
+    )
+    reasoning_used = reasoning_evidence.source == "historical_evidence"
+    reasoning_top_path = reasoning_evidence.paths[0] if reasoning_evidence.paths else None
+    reasoning_top_models = (reasoning_top_path or {}).get("models", [])
 
     reasoning_meta = {
         "used_reasoning_path": reasoning_used,
         "reasoning_used_rate": 1.0 if reasoning_used else 0.0,
         "reasoning_mode": PROTOCOL_B_REASONING_MODE,
-        "reasoning_path": reasoning_paths[0][0] if reasoning_paths else None,
-        "reasoning_score": float(reasoning_paths[0][1]) if reasoning_paths else None,
+        "reasoning_source": reasoning_evidence.source,
+        "reasoning_path": reasoning_top_path.get("path_id") if reasoning_top_path else None,
+        "reasoning_score": reasoning_top_path.get("final_score") if reasoning_top_path else None,
         "reasoning_disabled": PROTOCOL_B_REASONING_MODE == "off",
-        "reasoning_candidate_paths": len(reasoning_paths),
+        "reasoning_candidate_paths": len(reasoning_evidence.paths),
+        "reasoning_contribution": dict(reasoning_evidence.contribution_by_model),
+        "cold_start_no_evidence": reasoning_evidence.cold_start_no_evidence,
     }
 
     # Protocol B 差异化：特征奖励 + 误差相关惩罚（避免 A/B 完全一致）
@@ -345,81 +354,64 @@ def kg_combination_with_features(df_val: pd.DataFrame, df_test: pd.DataFrame,
     if len(df_val) < PROTOCOL_B_SMALL_SAMPLE_THRESHOLD:
         feature_bonus_weight += 0.2
         corr_penalty_weight *= 0.5
-    selected, b_scores, feature_bonus_map, b_select_meta = select_models_protocol_b(
-        mg=mg,
-        model_cols=model_cols,
-        maes=maes,
-        error_corrs=error_corrs,
-        feat_model_corrs=feat_model_corrs,
-        horizon=horizon,
-        df_val=df_val,
-        max_models=max_models,
-        feature_bonus_weight=feature_bonus_weight,
-        corr_penalty_weight=corr_penalty_weight,
-        feature_diversity_weight=PROTOCOL_B_FEATURE_DIVERSITY_WEIGHT,
-        drift_level=drift_level,
-    )
-    if reasoning_used and reasoning_selected_models:
-        if PROTOCOL_B_REASONING_MODE == "prefer":
-            selected = reasoning_selected_models.copy()
-        elif PROTOCOL_B_REASONING_MODE == "hybrid":
-            merged = list(dict.fromkeys(reasoning_selected_models + selected))
-            selected = sorted(merged, key=lambda m: maes[m])[:max(2, max_models)]
-
-    min_selected_models = min(max(PROTOCOL_B_MIN_SELECTED_MODELS, 2), len(model_cols), max(2, max_models))
-    if len(selected) < min_selected_models:
-        selected = _fallback_selection(mg, model_cols, maes, max_models=max_models)
-    selected = filter_conflicting_models(mg, selected, maes=maes)
-    if len(selected) < min_selected_models:
-        selected = sorted(model_cols, key=lambda m: maes[m])[:min_selected_models]
-    if len(selected) > max_models:
-        selected = selected[:max_models]
-    single_model_direct_pass_meta: Dict[str, Any] = {"applied": False}
-    if drift_level == "high" and len(selected) <= 2 and len(model_cols) > 0:
-        best_single = min(model_cols, key=lambda m: maes.get(m, float("inf")))
-        best_selected_mae = min([maes.get(m, float("inf")) for m in selected]) if selected else float("inf")
-        if maes.get(best_single, float("inf")) <= best_selected_mae * PROTOCOL_B_HIGH_DRIFT_SINGLE_MODEL_DIRECT_PASS_RATIO:
-            selected = [best_single]
-            single_model_direct_pass_meta = {
-                "applied": True,
-                "best_single": best_single,
-                "best_single_mae": float(maes.get(best_single, float("inf"))),
-                "best_selected_mae": float(best_selected_mae),
-                "ratio": float(PROTOCOL_B_HIGH_DRIFT_SINGLE_MODEL_DIRECT_PASS_RATIO),
-            }
-    base_selection_guard_meta: Dict[str, Any] = {
-        "enabled": bool(PROTOCOL_B_ENFORCE_BASE_MODEL_IN_SELECTION),
-        "triggered": False,
-        "mode": str(PROTOCOL_B_ENFORCE_BASE_MODEL_MODE),
-        "best_base_model": best_base_model,
-        "horizon": int(horizon),
+    if _fixed_selected_models is not None:
+        # 固定二模型诊断（Task 8.3 Task 4）：真正绕过 selector，不诱导评分。
+        # 拟合、interaction、post-adjustment 仍复用生产实现；feature_bonus_map
+        # 与 selector 用同一公式，保证 post-adjustment 与生产一致。
+        selected = [m for m in _fixed_selected_models if m in model_cols]
+        feature_bonus_map = _compute_feature_bonus_map(model_cols, feat_model_corrs)
+        b_scores = {m: 0.0 for m in model_cols}
+        b_select_meta = {
+            "diagnostic_mode": "fixed_pair",
+            "requested_models": list(selected),
+            "candidate_order": list(selected),
+            "selector_output": list(selected),
+            "constraint_decisions": [],
+            "pair_diagnostics": {},
+            "score_components": {},
+            "relation_strength": {
+                "weight": float(PROTOCOL_B_RELATION_STRENGTH_WEIGHT),
+                "neutral": float(PROTOCOL_B_RELATION_STRENGTH_NEUTRAL),
+                "by_model": {m: float(PROTOCOL_B_RELATION_STRENGTH_NEUTRAL) for m in model_cols},
+                "contribution": {m: 0.0 for m in model_cols},
+                "edges_found": [],
+            },
+        }
+    else:
+        selected, b_scores, feature_bonus_map, b_select_meta = select_models_protocol_b(
+            mg=mg,
+            model_cols=model_cols,
+            maes=maes,
+            error_corrs=error_corrs,
+            feat_model_corrs=feat_model_corrs,
+            horizon=horizon,
+            df_val=df_val,
+            max_models=max_models,
+            feature_bonus_weight=feature_bonus_weight,
+            corr_penalty_weight=corr_penalty_weight,
+            feature_diversity_weight=PROTOCOL_B_FEATURE_DIVERSITY_WEIGHT,
+            drift_level=drift_level,
+            reasoning_contribution=reasoning_evidence.contribution_by_model,
+            dataset_name=dataset_name,
+            base_model_cols=base_model_cols,
+        )
+    # 选择流程（Task 8.3 Task 3）：selector 之后不再有任何改写 selected 的代码，
+    # post_selector_mutations 恒为空；constraint_decisions 已在 selector 内记录。
+    selection_flow = {
+        "candidate_order": list(b_select_meta["candidate_order"]),
+        "selector_output": list(selected),
+        "reasoning": {
+            "used": bool(reasoning_used),
+            "mode": PROTOCOL_B_REASONING_MODE,
+            "source": reasoning_evidence.source,
+            "path": reasoning_meta["reasoning_path"],
+            "path_models": list(reasoning_top_models),
+            "contribution": dict(reasoning_evidence.contribution_by_model),
+        },
+        "constraint_decisions": list(b_select_meta["constraint_decisions"]),
+        "post_selector_mutations": [],
+        "final_selected_before_fit": list(selected),
     }
-    enforce_dataset_ok = (
-        not PROTOCOL_B_ENFORCE_BASE_MODEL_DATASETS
-        or (dataset_name in PROTOCOL_B_ENFORCE_BASE_MODEL_DATASETS)
-    )
-    if (
-        PROTOCOL_B_ENFORCE_BASE_MODEL_IN_SELECTION
-        and PROTOCOL_B_ENFORCE_BASE_MODEL_MODE != "off"
-        and enforce_dataset_ok
-        and int(horizon) >= int(PROTOCOL_B_ENFORCE_BASE_MODEL_MIN_H)
-        and selected
-    ):
-        selected_base = [m for m in selected if m in set(base_model_cols or [])]
-        base_selection_guard_meta["selected_base_count_before"] = int(len(selected_base))
-        base_selection_guard_meta["selected_before"] = list(selected)
-        if not selected_base and best_base_model is not None:
-            base_selection_guard_meta["triggered"] = True
-            if PROTOCOL_B_ENFORCE_BASE_MODEL_MODE == "best_base_single":
-                selected = [best_base_model]
-            else:
-                selected = [best_base_model] + [m for m in selected if m != best_base_model]
-                if len(selected) > max_models:
-                    selected = selected[:max_models]
-            base_selection_guard_meta["selected_after"] = list(selected)
-            base_selection_guard_meta["reason"] = (
-                "ext_only_selection_guard: no base model selected in Protocol B candidate set"
-            )
 
     drift_decay, drift_decay_meta = _resolve_drift_aware_temporal_decay(
         base_decay=KG_RIDGE_TEMPORAL_DECAY,
@@ -465,15 +457,16 @@ def kg_combination_with_features(df_val: pd.DataFrame, df_test: pd.DataFrame,
         temporal_decay_meta=drift_decay_meta,
         temporal_min_weight_ratio=temporal_min_w_ratio,
     )
+    # fitted_models 只可能因拟合后的近零权重清理与 final_selected_before_fit 不同。
+    selection_flow["fitted_models"] = list(selected)
     ridge_meta["protocol_b_selection_meta"] = {
         "max_models": int(max_models),
-        "min_selected_models": int(min_selected_models),
-        "single_model_direct_pass": single_model_direct_pass_meta,
-        "base_selection_guard": base_selection_guard_meta,
         "high_drift_extended_score_factor": (
             float(KG_HIGH_DRIFT_EXTENDED_SCORE_FACTOR) if drift_level == "high" else 1.0
         ),
+        "explicit_conflict_edges_consumed": explicit_conflict_edges_consumed,
         **b_select_meta,
+        "selection_flow": selection_flow,
         "stability": {
             "by_model": stability_meta,
             "removed_models": stability_removed,
@@ -1190,7 +1183,24 @@ def kg_combination_with_features(df_val: pd.DataFrame, df_test: pd.DataFrame,
             multi_window_guard_meta["triggered"] = False
     ridge_meta["guard_config"]["multi_window_guard"] = multi_window_guard_meta
 
-    if fallback_reason:
+    # 带符号关系反馈证据（Task 8.3 Task 5）：方向与幅度只由 blocked-CV/OOF 决定。
+    # guard 回退时跳过并留痕；样本内 validation gain 与 Ridge 权重只作审计。
+    effective_fallback_target = fallback_target if fallback_reason else None
+    relation_feedback = compute_relation_feedback_evidence(
+        df_val=df_val,
+        candidate_models=model_cols,
+        selected_models=selected,
+        horizon=horizon,
+        final_weights=weights,
+        fallback_target=effective_fallback_target,
+        alpha_candidates=b_alpha_candidates,
+        temporal_decay=drift_decay,
+        temporal_decay_meta=drift_decay_meta,
+        temporal_min_weight_ratio=temporal_min_w_ratio,
+    )
+    ridge_meta["relation_feedback"] = relation_feedback
+
+    if fallback_reason and not _skip_final_guard:
         naming_b = get_strategy_naming("kg_protocol_b", default_category="kg_core")
         guarded = copy.deepcopy(protocol_a_reference)
         guarded["protocol"] = "B_fallback_to_A_guard"
@@ -1263,6 +1273,12 @@ def kg_combination_with_features(df_val: pd.DataFrame, df_test: pd.DataFrame,
                     "stepwise_meta",
                     "stepwise_alpha",
                     "stepwise_min_improve_ratio",
+                    "score_components",
+                    "pair_diagnostics",
+                    "candidate_order",
+                    "constraint_decisions",
+                    "selector_output",
+                    "selection_flow",
                 ):
                     _val = b_meta_src.get(_key)
                     if _val is None:
@@ -1328,6 +1344,7 @@ def kg_combination_with_features(df_val: pd.DataFrame, df_test: pd.DataFrame,
                     df_val[bs_models[0]].values,
                     df_test[bs_models[0]].values,
                 )
+        guarded["relation_feedback"] = relation_feedback
         return guarded
 
     guard_cfg = ridge_meta.get("guard_config", {})
@@ -1369,7 +1386,54 @@ def kg_combination_with_features(df_val: pd.DataFrame, df_test: pd.DataFrame,
         },
         "protocol": "B_pred_features",
         "feedback_apply_meta": feedback_apply_meta,
+        "relation_feedback": relation_feedback,
     }
+    if _fixed_selected_models is not None:
+        # 固定二模型诊断（Task 8.3 Task 4）：记录诊断标志与 guard 会做什么，
+        # 但不执行回退。退化资格按近零权重清理后的 zero_weight_cleanup["after"]
+        # 判定——二模型下生产清理不触发 refit，但"after"已反映实际有效模型。
+        cleanup_after = (ridge_meta.get("zero_weight_cleanup") or {}).get("after")
+        effective_models = list(cleanup_after) if cleanup_after is not None else list(selected)
+        result["diagnostic_mode"] = "fixed_pair"
+        result["requested_models"] = list(_fixed_selected_models)
+        result["effective_models"] = effective_models
+        result["eligible_pair"] = len(effective_models) == 2
+        result["degenerate_reason"] = (
+            None if len(effective_models) == 2 else "zero_weight_cleanup_reduced_pair"
+        )
+        result["fallback_target"] = None
+        result["guard_would_fallback_to"] = fallback_target if fallback_reason else None
+        result["guard_would_fallback_reason"] = fallback_reason
     # pred_val/pred_test 是引擎最终采用的预测：可能已叠加交互残差、也可能被
     # post_adjustment 覆盖回线性组合。交出它们本身，调用方不必再猜。
     return _attach_predictions(result, pred_val, pred_test)
+
+
+def evaluate_fixed_protocol_b_candidate(
+    df_val: pd.DataFrame,
+    df_test: pd.DataFrame,
+    df_raw_val: Optional[pd.DataFrame],
+    df_raw_test: Optional[pd.DataFrame],
+    *,
+    selected_models: Sequence[str],
+    horizon: int,
+    dataset_name: Optional[str],
+    base_model_cols: Optional[Sequence[str]] = None,
+) -> Dict[str, Any]:
+    """诊断专用固定二模型求值入口（Task 8.3 Task 4）。
+
+    真正绕过候选选择器与最终 guard（不通过调高候选分数诱导选择），
+    拟合、interaction 与 post-adjustment 复用生产实现。固定 pair 之外还记录
+    guard 会回退到什么目标（但不执行），以及近零权重清理后的退化标记。
+    """
+    if len(set(selected_models)) != 2:
+        raise ValueError("fixed candidate evaluation requires exactly two distinct models")
+    return kg_combination_with_features(
+        df_val, df_test, df_raw_val, df_raw_test,
+        list(selected_models), horizon,
+        dataset_name=dataset_name,
+        base_model_cols=list(base_model_cols or selected_models),
+        return_predictions=True,
+        _fixed_selected_models=list(selected_models),
+        _skip_final_guard=True,
+    )
