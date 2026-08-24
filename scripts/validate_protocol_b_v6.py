@@ -8,8 +8,15 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import sys
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence
+
+# 直接执行（python scripts/validate_protocol_b_v6.py）时仓库根不在 sys.path，
+# `from scripts.* import ...` 会报 ModuleNotFoundError。自行把仓库根加入 sys.path。
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.run_protocol_b_candidate_diagnostic import validate_diagnostic_schema
 from scripts.run_system_ab_shadow import (

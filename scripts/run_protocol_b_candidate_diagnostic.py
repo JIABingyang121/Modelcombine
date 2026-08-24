@@ -22,6 +22,13 @@ from typing import Any, Dict, List, Optional, Sequence
 import numpy as np
 import pandas as pd
 
+# 直接执行（python scripts/run_protocol_b_candidate_diagnostic.py）时，仓库根
+# 不在 sys.path，`from scripts.* import ...` 会报 ModuleNotFoundError。与
+# run_system_ab_shadow.py 保持一致，自行把仓库根加入 sys.path。
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 SCHEMA_VERSION = "task83-candidate-diagnostic.1"
 
 # Global Constraints 锁定的来源哈希（固定 baselines_v5，不得重训）。

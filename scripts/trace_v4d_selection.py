@@ -15,6 +15,12 @@ from typing import Any, Callable, Dict, List
 
 import numpy as np
 
+# 直接执行（python scripts/trace_v4d_selection.py）时仓库根不在 sys.path，
+# `from scripts.* import ...` 会报 ModuleNotFoundError。自行把仓库根加入 sys.path。
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 LEGACY_EXPECTED_HEAD = "63d2defe4889bc82cded69036fc9ca8987192b19"
 
 
@@ -94,6 +100,12 @@ def main() -> int:
         label=f"{args.dataset} train.csv",
     )
 
+    # 上面的常量导入会把当前 worktree 的 namespace package "scripts" 留在
+    # sys.modules，其 __path__ 指向当前 worktree，会污染下方 legacy 导入。
+    # 用完即移除，使 legacy 导入真正落到 detached v4d checkout。
+    for _m in ("scripts.run_protocol_b_candidate_diagnostic", "scripts"):
+        sys.modules.pop(_m, None)
+
     # 先隔离：任何当前 worktree 的项目模块都不允许已加载，否则包装的是当前代码。
     for mod in ("src", "scripts", "scripts.run_system_ab_shadow", "scripts.train_baselines"):
         if mod in sys.modules:
@@ -105,23 +117,29 @@ def main() -> int:
     legacy_root = str(args.legacy_root.resolve())
     sys.path.insert(0, legacy_root)
 
-    # 仅在此刻才导入 v4d 模块。
-    import scripts.run_system_ab_shadow as v4d_shadow  # noqa: E402
+    # 先导入要包装的模块，再导入 run_system_ab_shadow。注意：model_selection
+    # 与 protocol_b 存在循环依赖——import model_selection 会顺带把 protocol_b
+    # 载入，故包装必须在 protocol_b 载入之后、且要同时覆盖 protocol_b 的模块级
+    # 绑定（kg_combination_with_features 内部实际调用的就是 protocol_b 的命名空间），
+    # 否则 wrap_call 永不命中（wrapped_calls 恒为空）。
     import src.eval.kg.conflict as v4d_conflict  # noqa: E402
     import src.eval.kg.model_selection as v4d_ms  # noqa: E402
+    import scripts.run_system_ab_shadow as v4d_shadow  # noqa: E402
+    import src.eval.kg.protocol_b as v4d_pb  # noqa: E402
 
     log: List[Dict[str, Any]] = []
     for name in ("select_models_protocol_b", "filter_conflicting_models", "_fallback_selection", "fit_static_weight_ridge"):
-        target = getattr(v4d_ms, name, None)
-        if target is None:
-            target = getattr(v4d_conflict, name, None)
+        target = getattr(v4d_ms, name, None) or getattr(v4d_conflict, name, None)
         if target is None:
             log.append({"stage": name, "result": None, "missing": True})
             continue
         wrapped = wrap_call(log, name, target)
+        # 同时覆盖 protocol_b 的模块级绑定与源模块，确保内部调用命中包装。
+        if hasattr(v4d_pb, name):
+            setattr(v4d_pb, name, wrapped)
         if hasattr(v4d_ms, name):
             setattr(v4d_ms, name, wrapped)
-        else:
+        elif hasattr(v4d_conflict, name):
             setattr(v4d_conflict, name, wrapped)
 
     # 复用 v4d 的 build_task_matrix 与 Protocol B 运行，只记录、不改返回值。
