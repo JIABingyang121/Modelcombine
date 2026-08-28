@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
+from itertools import combinations
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -205,6 +206,79 @@ def _cleanup_zero_weight_models_and_refit(
         ridge_meta.update(refit_meta)
     ridge_meta["zero_weight_cleanup"] = cleanup_meta
     return selected, pred_val, pred_test, weights, ridge_meta
+
+def pair_eligibility_from_cleanup(
+    selected_models: Sequence[str],
+    cleanup_after: Optional[Sequence[str]],
+) -> Tuple[List[str], bool, Optional[str]]:
+    """按近零权重清理结果判定二模型候选是否仍是有效二模型组合。
+
+    二模型下生产清理不触发 refit（``1 < len(nonzero) < 2`` 恒假），但
+    ``zero_weight_cleanup["after"]`` 已经反映实际有效模型。诊断入口与生产
+    selector 共用这一处判定，避免两边对"退化"给出不同答案。
+    """
+    effective = list(cleanup_after) if cleanup_after is not None else list(selected_models)
+    eligible = len(effective) == 2
+    return effective, eligible, None if eligible else "zero_weight_cleanup_reduced_pair"
+
+
+def evaluate_pair_on_validation(
+    *,
+    df_val: pd.DataFrame,
+    pair: Sequence[str],
+    horizon: int,
+    alpha_candidates: Optional[List[float]] = None,
+    temporal_decay: Optional[float] = None,
+    temporal_decay_meta: Optional[Dict[str, Any]] = None,
+    temporal_min_weight_ratio: Optional[float] = None,
+) -> Dict[str, Any]:
+    """只用 validation 数据求值一个二模型候选，复用生产 Ridge 与近零权重清理。
+
+    签名里没有任何 test 帧，``df_val`` 同时充当拟合与评估输入，所以这一步不读
+    test 标签、test MAE 或 test 预测配对。注意范围：这只覆盖 pair 替换评分本身，
+    上游的漂移/稳定性判断仍会消费 test 预测的分布（无监督协变量偏移判据），
+    不能据此说整条选择链完全不接触 test 数据。
+
+    另一处口径限制：这里只做 Ridge + 近零权重清理，而候选诊断的 best pair 走的是
+    完整固定 pair 流水线（含 interaction 与 post-adjustment）。两者的资格判定已经
+    统一，但排序目标尚未完全对齐，真实数据上可能给出不同顺序。
+    """
+    models = list(pair)
+    pred_val, pred_test, weights, ridge_meta = fit_static_weight_ridge(
+        df_val=df_val,
+        df_test=df_val,
+        selected_models=models,
+        horizon=horizon,
+        alpha_candidates=alpha_candidates,
+        temporal_decay=temporal_decay,
+        temporal_decay_meta=temporal_decay_meta,
+        temporal_min_weight_ratio=temporal_min_weight_ratio,
+    )
+    _cleaned, pred_val, _pred_test, weights, ridge_meta = _cleanup_zero_weight_models_and_refit(
+        df_val=df_val,
+        df_test=df_val,
+        selected_models=models,
+        pred_val=pred_val,
+        pred_test=pred_test,
+        weights=weights,
+        ridge_meta=ridge_meta,
+        horizon=horizon,
+        alpha_candidates=alpha_candidates,
+        temporal_decay=temporal_decay,
+        temporal_decay_meta=temporal_decay_meta,
+        temporal_min_weight_ratio=temporal_min_weight_ratio,
+    )
+    cleanup_after = (ridge_meta.get("zero_weight_cleanup") or {}).get("after")
+    effective, eligible, degenerate_reason = pair_eligibility_from_cleanup(models, cleanup_after)
+    validation_mae = float(np.mean(np.abs(np.asarray(pred_val, dtype=float) - df_val["y"].values)))
+    return {
+        "models": models,
+        "validation_mae": validation_mae,
+        "eligible_pair": eligible,
+        "degenerate_reason": degenerate_reason,
+        "effective_models": effective,
+    }
+
 
 def _find_reliable_small_combo(
     *,
@@ -489,6 +563,7 @@ def select_models_protocol_b(
     reasoning_contribution: Optional[Mapping[str, float]] = None,
     dataset_name: Optional[str] = None,
     base_model_cols: Optional[List[str]] = None,
+    pair_fit_config: Optional[Mapping[str, Any]] = None,
 ) -> Tuple[List[str], Dict[str, float], Dict[str, float], Dict]:
     """
     Protocol B 专用模型选择：
@@ -642,6 +717,15 @@ def select_models_protocol_b(
     stepwise_meta = {}
     stepwise_alpha = 1.0
     stepwise_min_improve = PROTOCOL_STEPWISE_MIN_IMPROVEMENT
+    # stepwise 输出短于两个模型时会被丢弃、继续沿用 beam 候选集合。过去这一步
+    # 没有留痕，trace 里看不出最终候选到底来自哪一段搜索。
+    candidate_source = "beam_search"
+    stepwise_adoption: Dict[str, Any] = {
+        "stepwise_output": None,
+        "adopted": False,
+        "not_adopted_reason": "stepwise_not_run",
+        "candidate_source": candidate_source,
+    }
     if df_val is not None and len(selected) >= 1:
         stepwise_min_improve = _adaptive_stepwise_min_improve(
             drift_level=drift_level,
@@ -669,11 +753,20 @@ def select_models_protocol_b(
             # 仅 Protocol B 使用含关系强度的候选排序；Protocol A 保持按 MAE 排序
             respect_candidate_order=True,
         )
+        stepwise_adoption["stepwise_output"] = list(stepwise_selected)
         if len(stepwise_selected) >= 2:
             selected = stepwise_selected
+            candidate_source = "stepwise"
+            stepwise_adoption["adopted"] = True
+            stepwise_adoption["not_adopted_reason"] = None
+        else:
+            stepwise_adoption["not_adopted_reason"] = "stepwise_returned_fewer_than_two_models"
+        stepwise_adoption["candidate_source"] = candidate_source
 
     if len(selected) < 2:
         selected = sorted(model_cols, key=lambda m: maes[m])[:min(3, len(model_cols))]
+        candidate_source = "mae_ranked_fallback"
+        stepwise_adoption["candidate_source"] = candidate_source
 
     # === 拟合前候选约束：唯一候选选择权在此收口（Task 8.3 Task 3）。===
     # 这些决策原先散落在 protocol_b.py 的 selector 调用之后，现在全部移入本
@@ -818,6 +911,105 @@ def select_models_protocol_b(
                 "after": list(selected),
             })
 
+    # 6) pair 资格对齐（Task 8.3 Task 10）
+    # 权重归零后已退化为单模型的 pair 不是有效二模型组合。资格判据直接复用生产
+    # 的 zero-weight cleanup 结果，替换只用 validation 求值，找不到合格 pair 时
+    # 显式回退到清理后的有效模型，交给既有 guard 链决定最终是否采用。
+    pair_eligibility_meta: Dict[str, Any] = {
+        "checked": False,
+        "reason_not_checked": "selection_is_not_a_pair",
+    }
+    if df_val is not None and len(selected) == 2:
+        fit_cfg = dict(pair_fit_config or {})
+        base_enforcement_active = bool(
+            PROTOCOL_B_ENFORCE_BASE_MODEL_IN_SELECTION
+            and PROTOCOL_B_ENFORCE_BASE_MODEL_MODE != "off"
+            and enforce_dataset_ok
+            and int(horizon) >= int(PROTOCOL_B_ENFORCE_BASE_MODEL_MIN_H)
+            and base_model_candidates
+        )
+        base_model_set = set(base_model_candidates)
+
+        def _pair_allowed(pair: List[str]) -> bool:
+            if check_conflict(mg, pair):
+                return False
+            if base_enforcement_active and not (set(pair) & base_model_set):
+                return False
+            return True
+
+        def _evaluate(pair: List[str]) -> Dict[str, Any]:
+            return evaluate_pair_on_validation(
+                df_val=df_val,
+                pair=pair,
+                horizon=horizon,
+                alpha_candidates=fit_cfg.get("alpha_candidates"),
+                temporal_decay=fit_cfg.get("temporal_decay"),
+                temporal_decay_meta=fit_cfg.get("temporal_decay_meta"),
+                temporal_min_weight_ratio=fit_cfg.get("temporal_min_weight_ratio"),
+            )
+
+        incumbent = list(selected)
+        evaluated: List[Dict[str, Any]] = [_evaluate(incumbent)]
+        if evaluated[0]["eligible_pair"]:
+            pair_eligibility_meta = {
+                "checked": True,
+                "reason_not_checked": None,
+                "incumbent_pair": incumbent,
+                "evaluated_pairs": evaluated,
+                "selected_pair": incumbent,
+                "outcome": "kept",
+                "fallback_target": None,
+                "fallback_reason": None,
+            }
+        else:
+            for pair in combinations(candidate_order, 2):
+                pair = list(pair)
+                if set(pair) == set(incumbent) or not _pair_allowed(pair):
+                    continue
+                evaluated.append(_evaluate(pair))
+            eligible_rows = [row for row in evaluated if row["eligible_pair"]]
+            if eligible_rows:
+                best = min(
+                    eligible_rows,
+                    key=lambda row: (row["validation_mae"], tuple(row["models"])),
+                )
+                constraint_decisions.append({
+                    "stage": "degenerate_pair_replaced_by_eligible_pair",
+                    "before": list(selected),
+                    "after": list(best["models"]),
+                })
+                selected = list(best["models"])
+                pair_eligibility_meta = {
+                    "checked": True,
+                    "reason_not_checked": None,
+                    "incumbent_pair": incumbent,
+                    "evaluated_pairs": evaluated,
+                    "selected_pair": list(best["models"]),
+                    "outcome": "replaced",
+                    "fallback_target": None,
+                    "fallback_reason": None,
+                }
+            else:
+                effective = list(evaluated[0]["effective_models"])
+                if not effective:
+                    effective = [min(incumbent, key=lambda m: maes.get(m, float("inf")))]
+                constraint_decisions.append({
+                    "stage": "degenerate_pair_fallback_to_effective_single",
+                    "before": list(selected),
+                    "after": list(effective),
+                })
+                selected = effective
+                pair_eligibility_meta = {
+                    "checked": True,
+                    "reason_not_checked": None,
+                    "incumbent_pair": incumbent,
+                    "evaluated_pairs": evaluated,
+                    "selected_pair": None,
+                    "outcome": "no_eligible_pair",
+                    "fallback_target": list(effective),
+                    "fallback_reason": "no_eligible_pair_after_zero_weight_cleanup",
+                }
+
     # 逐模型对的冲突/相关性诊断（Task 8.3 Task 3）：hard_conflict 只来自显式
     # conflict 边；correlation_penalty 来自连续误差相关性，不构成硬排除。
     ordered_cols = sorted(model_cols)
@@ -839,6 +1031,8 @@ def select_models_protocol_b(
         "candidate_order": list(candidate_order),
         "selector_output": list(selected),
         "constraint_decisions": constraint_decisions,
+        "stepwise_adoption": stepwise_adoption,
+        "pair_eligibility": pair_eligibility_meta,
         "pair_diagnostics": pair_diagnostics,
         "single_model_direct_pass": single_model_direct_pass_meta,
         "base_selection_guard": base_selection_guard_meta,

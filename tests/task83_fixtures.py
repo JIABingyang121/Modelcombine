@@ -82,3 +82,70 @@ def make_relation_drift_context(
         feedback_store=None, return_predictions=True,
     )
     return ctx, "drift"
+
+
+DEGENERATE_MODELS = ["m_anchor", "m_scaled", "m_third"]
+ALL_DEGENERATE_MODELS = ["c1", "c2", "c3"]
+
+
+def make_degenerate_pair_frames(seed: int = 7, n_val: int = 600, n_test: int = 180):
+    """构造"stepwise 选中的 pair 会被 Ridge 归零"的确定性帧（Task 8.3 Task 10）。
+
+    `m_anchor` 单模型 MAE 最好，因此是 stepwise 的起点；`m_scaled` 系统性缩放
+    （0.85y）且噪声与 anchor 同源，正约束 Ridge 在 `[m_anchor, m_scaled]` 上的
+    无约束最优解对 anchor 为负，被截断成 0，pair 实际退化为单模型。
+    `m_third` 噪声独立，与另外两个模型都能组成真正的二模型组合。
+    退化由真实 Ridge 与真实 zero-weight cleanup 产生，不做任何伪造。
+    """
+    rng = np.random.default_rng(seed)
+    ts_val = pd.date_range("2026-01-01", periods=n_val, freq="h")
+    ts_test = pd.date_range("2026-02-01", periods=n_test, freq="h")
+
+    def build(ts):
+        n = len(ts)
+        t = np.arange(n, dtype=float)
+        y = 100.0 + 10.0 * np.sin(t * 2 * np.pi / 24)
+        u = rng.normal(0.0, 1.0, n)
+        w = rng.normal(0.0, 1.5, n)
+        z = rng.normal(0.0, 0.05, n)
+        return pd.DataFrame({
+            "timestamp": ts,
+            "y": y,
+            "m_anchor": y + u,
+            "m_scaled": 0.85 * y + 0.3 * u + z,
+            "m_third": y + w,
+        })
+
+    df_val, df_test = build(ts_val), build(ts_test)
+    raw_val = pd.DataFrame({"timestamp": ts_val, "hour": ts_val.hour})
+    raw_test = pd.DataFrame({"timestamp": ts_test, "hour": ts_test.hour})
+    return df_val, df_test, raw_val, raw_test
+
+
+def make_all_degenerate_frames(seed: int = 13, n_val: int = 600, n_test: int = 180):
+    """三个候选误差高度同源：任意二模型组合都会被 Ridge 归零成单模型。
+
+    同时也是"stepwise 只返回 1 个模型"的场景——组合改善低于自适应阈值，
+    stepwise 在第一步就停止。
+    """
+    rng = np.random.default_rng(seed)
+    ts_val = pd.date_range("2026-01-01", periods=n_val, freq="h")
+    ts_test = pd.date_range("2026-02-01", periods=n_test, freq="h")
+
+    def build(ts):
+        n = len(ts)
+        t = np.arange(n, dtype=float)
+        y = 100.0 + 10.0 * np.sin(t * 2 * np.pi / 24)
+        e = rng.normal(0.0, 1.0, n)
+        return pd.DataFrame({
+            "timestamp": ts,
+            "y": y,
+            "c1": y + e + 0.06 * rng.normal(0.0, 1.0, n),
+            "c2": y + 1.02 * e + 0.06 * rng.normal(0.0, 1.0, n),
+            "c3": y + 1.05 * e + 0.06 * rng.normal(0.0, 1.0, n),
+        })
+
+    df_val, df_test = build(ts_val), build(ts_test)
+    raw_val = pd.DataFrame({"timestamp": ts_val, "hour": ts_val.hour})
+    raw_test = pd.DataFrame({"timestamp": ts_test, "hour": ts_test.hour})
+    return df_val, df_test, raw_val, raw_test

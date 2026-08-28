@@ -29,6 +29,7 @@ from .model_selection import (
     _cleanup_zero_weight_models_and_refit,
     _compute_feature_bonus_map,
     fit_static_weight_ridge,
+    pair_eligibility_from_cleanup,
     select_models_protocol_b,
 )
 from .reasoning_evidence import build_reasoning_evidence
@@ -348,6 +349,35 @@ def kg_combination_with_features(df_val: pd.DataFrame, df_test: pd.DataFrame,
         "cold_start_no_evidence": reasoning_evidence.cold_start_no_evidence,
     }
 
+    # 拟合参数在选择之前就已确定（只取决于 drift/dataset/horizon）。提前解析出来，
+    # 让 selector 的 pair 资格判定用与最终拟合完全相同的 Ridge 配置。
+    drift_decay, drift_decay_meta = _resolve_drift_aware_temporal_decay(
+        base_decay=KG_RIDGE_TEMPORAL_DECAY,
+        drift_level=drift_level,
+        drift_median_psi=drift_median_psi,
+    )
+    temporal_min_w_ratio = None
+    if drift_level == "high":
+        temporal_min_w_ratio = min(
+            1.0,
+            KG_TEMPORAL_WEIGHT_MIN_RATIO * PROTOCOL_B_HIGH_DRIFT_MIN_W_MULTIPLIER,
+        )
+    if dataset_name in PROTOCOL_B_MIN_W_OVERRIDE_DATASETS:
+        base_ratio = temporal_min_w_ratio if temporal_min_w_ratio is not None else KG_TEMPORAL_WEIGHT_MIN_RATIO
+        temporal_min_w_ratio = min(1.0, max(float(base_ratio), float(PROTOCOL_B_MIN_W_OVERRIDE_VALUE)))
+
+    # P0-3: h24 alpha 加强正则化
+    b_alpha_candidates = HIGH_DRIFT_ALPHA_CANDIDATES if drift_level == "high" else None
+    if horizon >= KG_LONG_HORIZON_MIN_H and b_alpha_candidates is None:
+        b_alpha_candidates = [a * KG_LONG_HORIZON_ALPHA_MULTIPLIER for a in [1.0, 10.0, 50.0, 100.0, 500.0]]
+
+    pair_fit_config = {
+        "alpha_candidates": b_alpha_candidates,
+        "temporal_decay": drift_decay,
+        "temporal_decay_meta": drift_decay_meta,
+        "temporal_min_weight_ratio": temporal_min_w_ratio,
+    }
+
     # Protocol B 差异化：特征奖励 + 误差相关惩罚（避免 A/B 完全一致）
     feature_bonus_weight = PROTOCOL_B_FEATURE_BONUS_WEIGHT
     corr_penalty_weight = PROTOCOL_B_CORR_PENALTY_WEIGHT
@@ -367,6 +397,16 @@ def kg_combination_with_features(df_val: pd.DataFrame, df_test: pd.DataFrame,
             "candidate_order": list(selected),
             "selector_output": list(selected),
             "constraint_decisions": [],
+            "stepwise_adoption": {
+                "stepwise_output": None,
+                "adopted": False,
+                "not_adopted_reason": "diagnostic_fixed_pair",
+                "candidate_source": "diagnostic_fixed_pair",
+            },
+            "pair_eligibility": {
+                "checked": False,
+                "reason_not_checked": "diagnostic_fixed_pair",
+            },
             "pair_diagnostics": {},
             "score_components": {},
             "relation_strength": {
@@ -394,6 +434,7 @@ def kg_combination_with_features(df_val: pd.DataFrame, df_test: pd.DataFrame,
             reasoning_contribution=reasoning_evidence.contribution_by_model,
             dataset_name=dataset_name,
             base_model_cols=base_model_cols,
+            pair_fit_config=pair_fit_config,
         )
     # 选择流程（Task 8.3 Task 3）：selector 之后不再有任何改写 selected 的代码，
     # post_selector_mutations 恒为空；constraint_decisions 已在 selector 内记录。
@@ -409,29 +450,18 @@ def kg_combination_with_features(df_val: pd.DataFrame, df_test: pd.DataFrame,
             "contribution": dict(reasoning_evidence.contribution_by_model),
         },
         "constraint_decisions": list(b_select_meta["constraint_decisions"]),
+        # stepwise 输出是否被采用、pair 资格判定过程（Task 8.3 Task 10）
+        "stepwise_adoption": dict(b_select_meta["stepwise_adoption"]),
+        "pair_eligibility": dict(b_select_meta["pair_eligibility"]),
         "post_selector_mutations": [],
         "final_selected_before_fit": list(selected),
     }
-
-    drift_decay, drift_decay_meta = _resolve_drift_aware_temporal_decay(
-        base_decay=KG_RIDGE_TEMPORAL_DECAY,
-        drift_level=drift_level,
-        drift_median_psi=drift_median_psi,
+    # selector 判定"没有任何合格 pair"时，最终回退目标要在下方 guard 处改成最佳
+    # 单模型：Protocol A 保留旧语义，其输出本身可能带零权重模型，回退到 A 会把刚
+    # 被判为不合格的退化组合重新带进最终结果。
+    no_eligible_pair = (
+        (b_select_meta.get("pair_eligibility") or {}).get("outcome") == "no_eligible_pair"
     )
-    temporal_min_w_ratio = None
-    if drift_level == "high":
-        temporal_min_w_ratio = min(
-            1.0,
-            KG_TEMPORAL_WEIGHT_MIN_RATIO * PROTOCOL_B_HIGH_DRIFT_MIN_W_MULTIPLIER,
-        )
-    if dataset_name in PROTOCOL_B_MIN_W_OVERRIDE_DATASETS:
-        base_ratio = temporal_min_w_ratio if temporal_min_w_ratio is not None else KG_TEMPORAL_WEIGHT_MIN_RATIO
-        temporal_min_w_ratio = min(1.0, max(float(base_ratio), float(PROTOCOL_B_MIN_W_OVERRIDE_VALUE)))
-
-    # P0-3: h24 alpha 加强正则化
-    b_alpha_candidates = HIGH_DRIFT_ALPHA_CANDIDATES if drift_level == "high" else None
-    if horizon >= KG_LONG_HORIZON_MIN_H and b_alpha_candidates is None:
-        b_alpha_candidates = [a * KG_LONG_HORIZON_ALPHA_MULTIPLIER for a in [1.0, 10.0, 50.0, 100.0, 500.0]]
 
     pred_val, pred_test, weights, ridge_meta = fit_static_weight_ridge(
         df_val=df_val,
@@ -1106,6 +1136,18 @@ def kg_combination_with_features(df_val: pd.DataFrame, df_test: pd.DataFrame,
         )
         fallback_reason = f"{fallback_reason};{extra_reason}"
 
+    # 无合格 pair 时改走最佳单模型分支（Task 8.3 Task 10）。只改回退目标，不动任何
+    # guard 阈值、不改 Protocol A：否则 selector 刚拒绝的退化组合会经由 A 的输出
+    # 重新出现在最终结果里。
+    if (
+        fallback_reason
+        and fallback_target == "protocol_a"
+        and no_eligible_pair
+        and best_single_model is not None
+    ):
+        fallback_target = "best_single"
+        fallback_reason = f"{fallback_reason};no_eligible_pair_fallback_to_best_single"
+
     ridge_meta["guard_config"].update({
         "complexity_penalty_enabled": bool(complexity_guard_enabled),
         "complexity_penalty_min_rel_improve": float(PROTOCOL_B_COMPLEXITY_PENALTY_MIN_REL_IMPROVE),
@@ -1393,14 +1435,14 @@ def kg_combination_with_features(df_val: pd.DataFrame, df_test: pd.DataFrame,
         # 但不执行回退。退化资格按近零权重清理后的 zero_weight_cleanup["after"]
         # 判定——二模型下生产清理不触发 refit，但"after"已反映实际有效模型。
         cleanup_after = (ridge_meta.get("zero_weight_cleanup") or {}).get("after")
-        effective_models = list(cleanup_after) if cleanup_after is not None else list(selected)
+        effective_models, eligible_pair, degenerate_reason = pair_eligibility_from_cleanup(
+            selected, cleanup_after,
+        )
         result["diagnostic_mode"] = "fixed_pair"
         result["requested_models"] = list(_fixed_selected_models)
         result["effective_models"] = effective_models
-        result["eligible_pair"] = len(effective_models) == 2
-        result["degenerate_reason"] = (
-            None if len(effective_models) == 2 else "zero_weight_cleanup_reduced_pair"
-        )
+        result["eligible_pair"] = eligible_pair
+        result["degenerate_reason"] = degenerate_reason
         result["fallback_target"] = None
         result["guard_would_fallback_to"] = fallback_target if fallback_reason else None
         result["guard_would_fallback_reason"] = fallback_reason
