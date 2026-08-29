@@ -2023,6 +2023,7 @@ def main() -> int:
     parser.add_argument("--skip-combinator", action="store_true", help="跳过旧 System A 参考（默认运行）")
     parser.add_argument("--combinator-timeout", type=float, default=900.0)
     parser.add_argument("--candidate-diagnostic", type=Path, default=None, help="候选诊断报告（task83-candidate-diagnostic.1）")
+    parser.add_argument("--independent-batch", action="store_true")
     parser.add_argument("--out-root", type=Path, default=PROJECT_ROOT / "result" / "ab_convergence" / "shadow_9tasks")
     args = parser.parse_args()
 
@@ -2107,7 +2108,7 @@ def main() -> int:
                 "候选诊断未覆盖恰好九个唯一任务；缺失: "
                 f"{sorted((k[0], k[1]) for k in (expected_keys - diag_keys))}"
             )
-        if full_run:
+        if full_run and not args.independent_batch:
             # 锁定来源校验：固定 baselines_v5 的 pipeline/数据/provenance 哈希与
             # 72 artifacts + 225 文件哈希（Global Constraints 写定值）。
             from scripts.run_protocol_b_candidate_diagnostic import verify_locked_sources
@@ -2203,6 +2204,7 @@ def main() -> int:
             "filter_threshold": args.filter_threshold,
             "run_combinator": not args.skip_combinator,
             "candidate_diagnostic_sha256": candidate_diagnostic_sha256,
+            "independent_batch": args.independent_batch,
             "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         },
     }

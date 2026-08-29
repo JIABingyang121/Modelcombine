@@ -116,6 +116,17 @@ def test_default_task_specs_are_consumable_by_diagnostic_builder(monkeypatch):
     assert len(report["tasks"]) == 9
     assert all(t["task_id"] for t in report["tasks"])
 
+    def _locked_v5_must_not_run(**kwargs):
+        raise AssertionError("independent batch must not use locked v5 validation")
+
+    monkeypatch.setattr(diag, "verify_locked_sources", _locked_v5_must_not_run)
+    independent = diag.build_diagnostic_report(
+        pred_root=Path("/tmp/pred"), raw_root=None,
+        feature_root=Path("/tmp/features"), pipeline_config=Path("/tmp/pipeline.yaml"),
+        tasks=specs, independent_batch=True,
+    )
+    assert independent["locked_sources"] == {"status": "independent_batch"}
+
 
 def _schema_task(dataset, horizon, *, best_pair=None, pairs=None):
     default_pairs = [

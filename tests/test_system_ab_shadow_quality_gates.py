@@ -654,11 +654,11 @@ def test_main_assembles_v6_report_through_cli(monkeypatch, tmp_path):
     import scripts.run_protocol_b_candidate_diagnostic as diag_mod
     import scripts.train_baselines as tb
 
+    def _locked_v5_must_not_run(**kwargs):
+        raise AssertionError("independent batch must not use locked v5 validation")
+
     monkeypatch.setattr(shadow, "_build_kg_model_candidates", lambda: ["m1", "m2"])
-    monkeypatch.setattr(
-        diag_mod, "verify_locked_sources",
-        lambda pred_root, pipeline_config, feature_root: {"status": "verified"},
-    )
+    monkeypatch.setattr(diag_mod, "verify_locked_sources", _locked_v5_must_not_run)
     monkeypatch.setattr(
         tb, "load_verified_baseline_provenance",
         lambda pred_root, pipeline_config: {"pipeline_sha256": "x", "data_hashes": {}},
@@ -675,6 +675,7 @@ def test_main_assembles_v6_report_through_cli(monkeypatch, tmp_path):
         "--skip-combinator",
         "--candidate-diagnostic", str(diag_path),
         "--require-baseline-provenance",
+        "--independent-batch",
         "--seed", "42",
         "--out-root", str(out_root),
     ])
@@ -690,6 +691,7 @@ def test_main_assembles_v6_report_through_cli(monkeypatch, tmp_path):
     assert "per_task_vs_best_pair_3pct" in gates
     assert report["relation_qualification"]["status"] == "qualified"
     assert report["_meta"]["candidate_diagnostic_sha256"]
+    assert report["_meta"]["independent_batch"] is True
 
 
 def _v6_records():

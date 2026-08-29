@@ -186,6 +186,7 @@ def build_diagnostic_report(
     feature_root: Path,
     pipeline_config: Path,
     tasks: Sequence[Dict[str, Any]],
+    independent_batch: bool = False,
 ) -> Dict[str, Any]:
     """对 9 任务枚举单模型/全部二模型，并输出候选诊断报告。"""
     from scripts.run_system_ab_shadow import _build_kg_model_candidates, build_task_matrix
@@ -194,8 +195,14 @@ def build_diagnostic_report(
         kg_combination_with_features,
     )
 
-    locked_sources = verify_locked_sources(
-        pred_root=pred_root, pipeline_config=pipeline_config, feature_root=feature_root
+    locked_sources = (
+        {"status": "independent_batch"}
+        if independent_batch
+        else verify_locked_sources(
+            pred_root=pred_root,
+            pipeline_config=pipeline_config,
+            feature_root=feature_root,
+        )
     )
     models = _build_kg_model_candidates()
     records: List[Dict[str, Any]] = []
@@ -396,6 +403,7 @@ def main() -> int:
     parser.add_argument("--pipeline-config", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--out-root", type=Path, required=True)
+    parser.add_argument("--independent-batch", action="store_true")
     args = parser.parse_args()
 
     from scripts.run_system_ab_shadow import build_task_specs
@@ -410,6 +418,7 @@ def main() -> int:
         feature_root=args.feature_root,
         pipeline_config=args.pipeline_config,
         tasks=specs,
+        independent_batch=args.independent_batch,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
