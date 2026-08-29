@@ -149,3 +149,56 @@ def make_all_degenerate_frames(seed: int = 13, n_val: int = 600, n_test: int = 1
     raw_val = pd.DataFrame({"timestamp": ts_val, "hour": ts_val.hour})
     raw_test = pd.DataFrame({"timestamp": ts_test, "hour": ts_test.hour})
     return df_val, df_test, raw_val, raw_test
+
+
+HIGH_DRIFT_MODELS = ["m1", "m2", "m3"]
+
+
+def make_high_drift_overfit_frames(
+    seed: int = 5,
+    n_val: int = 800,
+    n_test: int = 200,
+    tail_infl: float = 1.12,
+    shift: float = 50.0,
+    inter_gain: float = 3.0,
+):
+    """复现 AEMO NSW h=1 的 high_drift_overfit_guard 病态（Task 8.3 Task 11）。
+
+    三个候选共享一段可由原始特征 `wk` 解释的系统性偏差，Protocol B 的 interaction
+    分支能真实消掉它，因此 B 在验证集上大幅优于 A；验证窗尾部 30% 的误差被放大，
+    使 `tail/full` 落在 (1.08, 1.15]——刚好高于 h<=1 的 tail 门槛、又低于
+    tail_holdout 门槛，于是 `high_drift_overfit_guard` 以"样本内改善过大"为由回退。
+    test 侧整体平移只用于把 PSI 推到高漂移区间，不参与任何选择。
+
+    `tail_infl=1.0` 时尾部不放大，该 guard 条件不成立，可作对照。
+    """
+    rng = np.random.default_rng(seed)
+    ts_val = pd.date_range("2026-01-01", periods=n_val, freq="h")
+    ts_test = pd.date_range("2026-03-01", periods=n_test, freq="h")
+
+    def build(ts, is_test):
+        n = len(ts)
+        t = np.arange(n, dtype=float)
+        y = 200.0 + 0.02 * t + 20.0 * np.sin(t * 2 * np.pi / 24)
+        f = np.sin(t * 2 * np.pi / 168) * 10.0
+        scale = np.ones(n)
+        if not is_test:
+            scale[int(n * 0.70):] = tail_infl
+        e1 = rng.normal(0.0, 6.0, n) * scale
+        e2 = rng.normal(0.0, 6.0, n) * scale
+        e3 = rng.normal(0.0, 9.0, n) * scale
+        bias = inter_gain * f
+        off = shift if is_test else 0.0
+        frame = pd.DataFrame({
+            "timestamp": ts,
+            "y": y,
+            "m1": y + bias + e1 + off,
+            "m2": y + bias + e2 + off,
+            "m3": y + bias + e3 + off,
+        })
+        raw = pd.DataFrame({"timestamp": ts, "wk": f, "hour": ts.hour})
+        return frame, raw
+
+    df_val, raw_val = build(ts_val, False)
+    df_test, raw_test = build(ts_test, True)
+    return df_val, df_test, raw_val, raw_test

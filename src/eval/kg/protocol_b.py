@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import copy
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -100,6 +100,55 @@ def _interaction_oof_cv_metrics(
         "mae_inter_oof": mae_inter,
         "oof_coverage": float(np.mean(mask.astype(float))),
     }
+
+def _unified_oof_mae(
+    *,
+    df_val: pd.DataFrame,
+    models: Sequence[str],
+    horizon: int,
+    alpha: float,
+    sample_weight: Optional[np.ndarray],
+    interaction_features: Optional[np.ndarray] = None,
+    interaction_alpha: Optional[float] = None,
+) -> Tuple[float, int]:
+    """在同一组 blocked-CV 折上计算一个方案的折外 MAE（Task 8.3 Task 11）。
+
+    每一折都重新拟合线性组合（正约束 Ridge、无截距）；给出 interaction 设计矩阵
+    时，在同一折内用该折的残差重新拟合交互残差模型再叠加。A/B 两侧调用同一函数、
+    同样的折配置、同样的 alpha 与样本权重，返回 (折外 MAE, 覆盖样本数)，
+    覆盖数用于确认两侧评价范围一致。
+
+    只读取 ``df_val``，签名不含任何 test 帧。拟合失败直接向上抛：该判据只在
+    ``len(df_val) >= 500`` 时可达，此时折必然存在且非退化，任何异常都是真问题。
+    """
+    y = np.asarray(df_val["y"].values, dtype=float)
+    X = np.asarray(df_val[list(models)].values, dtype=float)
+    n_folds, min_train, gap = _resolve_cv_config(len(y), horizon)
+    splits = blocked_cv_splits(len(y), n_folds=n_folds, min_train=min_train, gap=gap)
+
+    oof = np.full(len(y), np.nan, dtype=float)
+    for train_idx, val_idx in splits:
+        sw = sample_weight[train_idx] if sample_weight is not None else None
+        reg, _ = fit_ridge_robust(
+            X[train_idx], y[train_idx],
+            alpha=float(alpha), positive=True, fit_intercept=False,
+            sample_weight=sw,
+        )
+        pred_va = reg.predict(X[val_idx])
+        if interaction_features is not None:
+            residual = y[train_idx] - reg.predict(X[train_idx])
+            reg_i, _ = fit_ridge_robust(
+                interaction_features[train_idx], residual,
+                alpha=float(interaction_alpha),
+                positive=False, fit_intercept=False,
+                sample_weight=sw,
+            )
+            pred_va = pred_va + reg_i.predict(interaction_features[val_idx])
+        oof[val_idx] = pred_va
+
+    mask = np.isfinite(oof)
+    return float(np.mean(np.abs(oof[mask] - y[mask]))), int(mask.sum())
+
 
 def kg_combination_with_features(df_val: pd.DataFrame, df_test: pd.DataFrame,
                                   df_raw_val: Optional[pd.DataFrame],
@@ -504,6 +553,7 @@ def kg_combination_with_features(df_val: pd.DataFrame, df_test: pd.DataFrame,
     }
 
     # Protocol B 差异化主分支：在主干预测上叠加“模型 x 特征”交互残差。
+    applied_interaction_spec: Optional[Dict[str, Any]] = None
     interaction_meta: Dict[str, Any] = {
         "enabled": False,
         "applied": False,
@@ -682,6 +732,12 @@ def kg_combination_with_features(df_val: pd.DataFrame, df_test: pd.DataFrame,
                             pred_val = pred_val_i
                             pred_test = pred_test_i
                             interaction_meta["applied"] = True
+                            # 供 guard 的统一折外比较逐折重拟合同一交互结构使用
+                            applied_interaction_spec = {
+                                "features": X_inter_val,
+                                "alpha": float(alpha_i),
+                                "sample_weight": inter_sample_weight,
+                            }
                         interaction_meta.update({
                             "n_interactions": int(X_inter_val.shape[1]),
                             "alpha": float(alpha_i),
@@ -978,12 +1034,56 @@ def kg_combination_with_features(df_val: pd.DataFrame, df_test: pd.DataFrame,
                 and rel_improve_b_vs_a > PROTOCOL_B_HIGH_DRIFT_OVERFIT_VAL_IMPROVE_THRESHOLD
                 and (not tail_guard_ok or not interaction_guard_ok)
             ):
-                fallback_reason = (
-                    "high_drift_overfit_guard: "
-                    f"rel_improve={rel_improve_b_vs_a:.4f} > {PROTOCOL_B_HIGH_DRIFT_OVERFIT_VAL_IMPROVE_THRESHOLD:.4f}, "
-                    f"tail/full={tail_ratio_repr}, "
-                    f"interaction_guard_ok={interaction_guard_ok}"
+                # 样本内改善过大本身不是过拟合证据（Task 8.3 Task 11）。真实九任务
+                # 里该任务全部候选的 tail/full 几乎相同、都越过门槛，复合判据退化成
+                # "越好越拒"。这里在同一组折、同一评价范围上分别算 A、B 的折外 MAE：
+                # 折外支持 B 就不以样本内改善为由回退；不支持或不可用维持保守回退。
+                # 阈值一律不动，只增加一条证据。
+                oof_alpha = float(ridge_meta.get("best_alpha") or 1.0)
+                oof_sample_weight = _compute_temporal_weights(
+                    len(df_val), drift_decay, min_ratio=temporal_min_w_ratio,
                 )
+                models_a = list(
+                    (protocol_a_reference.get("val") or {}).get("selected_models") or []
+                )
+                oof_mae_a, oof_cov_a = _unified_oof_mae(
+                    df_val=df_val, models=models_a, horizon=horizon,
+                    alpha=oof_alpha, sample_weight=oof_sample_weight,
+                )
+                oof_mae_b, oof_cov_b = _unified_oof_mae(
+                    df_val=df_val, models=list(selected), horizon=horizon,
+                    alpha=oof_alpha, sample_weight=oof_sample_weight,
+                    interaction_features=(applied_interaction_spec or {}).get("features"),
+                    interaction_alpha=(applied_interaction_spec or {}).get("alpha"),
+                )
+                oof_supports_b = oof_mae_b < oof_mae_a
+                ridge_meta["guard_config"]["high_drift_overfit_oof_check"] = {
+                    "evaluated": True,
+                    "protocol": "same_blocked_cv_folds_same_alpha_and_sample_weight",
+                    "alpha": oof_alpha,
+                    "models_a": models_a,
+                    "models_b": list(selected),
+                    "interaction_included_for_b": applied_interaction_spec is not None,
+                    "oof_mae_a": oof_mae_a,
+                    "oof_mae_b": oof_mae_b,
+                    "oof_coverage_a": oof_cov_a,
+                    "oof_coverage_b": oof_cov_b,
+                    "rel_improve_b_vs_a": float(rel_improve_b_vs_a),
+                    "tail_full_ratio_b": (
+                        float(tail_full_ratio_b)
+                        if tail_full_ratio_b is not None and np.isfinite(tail_full_ratio_b)
+                        else None
+                    ),
+                    "supports_b": bool(oof_supports_b),
+                }
+                if not oof_supports_b:
+                    fallback_reason = (
+                        "high_drift_overfit_guard: "
+                        f"rel_improve={rel_improve_b_vs_a:.4f} > {PROTOCOL_B_HIGH_DRIFT_OVERFIT_VAL_IMPROVE_THRESHOLD:.4f}, "
+                        f"tail/full={tail_ratio_repr}, "
+                        f"interaction_guard_ok={interaction_guard_ok}, "
+                        f"oof_supports_b=False(oof_a={oof_mae_a:.4f}, oof_b={oof_mae_b:.4f})"
+                    )
             elif (
                 rel_improve_b_vs_a is not None
                 and rel_improve_b_vs_a < PROTOCOL_B_HIGH_DRIFT_A_PREFERRED_MIN_IMPROVE

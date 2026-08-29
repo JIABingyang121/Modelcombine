@@ -47,3 +47,22 @@ def test_candidate_diagnostic_resolves_scripts_when_run_directly(tmp_path):
     )
     assert "No module named 'scripts'" not in proc.stderr
     assert proc.returncode != 0  # 会因缺数据失败，但不应是导入错误
+
+
+def test_proxy_objective_probe_resolves_scripts_when_run_directly(tmp_path):
+    """代理口径探针脚本直接执行时必须能解析 `scripts.*` 导入（--help 即触发）。"""
+    proc = _run("scripts/run_proxy_objective_probe.py", "--help", cwd=tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    assert "No module named 'scripts'" not in proc.stderr
+
+
+def test_proxy_objective_probe_ranking_is_deterministic():
+    """排序按 (MAE, 模型名) 定序，同分用模型名作稳定次级键。"""
+    from scripts.run_proxy_objective_probe import _rank
+
+    rows = [
+        {"model": "b", "v": 1.0},
+        {"model": "a", "v": 1.0},
+        {"model": "c", "v": 0.5},
+    ]
+    assert _rank(rows, "v") == ["c", "a", "b"]
