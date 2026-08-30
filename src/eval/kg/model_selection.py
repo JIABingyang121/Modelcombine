@@ -564,6 +564,7 @@ def select_models_protocol_b(
     dataset_name: Optional[str] = None,
     base_model_cols: Optional[List[str]] = None,
     pair_fit_config: Optional[Mapping[str, Any]] = None,
+    full_pair_evaluator: Optional[Callable[[Sequence[str]], Mapping[str, Any]]] = None,
 ) -> Tuple[List[str], Dict[str, float], Dict[str, float], Dict]:
     """
     Protocol B 专用模型选择：
@@ -949,66 +950,103 @@ def select_models_protocol_b(
             )
 
         incumbent = list(selected)
-        evaluated: List[Dict[str, Any]] = [_evaluate(incumbent)]
-        if evaluated[0]["eligible_pair"]:
+        if full_pair_evaluator is None:
+            evaluated: List[Dict[str, Any]] = [_evaluate(incumbent)]
+            if not evaluated[0]["eligible_pair"]:
+                for pair in combinations(candidate_order, 2):
+                    pair = list(pair)
+                    if set(pair) == set(incumbent) or not _pair_allowed(pair):
+                        continue
+                    evaluated.append(_evaluate(pair))
+        else:
+            evaluated = []
+            for pair in combinations(candidate_order, 2):
+                pair = list(pair)
+                if not _pair_allowed(pair):
+                    continue
+                full = full_pair_evaluator(pair)
+                evaluated.append({
+                    "models": pair,
+                    "validation_mae": float(full["val"]["mae"]),
+                    "full_validation_mae": float(full["val"]["mae"]),
+                    "candidate_score": float(_score_combo(pair)),
+                    "eligible_pair": bool(full["eligible_pair"]),
+                    "degenerate_reason": full["degenerate_reason"],
+                    "effective_models": list(full["effective_models"]),
+                })
+
+        eligible_rows = [row for row in evaluated if row["eligible_pair"]]
+        if eligible_rows:
+            if full_pair_evaluator is None:
+                best = min(
+                    eligible_rows,
+                    key=lambda row: (row["validation_mae"], tuple(sorted(row["models"]))),
+                )
+            else:
+                best_validation_mae = min(row["validation_mae"] for row in eligible_rows)
+                near_tied = [
+                    row for row in eligible_rows
+                    if row["validation_mae"] <= best_validation_mae * (1.0 + stepwise_min_improve)
+                ]
+                for row in eligible_rows:
+                    row["within_validation_margin"] = row in near_tied
+                best = min(
+                    near_tied,
+                    key=lambda row: (-row["candidate_score"], tuple(sorted(row["models"]))),
+                )
+            selected = list(best["models"])
+            if set(selected) != set(incumbent):
+                stage = (
+                    "full_validation_pair_selection"
+                    if full_pair_evaluator is not None
+                    else "degenerate_pair_replaced_by_eligible_pair"
+                )
+                constraint_decisions.append({
+                    "stage": stage,
+                    "before": incumbent,
+                    "after": list(best["models"]),
+                })
+            if full_pair_evaluator is None:
+                outcome = "replaced" if set(selected) != set(incumbent) else "kept"
+            else:
+                outcome = (
+                    "replaced_by_full_validation"
+                    if set(selected) != set(incumbent)
+                    else "kept_by_full_validation"
+                )
             pair_eligibility_meta = {
                 "checked": True,
                 "reason_not_checked": None,
                 "incumbent_pair": incumbent,
                 "evaluated_pairs": evaluated,
-                "selected_pair": incumbent,
-                "outcome": "kept",
+                "selected_pair": list(selected),
+                "outcome": outcome,
+                "validation_tie_relative_margin": (
+                    float(stepwise_min_improve) if full_pair_evaluator is not None else None
+                ),
                 "fallback_target": None,
                 "fallback_reason": None,
             }
         else:
-            for pair in combinations(candidate_order, 2):
-                pair = list(pair)
-                if set(pair) == set(incumbent) or not _pair_allowed(pair):
-                    continue
-                evaluated.append(_evaluate(pair))
-            eligible_rows = [row for row in evaluated if row["eligible_pair"]]
-            if eligible_rows:
-                best = min(
-                    eligible_rows,
-                    key=lambda row: (row["validation_mae"], tuple(row["models"])),
-                )
-                constraint_decisions.append({
-                    "stage": "degenerate_pair_replaced_by_eligible_pair",
-                    "before": list(selected),
-                    "after": list(best["models"]),
-                })
-                selected = list(best["models"])
-                pair_eligibility_meta = {
-                    "checked": True,
-                    "reason_not_checked": None,
-                    "incumbent_pair": incumbent,
-                    "evaluated_pairs": evaluated,
-                    "selected_pair": list(best["models"]),
-                    "outcome": "replaced",
-                    "fallback_target": None,
-                    "fallback_reason": None,
-                }
-            else:
-                effective = list(evaluated[0]["effective_models"])
-                if not effective:
-                    effective = [min(incumbent, key=lambda m: maes.get(m, float("inf")))]
-                constraint_decisions.append({
-                    "stage": "degenerate_pair_fallback_to_effective_single",
-                    "before": list(selected),
-                    "after": list(effective),
-                })
-                selected = effective
-                pair_eligibility_meta = {
-                    "checked": True,
-                    "reason_not_checked": None,
-                    "incumbent_pair": incumbent,
-                    "evaluated_pairs": evaluated,
-                    "selected_pair": None,
-                    "outcome": "no_eligible_pair",
-                    "fallback_target": list(effective),
-                    "fallback_reason": "no_eligible_pair_after_zero_weight_cleanup",
-                }
+            effective = list(evaluated[0]["effective_models"])
+            if not effective:
+                effective = [min(incumbent, key=lambda m: maes.get(m, float("inf")))]
+            constraint_decisions.append({
+                "stage": "degenerate_pair_fallback_to_effective_single",
+                "before": incumbent,
+                "after": list(effective),
+            })
+            selected = effective
+            pair_eligibility_meta = {
+                "checked": True,
+                "reason_not_checked": None,
+                "incumbent_pair": incumbent,
+                "evaluated_pairs": evaluated,
+                "selected_pair": None,
+                "outcome": "no_eligible_pair",
+                "fallback_target": list(effective),
+                "fallback_reason": "no_eligible_pair_after_zero_weight_cleanup",
+            }
 
     # 逐模型对的冲突/相关性诊断（Task 8.3 Task 3）：hard_conflict 只来自显式
     # conflict 边；correlation_penalty 来自连续误差相关性，不构成硬排除。

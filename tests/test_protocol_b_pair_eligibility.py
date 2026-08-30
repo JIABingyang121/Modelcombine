@@ -79,7 +79,7 @@ def test_degenerate_stepwise_pair_is_replaced_by_eligible_pair():
 
     # 最终不得继续使用退化 pair；换成 validation MAE 最低的合格 pair
     assert flow["selector_output"] != ["m_anchor", "m_scaled"]
-    assert eligibility["outcome"] == "replaced"
+    assert eligibility["outcome"] == "replaced_by_full_validation"
     assert eligibility["selected_pair"] == ["m_third", "m_scaled"]
     assert flow["selector_output"] == ["m_third", "m_scaled"]
 
@@ -99,7 +99,7 @@ def test_degenerate_stepwise_pair_is_replaced_by_eligible_pair():
 
     # 换候选走的是既有 constraint_decisions 通道，不另起一套记录
     stages = [d["stage"] for d in flow["constraint_decisions"]]
-    assert "degenerate_pair_replaced_by_eligible_pair" in stages
+    assert "full_validation_pair_selection" in stages
 
 
 def test_pair_selection_does_not_read_test_labels_or_test_predictions():
@@ -238,10 +238,12 @@ def test_non_degenerate_input_keeps_previous_selection():
     assert adoption["candidate_source"] == "stepwise"
 
     eligibility = flow["pair_eligibility"]
-    assert eligibility["outcome"] == "kept"
+    assert eligibility["outcome"] == "kept_by_full_validation"
     assert eligibility["selected_pair"] == ["m3", "m2"]
-    assert [row["models"] for row in eligibility["evaluated_pairs"]] == [["m3", "m2"]]
-    assert eligibility["evaluated_pairs"][0]["eligible_pair"] is True
+    assert {frozenset(row["models"]) for row in eligibility["evaluated_pairs"]} == {
+        frozenset(pair) for pair in [("m1", "m2"), ("m1", "m3"), ("m2", "m3")]
+    }
+    assert all(row["eligible_pair"] is True for row in eligibility["evaluated_pairs"])
     stages = [d["stage"] for d in flow["constraint_decisions"]]
     assert "degenerate_pair_replaced_by_eligible_pair" not in stages
     assert "degenerate_pair_fallback_to_effective_single" not in stages

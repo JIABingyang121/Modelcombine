@@ -467,6 +467,15 @@ def kg_combination_with_features(df_val: pd.DataFrame, df_test: pd.DataFrame,
             },
         }
     else:
+        def full_pair_evaluator(pair: Sequence[str]) -> Dict:
+            return evaluate_fixed_protocol_b_candidate(
+                df_val, df_test, df_raw_val, df_raw_test,
+                selected_models=pair,
+                horizon=horizon,
+                dataset_name=dataset_name,
+                base_model_cols=base_model_cols,
+            )
+
         selected, b_scores, feature_bonus_map, b_select_meta = select_models_protocol_b(
             mg=mg,
             model_cols=model_cols,
@@ -484,6 +493,7 @@ def kg_combination_with_features(df_val: pd.DataFrame, df_test: pd.DataFrame,
             dataset_name=dataset_name,
             base_model_cols=base_model_cols,
             pair_fit_config=pair_fit_config,
+            full_pair_evaluator=full_pair_evaluator,
         )
     # 选择流程（Task 8.3 Task 3）：selector 之后不再有任何改写 selected 的代码，
     # post_selector_mutations 恒为空；constraint_decisions 已在 selector 内记录。
