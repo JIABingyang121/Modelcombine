@@ -23,14 +23,18 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from src.models.artifacts import save_artifact
 from src.models.registry import model_registry
 from src.models.implementations import _XGBRegressor, _CatBoostRegressor
+from src.storage.model_store import ModelStore
 from src.utils.determinism import global_seed, seed_for_candidate
 from src.utils.io import load_yaml
 
 
 BASELINE_PROVENANCE_FILENAME = "baseline_provenance.json"
 CANDIDATE_SEED_STRATEGY = "sha256(global_seed|model_id|stage)"
+# 模型库登记的训练实例任务类型；与 scenarios.task_type 保持一致。
+BASELINE_TASK_TYPE = "load_forecast"
 
 
 def ensure_dir(path: Path) -> None:
@@ -374,6 +378,8 @@ def run_dataset(
     out_root: Path,
     max_rows: int | None,
     model_params: Mapping[str, Mapping[str, Any]],
+    model_store: "ModelStore | None" = None,
+    artifact_dir: Path | None = None,
 ) -> Dict:
     results = {}
     # 同一数据集的 split 对所有 horizon 复用，避免重复 IO。
@@ -437,13 +443,13 @@ def run_dataset(
                     "timestamp": ts_val.values,
                     "pred": pred_val,
                     "y": y_val.values,
-                }).to_csv(val_path, index=False)
+                }).to_csv(val_path, index=False, float_format="%.17g")
                 pd.DataFrame({
                     "row_id": test_row_ids.values,
                     "timestamp": ts_test.values,
                     "pred": pred_test,
                     "y": y_test.values,
-                }).to_csv(test_path, index=False)
+                }).to_csv(test_path, index=False, float_format="%.17g")
                 fit_status = _extract_fit_status(model)
                 model_meta_path = out_root / name / f"model_meta_h{h}_{mid}.json"
                 with model_meta_path.open("w", encoding="utf-8") as mf:
@@ -496,6 +502,21 @@ def run_dataset(
                     }
                 )
 
+                # 模型库登记：紧贴刚拟合、仍然有效的 model 对象，不重训第二次。
+                if model_store is not None and artifact_dir is not None:
+                    library_model_id = f"{name}__h{h}__{mid}"
+                    model_artifact_path = artifact_dir / name / f"{library_model_id}.pkl"
+                    save_artifact(model, model_artifact_path)
+                    model_store.add_model(
+                        model_id=library_model_id,
+                        model_type=mid,
+                        task_type=BASELINE_TASK_TYPE,
+                        artifact_path=str(model_artifact_path),
+                        required_features=list(train_cols),
+                        model_params=params,
+                        lifecycle_stage="active",
+                    )
+
                 if fit_status.get("convergence_warning_count", 0):
                     print(
                         f"  {mid}: convergence_warnings={fit_status.get('convergence_warning_count')} "
@@ -528,7 +549,18 @@ def main():
     parser.add_argument("--max_rows", type=int, default=None, help="训练集最大行数（全局）")
     parser.add_argument("--allow_partial", action="store_true",
                         help="允许部分 dataset/horizon 产物缺失（默认严格校验完整性）")
+    parser.add_argument("--database", type=Path, default=None,
+                        help="SQLite 模型库路径；提供后登记每个拟合模型（需同时给 --model-artifacts）")
+    parser.add_argument("--model-artifacts", type=Path, default=None,
+                        help="拟合后模型对象的产物目录（需同时给 --database）")
     args = parser.parse_args()
+
+    if bool(args.database) != bool(args.model_artifacts):
+        parser.error("--database 与 --model-artifacts 必须同时提供或同时省略")
+    model_store = None
+    if args.database is not None:
+        model_store = ModelStore(str(args.database))
+        model_store.create_schema()
 
     dep_status = []
     if _XGBRegressor is None:
@@ -582,6 +614,8 @@ def main():
             out_root,
             args.max_rows,
             model_params,
+            model_store=model_store,
+            artifact_dir=args.model_artifacts,
         )
         all_results[name] = res
 

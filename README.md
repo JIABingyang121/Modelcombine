@@ -354,6 +354,30 @@ Phase 3 (6-12月): 深度嵌入 + Pareto 优化 + 在线学习
 **完整技术限制文档**: 参见 `docs/0701/plan_phase0_phase1.md`  
 **实现细节注释**: 代码中关键位置已添加 `[技术限制]` 标注块
 
+## SQLite 模型库（离线找组合 / 在线复用 / 反馈更新）
+
+```bash
+# 1. 训练基础模型并登记模型库
+python scripts/train_baselines.py --datasets pjm aemo_vic aemo_nsw \
+  --features data/features --out reports/baselines \
+  --database modelcombine.sqlite3 --model-artifacts model_library/models
+
+# 2. 枚举允许候选池内的组合，只按 validation 选最佳并写关系
+python scripts/train_combinations_kg.py --model-library \
+  --datasets pjm aemo_vic aemo_nsw --horizons 24 \
+  --pred-root reports/baselines --raw-root data/features \
+  --out-root reports/model_library \
+  --database modelcombine.sqlite3 --model-artifacts model_library/combos
+
+# 3. 对新场景检索历史关系并预测（输入不需要未来真实值）
+python run.py predict --database modelcombine.sqlite3 \
+  --scenario scenario.json --features future_features.csv --output predictions.csv
+
+# 4. 真实值返回后提交反馈
+python run.py feedback --database modelcombine.sqlite3 \
+  --prediction-run-id <id> --actual actual.csv
+```
+
 ## 扩展方向
 
 - 🧠 引入深度学习时序模型（LSTM、Transformer、TFT）

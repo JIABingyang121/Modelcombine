@@ -1279,5 +1279,30 @@ def run_pipeline() -> None:
     return results
 
 
+# --- SQLite 模型库在线入口（不接回 System A）--------------------------------
+
+def library_predict(*, database: str, scenario: str, features: str, output: str) -> Dict[str, Any]:
+    """从模型库匹配历史关系、加载产物并对用户未来特征产生预测。"""
+    from src.pipeline.library_prediction import predict
+
+    return predict(
+        database=database,
+        scenario_path=scenario,
+        features_path=features,
+        output_path=output,
+    )
+
+
+def library_feedback(*, database: str, prediction_run_id: int, actual: str) -> Dict[str, Any]:
+    """用后来返回的真实值更新对应关系的实际表现统计。"""
+    from src.pipeline.library_feedback import apply_feedback
+
+    return apply_feedback(
+        database=database,
+        prediction_run_id=int(prediction_run_id),
+        actual_path=actual,
+    )
+
+
 if __name__ == "__main__":
     run_pipeline()

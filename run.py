@@ -15,6 +15,7 @@
 4. 支持多种预测模型（Prophet、XGBoost、LightGBM等）
 """
 
+import argparse
 import sys
 import os
 from pathlib import Path
@@ -26,7 +27,60 @@ sys.path.insert(0, str(project_root))
 from src.pipeline.main import PowerPredictionPipeline
 
 
-def main():
+def _predict_command(argv):
+    """在线模型库预测：匹配历史关系 -> 加载产物 -> 预测。输入不需要未来真实值。"""
+    parser = argparse.ArgumentParser(prog="run.py predict")
+    parser.add_argument("--database", required=True, help="SQLite 模型库路径")
+    parser.add_argument("--scenario", required=True, help="场景 JSON 路径")
+    parser.add_argument("--features", required=True, help="已准备的未来特征 CSV 路径")
+    parser.add_argument("--output", required=True, help="预测输出 CSV 路径")
+    args = parser.parse_args(argv)
+
+    # 不复制旧流水线的宽泛异常捕获：输入错误与产物错误以非零退出暴露。
+    from src.pipeline.main import library_predict
+
+    trace = library_predict(
+        database=args.database,
+        scenario=args.scenario,
+        features=args.features,
+        output=args.output,
+    )
+    print(f"预测完成: {args.output}")
+    print(f"trace: {trace['trace_path']}")
+    print(
+        f"匹配场景: {trace['scenario_id']} (相似度 {trace['scenario_similarity']:.4f})，"
+        f"relation_id={trace['relation_id']}, prediction_run_id={trace['prediction_run_id']}"
+    )
+    return 0
+
+
+def _feedback_command(argv):
+    """在线反馈：用后来返回的真实值更新对应关系的实际表现统计。"""
+    parser = argparse.ArgumentParser(prog="run.py feedback")
+    parser.add_argument("--database", required=True, help="SQLite 模型库路径")
+    parser.add_argument("--prediction-run-id", type=int, required=True, help="predict 输出的 prediction_run_id")
+    parser.add_argument("--actual", required=True, help="真实值 CSV（含 timestamp 和 y）")
+    args = parser.parse_args(argv)
+
+    from src.pipeline.main import library_feedback
+
+    result = library_feedback(
+        database=args.database,
+        prediction_run_id=args.prediction_run_id,
+        actual=args.actual,
+    )
+    print(
+        f"反馈已记录: prediction_run_id={result['prediction_run_id']}, "
+        f"actual_mae={result['actual_mae']:.4f}"
+    )
+    print(
+        f"关系 {result['relation_id']}: feedback_count={result['feedback_count']}, "
+        f"mean_actual_mae={result['mean_actual_mae']:.4f}"
+    )
+    return 0
+
+
+def _run_legacy():
     """运行电力需求预测流水线"""
     print("=" * 60)
     print("电力需求智能预测分析系统")
@@ -79,6 +133,15 @@ def main():
         return 1
     
     return 0
+
+
+def main():
+    argv = sys.argv[1:]
+    if argv and argv[0] == "predict":
+        return _predict_command(argv[1:])
+    if argv and argv[0] == "feedback":
+        return _feedback_command(argv[1:])
+    return _run_legacy()
 
 
 if __name__ == "__main__":

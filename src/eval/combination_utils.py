@@ -364,7 +364,7 @@ def load_predictions_safe(pred_root: Path, dataset: str, horizon: int,
     # 清理并排序
     if "_ts_dt" not in merged.columns:
         merged["_ts_dt"] = pd.to_datetime(merged["timestamp"])
-    merged = merged.sort_values("_ts_dt").reset_index(drop=True)
+    merged = merged.sort_values(["_ts_dt", "row_id"]).reset_index(drop=True)
     
     drop_cols = [c for c in ["_stable_key", "_ts_dt", "_orig_idx"] if c in merged.columns]
     merged = merged.drop(columns=drop_cols, errors="ignore")

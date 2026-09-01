@@ -32,3 +32,10 @@ result/ab_convergence/**/*.log
 # PyTorch Lightning 在 CWD 落盘的训练日志（informer/autoformer 等深度模型触发）。
 # Task 5 基准运行时发现：这类日志写在仓库根目录，不属于 reports/ 只读快照范围。
 lightning_logs/
+
+# SQLite 模型库：本地运行库、训练模型/组合器产物、用户在线预测输出不入库。
+# --database / --model-artifacts / run.py predict --output 应指向仓库外或以下忽略路径。
+*.sqlite3
+*.sqlite3-journal
+*.sqlite3-wal
+model_library/

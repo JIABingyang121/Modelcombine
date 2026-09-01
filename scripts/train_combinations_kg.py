@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import itertools
 import json
 import os
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -51,8 +52,17 @@ except ImportError:
             return float("inf"), valid_ratio, n_valid
         return mae, valid_ratio, n_valid
 from src.eval.kg.protocol_a import kg_combination_pred_only
-from src.eval.kg.protocol_b import kg_combination_with_features
+from src.eval.kg.protocol_b import (
+    evaluate_fixed_protocol_b_combination,
+    kg_combination_with_features,
+)
+from src.eval.kg.data_io import _align_raw_to_pred
 from src.eval.kg.feedback import KGFeedbackStore, make_config_fingerprint
+from src.core.scenario_id import compute_scenario_id
+from src.models.artifacts import load_artifact, save_artifact
+from src.models.combination_predictor import COMBINATION_PREDICTOR_KEY
+from src.storage.model_store import ModelStore
+from scripts.train_baselines import prepare_supervised
 from src.eval.kg import load_candidate_audit_map, load_health_enabled_map
 from src.core.enums import ModelLifecycleStage, TaskType
 from src.core.index import IndexManager
@@ -1163,6 +1173,301 @@ def run_dataset_kg(dataset: str, horizons: List[int], models: List[str],
 
     return results
 
+
+# ==========================================================================
+# 离线模型库构建（SQLite 模型库 Task 4）
+# ==========================================================================
+
+MODEL_LIBRARY_TASK_TYPE = "load_forecast"
+MODEL_LIBRARY_BUSINESS_DOMAIN = "power_load"
+MODEL_LIBRARY_STRATEGY = "protocol_b_combination"
+TARGET = "load"
+
+
+def _infer_freq(timestamps: pd.Series) -> str:
+    ts = pd.to_datetime(timestamps, errors="coerce").dropna().sort_values()
+    inferred = pd.infer_freq(ts) if len(ts) >= 3 else None
+    if inferred:
+        return inferred
+    if len(ts) >= 2:
+        delta = ts.diff().dropna().median()
+        if pd.notna(delta):
+            if delta <= pd.Timedelta(hours=1):
+                return "h"
+            if delta <= pd.Timedelta(days=1):
+                return "D"
+    return "h"
+
+
+def _scenario_signature(
+    df_val: pd.DataFrame,
+    df_raw_val: Optional[pd.DataFrame],
+    horizon: int,
+    freq: str,
+) -> Dict[str, float]:
+    y = np.asarray(df_val["y"].values, dtype=float)
+    y = y[np.isfinite(y)]
+    signature: Dict[str, float] = {
+        "horizon": float(horizon),
+        "n_samples": float(len(y)),
+        "y_mean": float(np.mean(y)),
+        "y_std": float(np.std(y)),
+        "y_min": float(np.min(y)),
+        "y_max": float(np.max(y)),
+        "y_cv": float(np.std(y) / (abs(np.mean(y)) + 1e-6)),
+    }
+    if df_raw_val is not None and len(df_raw_val):
+        from src.selector.scenario_similarity import PowerScenarioAnalyzer
+
+        frame = _align_raw_to_pred(df_raw_val.copy(), df_val.copy())
+        frame = frame.reset_index(drop=True)
+        frame["load"] = pd.Series(y[: len(frame)])
+        extra = PowerScenarioAnalyzer().extract_scenario_signature(frame)
+        signature.update({k: float(v) for k, v in extra.items() if np.isfinite(v)})
+    return {k: round(float(v), 8) for k, v in signature.items()}
+
+
+def _forecast_origin_raw_frame(
+    raw_root: Optional[Path], dataset: str, split: str, horizon: int
+) -> Optional[pd.DataFrame]:
+    """预测起点特征 X(t)，附目标时间戳 t+H。
+
+    基础模型训练是 X(t) -> y(t+H)；组合 interaction 若也从这份特征取值（而不是
+    目标时刻的原始特征），离线评估、保存后重放、以及在线 run.py predict 三处
+    使用的就是同一份特征，无需调用方提供未来天气。
+    """
+    if raw_root is None:
+        return None
+    path = raw_root / dataset / f"{split}.csv"
+    if not path.exists():
+        return None
+    features, _y, target_ts, _freq = prepare_supervised(pd.read_csv(path), TARGET, horizon)
+    frame = features.reset_index(drop=True)
+    frame.insert(0, "timestamp", pd.to_datetime(target_ts).values)
+    return frame
+
+
+def _build_library_task(
+    store: ModelStore,
+    *,
+    dataset: str,
+    horizon: int,
+    kg_models: List[str],
+    pred_root: Path,
+    raw_root: Optional[Path],
+    artifact_dir: Path,
+    filter_threshold: float,
+) -> Dict[str, Any]:
+    # 指定任务不得静默跳过：产物缺失 / 无共同候选 / 过滤后无候选均直接失败。
+    try:
+        df_val = load_predictions_safe(pred_root, dataset, horizon, list(kg_models), "val")
+        df_test = load_predictions_safe(pred_root, dataset, horizon, list(kg_models), "test")
+    except (FileNotFoundError, ValueError) as exc:
+        raise RuntimeError(
+            f"model library build failed for {dataset} h={horizon}: {exc}"
+        ) from exc
+
+    model_cols = get_common_models(df_val, df_test, list(kg_models))
+    if not model_cols:
+        raise RuntimeError(
+            f"model library build failed for {dataset} h={horizon}: val/test 无共同候选模型"
+        )
+
+    df_val_i, df_test_i, _ = _impute_prediction_nans(df_val, df_test, model_cols)
+    safe_models, _filter_meta = filter_weak_models(
+        df_val_i, model_cols, threshold_ratio=filter_threshold, horizon=horizon
+    )
+    if not safe_models:
+        raise RuntimeError(
+            f"model library build failed for {dataset} h={horizon}: 弱模型/稳定性过滤后无可用模型"
+        )
+    safe_models = sorted(safe_models)
+
+    df_raw_val = _forecast_origin_raw_frame(raw_root, dataset, "val", horizon)
+    df_raw_test = _forecast_origin_raw_frame(raw_root, dataset, "test", horizon)
+    if df_raw_val is None or df_raw_test is None:
+        raise RuntimeError(
+            f"model library build needs raw features for {dataset} h={horizon}: "
+            f"raw_root={raw_root}"
+        )
+
+    cols = list(dict.fromkeys(list(safe_models) + ["y", "timestamp"]))
+    dval = df_val_i[cols]
+    dtest = df_test_i[cols]
+
+    # 非空子集全枚举：不写死二/三模型上限。相同实际成员只保留 validation 最小者。
+    candidates: Dict[Tuple[str, ...], Dict[str, Any]] = {}
+    for size in range(1, len(safe_models) + 1):
+        for members in itertools.combinations(safe_models, size):
+            res = evaluate_fixed_protocol_b_combination(
+                dval, dtest, df_raw_val, df_raw_test,
+                selected_models=list(members),
+                horizon=horizon,
+                dataset_name=dataset,
+                base_model_cols=list(safe_models),
+                return_combination_predictor=True,
+            )
+            predictor = res[COMBINATION_PREDICTOR_KEY]
+            effective = tuple(predictor.member_ids)
+            val_mae = float(res["val"]["mae"])
+            existing = candidates.get(effective)
+            if existing is None or val_mae < existing["validation_mae"]:
+                candidates[effective] = {
+                    "requested_members": list(members),
+                    "validation_mae": val_mae,
+                    "test_mae": float(res["test"]["mae"]),
+                    "predictor": predictor,
+                    "val_prediction": np.asarray(
+                        res["_runtime_predictions"]["val"], dtype=float
+                    ),
+                    "test_prediction": np.asarray(
+                        res["_runtime_predictions"]["test"], dtype=float
+                    ),
+                }
+
+    # 选择 validation MAE 最小者；完全相同才按排序后的模型 ID 元组做确定性选择。
+    best_key = min(candidates, key=lambda k: (candidates[k]["validation_mae"], k))
+    best = candidates[best_key]
+    predictor = best["predictor"]
+
+    freq = _infer_freq(dtest["timestamp"])
+    signature = _scenario_signature(dval, df_raw_val, horizon, freq)
+    scenario_id = compute_scenario_id(signature, prefix=f"{dataset}_h{horizon}")
+    effective_model_ids = [f"{dataset}__h{horizon}__{m}" for m in predictor.member_ids]
+    artifact_path = artifact_dir / dataset / f"{scenario_id}__combo.pkl"
+    save_artifact(predictor, artifact_path)
+
+    # §9.3：保存后立即重放，与离线最终预测逐点比对；不可重放的组合任何数据库写入都不发生。
+    reloaded = load_artifact(artifact_path)
+    for split_name, frame, engine_prediction, raw_frame in (
+        ("val", dval, best["val_prediction"], df_raw_val),
+        ("test", dtest, best["test_prediction"], df_raw_test),
+    ):
+        aligned_raw = _align_raw_to_pred(raw_frame.copy(), frame.copy()).reset_index(drop=True)
+        replay = np.asarray(
+            reloaded.predict(
+                {m: frame[m].to_numpy(dtype=float) for m in reloaded.member_ids},
+                aligned_raw,
+            ),
+            dtype=float,
+        )
+        max_abs = float(np.max(np.abs(replay - np.asarray(engine_prediction, dtype=float))))
+        if max_abs > 1e-8:
+            raise RuntimeError(
+                f"model library build failed for {dataset} h={horizon}: "
+                f"组合器重放误差 {max_abs:.3e} > 1e-8（{split_name}），不写入数据库"
+            )
+
+    if store.get_scenario(scenario_id) is None:
+        store.add_scenario(
+            scenario_id=scenario_id,
+            task_type=MODEL_LIBRARY_TASK_TYPE,
+            business_domain=MODEL_LIBRARY_BUSINESS_DOMAIN,
+            region=dataset,
+            horizon=horizon,
+            freq=freq,
+            signature=signature,
+        )
+    ts_val = pd.to_datetime(dval["timestamp"], errors="coerce")
+    data_profile_id = store.add_data_profile(
+        scenario_id=scenario_id,
+        data_ref=str((raw_root / dataset) if raw_root else (pred_root / dataset)),
+        target_column="y",
+        features=sorted(c for c in df_raw_val.columns if c != "timestamp"),
+        sample_count=len(dval),
+        start_at=str(ts_val.min()),
+        end_at=str(ts_val.max()),
+        signature=signature,
+    )
+
+    combination_id = store.add_combination(
+        MODEL_LIBRARY_STRATEGY,
+        str(artifact_path),
+        [
+            (model_id, order, float(weight))
+            for order, (model_id, weight) in enumerate(
+                zip(effective_model_ids, predictor.linear_weights)
+            )
+        ],
+    )
+    relation_id = store.add_relation(
+        scenario_id,
+        data_profile_id,
+        combination_id,
+        validation_mae=best["validation_mae"],
+        test_mae=best["test_mae"],
+    )
+    print(
+        f"  [model-library] {dataset} h={horizon}: 最佳组合 {list(predictor.member_ids)} "
+        f"(val_mae={best['validation_mae']:.4f}, {len(candidates)} 个去重候选)"
+    )
+    return {
+        "dataset": dataset,
+        "horizon": horizon,
+        "scenario_id": scenario_id,
+        "data_profile_id": data_profile_id,
+        "combination_id": combination_id,
+        "relation_id": relation_id,
+        "safe_models": list(safe_models),
+        "requested_members": best["requested_members"],
+        "effective_members": effective_model_ids,
+        "linear_weights": [float(w) for w in predictor.linear_weights],
+        "has_interaction": predictor.interaction is not None,
+        "validation_mae": best["validation_mae"],
+        "test_mae": best["test_mae"],
+        "val_prediction": best["val_prediction"].tolist(),
+        "test_prediction": best["test_prediction"].tolist(),
+    }
+
+
+def build_model_library(
+    *,
+    datasets: Optional[Sequence[str]],
+    selected_horizons: Optional[Sequence[int]],
+    kg_models: List[str],
+    pred_root: Path,
+    raw_root: Optional[Path],
+    out_root: Path,
+    database: Path,
+    artifact_dir: Path,
+    filter_threshold: float,
+) -> Dict[str, Any]:
+    ensure_dir(out_root)
+    store = ModelStore(str(database))
+    store.create_schema()
+    horizon_filter = set(int(h) for h in selected_horizons) if selected_horizons else None
+    dataset_filter = set(datasets) if datasets else None
+
+    report: Dict[str, Any] = {"tasks": []}
+    try:
+        for dataset, all_horizons in DATASET_HORIZONS.items():
+            if dataset_filter and dataset not in dataset_filter:
+                continue
+            for horizon in all_horizons:
+                if horizon_filter is not None and int(horizon) not in horizon_filter:
+                    continue
+                report["tasks"].append(
+                    _build_library_task(
+                        store,
+                        dataset=dataset,
+                        horizon=int(horizon),
+                        kg_models=kg_models,
+                        pred_root=pred_root,
+                        raw_root=raw_root,
+                        artifact_dir=artifact_dir,
+                        filter_threshold=filter_threshold,
+                    )
+                )
+    finally:
+        store.close()
+
+    (out_root / "model_library_report.json").write_text(
+        json.dumps(report, indent=2, default=str), encoding="utf-8"
+    )
+    print(f"\n[model-library] 报告已保存: {out_root / 'model_library_report.json'}")
+    return report
+
+
 def main():
     parser = argparse.ArgumentParser(description="KG 组合策略评估")
     parser.add_argument("--pred-root", type=Path, default=Path("reports/baselines"),
@@ -1214,6 +1519,12 @@ def main():
     parser.add_argument("--signal-kg-results", nargs="*", type=Path, default=None,
                         help="可选：加载 kg_results.json 作为 latency/drift 信号源")
     # P1-1: G0/G1/G2 消融分解
+    parser.add_argument("--model-library", action="store_true",
+                        help="离线模型库构建模式：枚举任意非空组合、写入最佳关系到 SQLite")
+    parser.add_argument("--database", type=Path, default=None,
+                        help="SQLite 模型库路径（--model-library 必需）")
+    parser.add_argument("--model-artifacts", type=Path, default=None,
+                        help="组合预测器产物目录（--model-library 必需）")
     parser.add_argument("--ablation-mode", type=str, default=None,
                         choices=["g0", "g1", "g2", "all"],
                         help="消融实验模式: g0=无扩展候选, g1=扩展无审计, g2=扩展+审计, all=依次跑全部")
@@ -1228,6 +1539,23 @@ def main():
     if args.raw_root:
         raw_root = args.raw_root if args.raw_root.is_absolute() else project_root / args.raw_root
     combo_root = args.combo_root if args.combo_root.is_absolute() else project_root / args.combo_root
+
+    if args.model_library:
+        if args.database is None or args.model_artifacts is None:
+            parser.error("--model-library 需要同时提供 --database 与 --model-artifacts")
+        kg_models = _build_kg_model_candidates()
+        build_model_library(
+            datasets=args.datasets,
+            selected_horizons=args.horizons,
+            kg_models=kg_models,
+            pred_root=pred_root,
+            raw_root=raw_root,
+            out_root=out_root,
+            database=args.database,
+            artifact_dir=args.model_artifacts,
+            filter_threshold=float(args.filter_threshold),
+        )
+        return
     health_config_path = None
     candidate_audit_path = None
     if args.health_config:

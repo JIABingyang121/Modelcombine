@@ -162,7 +162,8 @@ def kg_combination_with_features(df_val: pd.DataFrame, df_test: pd.DataFrame,
                                   relation_graph: Optional[ModelGraph] = None,
                                   relation_scenario_id: Optional[str] = None,
                                   _fixed_selected_models: Optional[List[str]] = None,
-                                  _skip_final_guard: bool = False) -> Dict:
+                                  _skip_final_guard: bool = False,
+                                  _return_combination_predictor: bool = False) -> Dict:
     """
     KG 组合 - 使用预测+原始特征
 
@@ -184,6 +185,10 @@ def kg_combination_with_features(df_val: pd.DataFrame, df_test: pd.DataFrame,
     # 诊断私有控制（Task 8.3 Task 4）：跳过 guard 必须有固定候选，否则没有意义。
     if _skip_final_guard and _fixed_selected_models is None:
         raise ValueError("_skip_final_guard requires _fixed_selected_models (diagnostic fixed pair)")
+    # 组合预测器只在固定集合 + 跳过 guard 的离线模型库/诊断路径构造：guard 回退时
+    # 最终输出不是 Protocol B 主分支组合，此时交出的预测器会与 yhat 不一致。
+    if _return_combination_predictor and not _skip_final_guard:
+        raise ValueError("_return_combination_predictor requires _skip_final_guard")
 
     # Protocol A 作为稳定参考与回退候选（用于 Protocol B 保护机制）
     # 回退分支要交出精确预测，A 侧也需同步产出。
@@ -564,6 +569,11 @@ def kg_combination_with_features(df_val: pd.DataFrame, df_test: pd.DataFrame,
 
     # Protocol B 差异化主分支：在主干预测上叠加“模型 x 特征”交互残差。
     applied_interaction_spec: Optional[Dict[str, Any]] = None
+    # 组合预测器重放 interaction 所需状态（仅 _return_combination_predictor 时消费）：
+    # 列顺序、每个 feature 的居中均值、已拟合残差回归器。
+    interaction_columns: List[Tuple[str, str]] = []
+    interaction_feature_means: Dict[str, float] = {}
+    interaction_regressor: Any = None
     interaction_meta: Dict[str, Any] = {
         "enabled": False,
         "applied": False,
@@ -633,12 +643,14 @@ def kg_combination_with_features(df_val: pd.DataFrame, df_test: pd.DataFrame,
                     for feat in selected_feats:
                         f_val = pd.to_numeric(raw_val_aligned[feat], errors="coerce")
                         f_mu = float(np.nanmean(f_val)) if np.isfinite(f_val).any() else 0.0
+                        interaction_feature_means[feat] = f_mu
                         f_val = f_val.fillna(f_mu).values.astype(float) - f_mu
                         f_test = pd.to_numeric(raw_test_aligned[feat], errors="coerce").fillna(f_mu).values.astype(float) - f_mu
                         for m in selected:
                             inter_val_cols.append(df_val[m].values.astype(float) * f_val)
                             inter_test_cols.append(df_test[m].values.astype(float) * f_test)
                             inter_names.append(f"{m}__x__{feat}")
+                            interaction_columns.append((m, feat))
 
                     if inter_val_cols:
                         X_inter_val = np.column_stack(inter_val_cols)
@@ -742,6 +754,7 @@ def kg_combination_with_features(df_val: pd.DataFrame, df_test: pd.DataFrame,
                             pred_val = pred_val_i
                             pred_test = pred_test_i
                             interaction_meta["applied"] = True
+                            interaction_regressor = reg_i
                             # 供 guard 的统一折外比较逐折重拟合同一交互结构使用
                             applied_interaction_spec = {
                                 "features": X_inter_val,
@@ -850,6 +863,38 @@ def kg_combination_with_features(df_val: pd.DataFrame, df_test: pd.DataFrame,
                 "feature_bonus": dict(zip(selected, feature_bonus_vec.tolist())),
                 "corr_penalty": dict(zip(selected, corr_pen_vec.tolist())),
             }
+
+    # 离线模型库 / 诊断路径：在拟合这些对象的同一执行点构造可序列化组合预测器。
+    # post-adjustment 被接受时会用纯线性组合整体覆盖（含 interaction 残差），因此
+    # interaction 项只在“interaction 已应用且 post-adjustment 未应用”时进入预测器。
+    combination_predictor = None
+    if _return_combination_predictor:
+        from src.models.combination_predictor import (
+            CombinationPredictor,
+            InteractionResidual,
+        )
+
+        post_adjustment_applied = bool(
+            (ridge_meta.get("post_adjustment") or {}).get("applied")
+        )
+        interaction_in_output = (
+            bool(interaction_meta.get("applied"))
+            and interaction_regressor is not None
+            and not post_adjustment_applied
+        )
+        interaction_term = None
+        if interaction_in_output:
+            interaction_term = InteractionResidual(
+                columns=list(interaction_columns),
+                feature_means=dict(interaction_feature_means),
+                regressor=interaction_regressor,
+            )
+        combination_predictor = CombinationPredictor(
+            member_ids=list(selected),
+            linear_weights=[float(weights[m]) for m in selected],
+            strategy="B_pred_features",
+            interaction=interaction_term,
+        )
 
     # Protocol B 软回退保护：
     # 1) 验证集明显劣于 A（默认>5%）时回退；
@@ -1556,9 +1601,46 @@ def kg_combination_with_features(df_val: pd.DataFrame, df_test: pd.DataFrame,
         result["fallback_target"] = None
         result["guard_would_fallback_to"] = fallback_target if fallback_reason else None
         result["guard_would_fallback_reason"] = fallback_reason
+    if combination_predictor is not None:
+        from src.models.combination_predictor import COMBINATION_PREDICTOR_KEY
+
+        result[COMBINATION_PREDICTOR_KEY] = combination_predictor
     # pred_val/pred_test 是引擎最终采用的预测：可能已叠加交互残差、也可能被
     # post_adjustment 覆盖回线性组合。交出它们本身，调用方不必再猜。
     return _attach_predictions(result, pred_val, pred_test)
+
+
+def evaluate_fixed_protocol_b_combination(
+    df_val: pd.DataFrame,
+    df_test: pd.DataFrame,
+    df_raw_val: Optional[pd.DataFrame],
+    df_raw_test: Optional[pd.DataFrame],
+    *,
+    selected_models: Sequence[str],
+    horizon: int,
+    dataset_name: Optional[str],
+    base_model_cols: Optional[Sequence[str]] = None,
+    return_combination_predictor: bool = False,
+) -> Dict[str, Any]:
+    """固定评估任意非空模型集合（离线模型库 / 诊断专用）。
+
+    真正绕过候选选择器与最终 guard；拟合、interaction、post-adjustment 复用
+    生产实现。集合内部近零权重清理是现有完整流水线行为，予以保留，清理后的
+    实际成员即该候选结果。不改变生产默认。
+    """
+    members = list(dict.fromkeys(selected_models))
+    if not members:
+        raise ValueError("fixed combination evaluation requires at least one model")
+    return kg_combination_with_features(
+        df_val, df_test, df_raw_val, df_raw_test,
+        members, horizon,
+        dataset_name=dataset_name,
+        base_model_cols=list(base_model_cols or members),
+        return_predictions=True,
+        _fixed_selected_models=members,
+        _skip_final_guard=True,
+        _return_combination_predictor=return_combination_predictor,
+    )
 
 
 def evaluate_fixed_protocol_b_candidate(
@@ -1574,18 +1656,14 @@ def evaluate_fixed_protocol_b_candidate(
 ) -> Dict[str, Any]:
     """诊断专用固定二模型求值入口（Task 8.3 Task 4）。
 
-    真正绕过候选选择器与最终 guard（不通过调高候选分数诱导选择），
-    拟合、interaction 与 post-adjustment 复用生产实现。固定 pair 之外还记录
-    guard 会回退到什么目标（但不执行），以及近零权重清理后的退化标记。
+    保留"恰好两个模型"校验供 V8 诊断使用，委托通用固定集合入口执行。
     """
     if len(set(selected_models)) != 2:
         raise ValueError("fixed candidate evaluation requires exactly two distinct models")
-    return kg_combination_with_features(
+    return evaluate_fixed_protocol_b_combination(
         df_val, df_test, df_raw_val, df_raw_test,
-        list(selected_models), horizon,
+        selected_models=list(selected_models),
+        horizon=horizon,
         dataset_name=dataset_name,
-        base_model_cols=list(base_model_cols or selected_models),
-        return_predictions=True,
-        _fixed_selected_models=list(selected_models),
-        _skip_final_guard=True,
+        base_model_cols=base_model_cols,
     )
