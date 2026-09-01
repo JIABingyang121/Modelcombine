@@ -87,3 +87,23 @@ def test_full_validation_selection_does_not_evaluate_explicit_conflict_pair(monk
     flow = _flow(result)
     assert all(set(pair) != {"m1", "m2"} for pair in calls)
     assert set(flow["selector_output"]) == {"m1", "m3"}
+
+
+def test_high_drift_pair_is_not_replaced_when_full_validation_is_better():
+    """高漂移下，完整 validation 明显更优的 pair 不得被恒真判断降为单模型。"""
+    df_val, df_test, raw_val, raw_test = make_protocol_b_frames()
+    for model in MODELS:
+        df_test[model] += 50.0
+
+    result = protocol_b.kg_combination_with_features(
+        df_val, df_test, raw_val, raw_test, list(MODELS), 6,
+        dataset_name="pjm", base_model_cols=list(MODELS),
+    )
+
+    flow = _flow(result)
+    assert len(flow["stepwise_adoption"]["stepwise_output"]) == 2
+    assert len(flow["selector_output"]) == 2
+    assert flow["pair_eligibility"]["checked"] is True
+    assert "high_drift_single_model_direct_pass" not in {
+        decision["stage"] for decision in flow["constraint_decisions"]
+    }

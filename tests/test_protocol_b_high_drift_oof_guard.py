@@ -39,7 +39,7 @@ def _guard_config(result):
 
 def test_oof_evidence_supporting_b_blocks_the_in_sample_overfit_fallback():
     """折外证据支持 B 时，不得再以"样本内改善过大"为由回退。"""
-    result = _run()
+    result = _run(tail_infl=1.3)
     guard = _guard_config(result)
     check = guard["high_drift_overfit_oof_check"]
 

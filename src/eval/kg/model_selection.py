@@ -839,10 +839,30 @@ def select_models_protocol_b(
     single_model_direct_pass_meta: Dict[str, Any] = {"applied": False}
     if drift_level == "high" and len(selected) <= 2 and len(model_cols) > 0:
         best_single = min(model_cols, key=lambda m: maes.get(m, float("inf")))
-        best_selected_mae = (
-            min([maes.get(m, float("inf")) for m in selected]) if selected else float("inf")
-        )
-        if maes.get(best_single, float("inf")) <= best_selected_mae * PROTOCOL_B_HIGH_DRIFT_SINGLE_MODEL_DIRECT_PASS_RATIO:
+        best_selected_mae: Optional[float] = None
+        if len(selected) == 2 and df_val is not None:
+            if full_pair_evaluator is None:
+                fit_cfg = dict(pair_fit_config or {})
+                pair_result = evaluate_pair_on_validation(
+                    df_val=df_val,
+                    pair=selected,
+                    horizon=horizon,
+                    alpha_candidates=fit_cfg.get("alpha_candidates"),
+                    temporal_decay=fit_cfg.get("temporal_decay"),
+                    temporal_decay_meta=fit_cfg.get("temporal_decay_meta"),
+                    temporal_min_weight_ratio=fit_cfg.get("temporal_min_weight_ratio"),
+                )
+                best_selected_mae = float(pair_result["validation_mae"])
+            else:
+                pair_result = full_pair_evaluator(selected)
+                best_selected_mae = float(pair_result["val"]["mae"])
+        elif len(selected) == 1:
+            best_selected_mae = maes.get(selected[0], float("inf"))
+        if (
+            best_selected_mae is not None
+            and maes.get(best_single, float("inf"))
+            <= best_selected_mae * PROTOCOL_B_HIGH_DRIFT_SINGLE_MODEL_DIRECT_PASS_RATIO
+        ):
             before = list(selected)
             selected = [best_single]
             single_model_direct_pass_meta = {
