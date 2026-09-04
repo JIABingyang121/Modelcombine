@@ -231,9 +231,8 @@ def _history_signature(history: pd.DataFrame, freq: str) -> Dict[str, float]:
     return _scenario_signature(target_frame, history, horizon=1, freq=freq)
 
 
-def _next_feature_row(
+def _forecast_origin_feature_row(
     history: pd.DataFrame,
-    timestamp: pd.Timestamp,
     feature_names: set[str],
     country: str,
 ) -> pd.DataFrame:
@@ -241,10 +240,7 @@ def _next_feature_row(
 
     lags = sorted({int(value) for value in re.findall(r"lag_(\d+)", " ".join(feature_names))})
     windows = sorted({int(value) for value in re.findall(r"roll(\d+)_(?:mean|std)", " ".join(feature_names))})
-    frame = pd.concat(
-        [history, pd.DataFrame({"timestamp": [timestamp], "load": [np.nan]})],
-        ignore_index=True,
-    )
+    frame = history.copy()
     frame = add_time_features(frame, "timestamp")
     frame = add_holiday(frame, "timestamp", country)
     frame = add_lag_roll_grouped(frame, [], "timestamp", "load", lags, windows)
@@ -276,8 +272,9 @@ def _predict_from_history(
     country = _COUNTRY_BY_REGION[scenario["region"]]
     future = []
     for _ in range(720):
-        timestamp = history["timestamp"].iloc[-1] + pd.Timedelta(hours=1)
-        features = _next_feature_row(history, timestamp, feature_names, country)
+        origin = history["timestamp"].iloc[-1]
+        timestamp = origin + pd.Timedelta(hours=1)
+        features = _forecast_origin_feature_row(history, feature_names, country)
         base_predictions = _base_predictions(matched, features)
         yhat = float(predictor.predict(base_predictions, features)[0])
         future.append({"timestamp": timestamp, "yhat": yhat})

@@ -8,6 +8,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 from sklearn.linear_model import Ridge
 
 from src.models.artifacts import save_artifact
@@ -95,6 +96,57 @@ def _build_h1_library(tmp_path: Path) -> tuple[Path, int]:
     return db, relation_id
 
 
+def _build_origin_time_h1_library(tmp_path: Path) -> Path:
+    db = tmp_path / "origin_time.sqlite3"
+    store = ModelStore(str(db))
+    store.create_schema()
+    artifacts = tmp_path / "origin_time_artifacts"
+    X = pd.DataFrame({"hour": np.tile(np.arange(24), 3)})
+    y = X["hour"].astype(float)
+    members = []
+    for index in (1, 2):
+        model = Ridge(alpha=1e-12).fit(X, y)
+        model_id = f"pjm__h1__origin_m{index}"
+        path = save_artifact(model, artifacts / f"{model_id}.pkl")
+        store.add_model(
+            model_id=model_id,
+            model_type="ridge",
+            task_type="load_forecast",
+            artifact_path=str(path),
+            required_features=["hour"],
+            model_params={},
+            lifecycle_stage="active",
+        )
+        members.append((model_id, index - 1, 0.5))
+    combo_path = save_artifact(
+        CombinationPredictor(member_ids=["m1", "m2"], linear_weights=[0.5, 0.5], strategy="linear"),
+        artifacts / "origin_time_combo.pkl",
+    )
+    combo_id = store.add_combination("protocol_b_combination", str(combo_path), members)
+    store.add_scenario(
+        scenario_id="pjm_h1_origin_time",
+        task_type="load_forecast",
+        business_domain="power_load",
+        region="pjm",
+        horizon=1,
+        freq="h",
+        signature={"horizon": 1.0, "y_mean": 100.0, "y_std": 1.0},
+    )
+    profile_id = store.add_data_profile(
+        scenario_id="pjm_h1_origin_time",
+        data_ref="data/pjm",
+        target_column="load",
+        features=["hour"],
+        sample_count=72,
+        start_at="2025-01-01T00:00:00",
+        end_at="2025-01-03T23:00:00",
+        signature={"horizon": 1.0, "y_mean": 100.0, "y_std": 1.0},
+    )
+    store.add_relation("pjm_h1_origin_time", profile_id, combo_id, validation_mae=1.0)
+    store.close()
+    return db
+
+
 def test_history_input_generates_30_day_forecast_and_accepts_feedback(tmp_path):
     db, relation_id = _build_h1_library(tmp_path)
     ts = pd.date_range("2026-01-01", periods=72, freq="h")
@@ -169,3 +221,30 @@ def test_matching_keeps_user_region_as_a_hard_constraint(tmp_path):
 
     store.close()
     assert scenario_id == "pjm_h1_reference"
+
+
+def test_history_prediction_uses_h1_feature_at_forecast_origin(tmp_path):
+    db = _build_origin_time_h1_library(tmp_path)
+    timestamps = pd.date_range("2026-01-01", periods=48, freq="h")
+    history = tmp_path / "history.csv"
+    pd.DataFrame({"timestamp": timestamps, "load": 100.0}).to_csv(history, index=False)
+    scenario = tmp_path / "scenario.json"
+    scenario.write_text(json.dumps({
+        "task_type": "load_forecast",
+        "business_domain": "power_load",
+        "region": "pjm",
+        "freq": "h",
+    }), encoding="utf-8")
+    output = tmp_path / "forecast.csv"
+
+    predict = subprocess.run(
+        [
+            sys.executable, "run.py", "predict", "--database", str(db),
+            "--scenario", str(scenario), "--history", str(history),
+            "--output", str(output),
+        ],
+        cwd=REPO_ROOT, capture_output=True, text=True,
+    )
+
+    assert predict.returncode == 0, predict.stdout + predict.stderr
+    assert pd.read_csv(output)["yhat"].iloc[0] == pytest.approx(23.0)
