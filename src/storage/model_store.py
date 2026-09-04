@@ -221,6 +221,7 @@ class ModelStore:
         *,
         task_type: Optional[str] = None,
         business_domain: Optional[str] = None,
+        region: Optional[str] = None,
         horizon: Optional[int] = None,
         freq: Optional[str] = None,
     ) -> list[dict]:
@@ -229,6 +230,7 @@ class ModelStore:
         for column, value in (
             ("task_type", task_type),
             ("business_domain", business_domain),
+            ("region", region),
             ("horizon", None if horizon is None else int(horizon)),
             ("freq", freq),
         ):

@@ -1281,14 +1281,18 @@ def run_pipeline() -> None:
 
 # --- SQLite 模型库在线入口（不接回 System A）--------------------------------
 
-def library_predict(*, database: str, scenario: str, features: str, output: str) -> Dict[str, Any]:
-    """从模型库匹配历史关系、加载产物并对用户未来特征产生预测。"""
+def library_predict(
+    *, database: str, scenario: str, features: str | None = None,
+    history: str | None = None, output: str,
+) -> Dict[str, Any]:
+    """从模型库匹配历史关系，预测用户未来特征或递归预测 720 小时。"""
     from src.pipeline.library_prediction import predict
 
     return predict(
         database=database,
         scenario_path=scenario,
         features_path=features,
+        history_path=history,
         output_path=output,
     )
 

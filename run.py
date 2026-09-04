@@ -32,7 +32,9 @@ def _predict_command(argv):
     parser = argparse.ArgumentParser(prog="run.py predict")
     parser.add_argument("--database", required=True, help="SQLite 模型库路径")
     parser.add_argument("--scenario", required=True, help="场景 JSON 路径")
-    parser.add_argument("--features", required=True, help="已准备的未来特征 CSV 路径")
+    input_group = parser.add_mutually_exclusive_group(required=True)
+    input_group.add_argument("--features", help="已准备的未来特征 CSV 路径")
+    input_group.add_argument("--history", help="历史用电 CSV 路径（含 timestamp 和 load）")
     parser.add_argument("--output", required=True, help="预测输出 CSV 路径")
     args = parser.parse_args(argv)
 
@@ -43,6 +45,7 @@ def _predict_command(argv):
         database=args.database,
         scenario=args.scenario,
         features=args.features,
+        history=args.history,
         output=args.output,
     )
     print(f"预测完成: {args.output}")
