@@ -34,6 +34,7 @@ from tests.forecast_steps_fixtures import (
     seed_models,
     task_of,
     write_dataset,
+    write_frozen_window_plan,
 )
 
 ROWS = 1000
@@ -90,43 +91,6 @@ def _run_library(tmp_path: Path, raw_root: Path, db: Path, out_root: Path):
     )
 
 
-def _write_frozen_window_plan(raw_root: Path, frames: dict[str, pd.DataFrame]) -> Path:
-    """写出 Stage 0 已冻结的 H1—H3/A/Q1—Q3 起点。"""
-    series = pd.concat(list(frames.values()), ignore_index=True)
-    series = series[["timestamp", "load"]]
-    (raw_root / DATASET).mkdir(parents=True, exist_ok=True)
-    series.to_csv(raw_root / DATASET / "load.csv", index=False)
-
-    start = pd.Timestamp(series["timestamp"].iloc[0])
-    steps = STEPS
-    first_origin_offset = len(series) - 7 * steps - 1
-    origins = []
-    for index, (label, role) in enumerate(
-        (("H1", "library"), ("H2", "library"), ("H3", "library"),
-         ("A", "audit"), ("Q1", "query"), ("Q2", "query"), ("Q3", "query"))
-    ):
-        origin = start + pd.Timedelta(hours=first_origin_offset + index * steps)
-        origins.append(
-            {
-                "label": label,
-                "role": role,
-                "history_start": str(origin - pd.Timedelta(hours=719)),
-                "forecast_origin": str(origin),
-                "first_target": str(origin + pd.Timedelta(hours=1)),
-                "last_target": str(origin + pd.Timedelta(hours=steps)),
-            }
-        )
-    plan = {
-        "datasets": [{
-            "dataset": DATASET,
-            "feasibility": {str(steps): {"origins": origins}},
-        }]
-    }
-    path = raw_root.parent / "frozen_windows.json"
-    path.write_text(json.dumps(plan), encoding="utf-8")
-    return path
-
-
 def test_window_plan_builds_three_relations_against_one_shared_audit_window(tmp_path):
     """Stage 1：H1—H3 分别建库，共用 A；Q1—Q3 尚不进入建库。"""
     raw_root = tmp_path / "raw"
@@ -134,7 +98,7 @@ def test_window_plan_builds_three_relations_against_one_shared_audit_window(tmp_
     db = tmp_path / "lib.sqlite3"
     frames = write_dataset(tmp_path / "splits", rows=ROWS)
     seed_models(db, artifacts, frames["train"])
-    window_plan = _write_frozen_window_plan(raw_root, frames)
+    window_plan = write_frozen_window_plan(raw_root, frames, forecast_steps=STEPS)
     out_root = tmp_path / "out"
 
     proc = subprocess.run(

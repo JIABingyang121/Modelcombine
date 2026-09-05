@@ -200,3 +200,50 @@ def run_predict(db: Path, scenario: Path, history: Path, output: Path):
         ],
         cwd=REPO_ROOT, capture_output=True, text=True,
     )
+
+
+WINDOW_ROLES = (
+    ("H1", "library"), ("H2", "library"), ("H3", "library"),
+    ("A", "audit"), ("Q1", "query"), ("Q2", "query"), ("Q3", "query"),
+)
+
+
+def write_frozen_window_plan(
+    raw_root: Path,
+    frames: dict[str, pd.DataFrame],
+    *,
+    forecast_steps: int,
+    signature_window: int = 720,
+    name: str = "frozen_windows.json",
+) -> Path:
+    """写出原始序列 `<ds>/load.csv` 与 Stage 0 已冻结的 H1—H3/A/Q1—Q3 起点。
+
+    末尾对齐排布，与 scripts/stage0_data_inventory.py 的 _proposed_origins 一致。
+    """
+    series = pd.concat(list(frames.values()), ignore_index=True)[["timestamp", "load"]]
+    (raw_root / DATASET).mkdir(parents=True, exist_ok=True)
+    series.to_csv(raw_root / DATASET / "load.csv", index=False)
+
+    start = pd.Timestamp(series["timestamp"].iloc[0])
+    first_origin_offset = len(series) - len(WINDOW_ROLES) * forecast_steps - 1
+    origins = []
+    for index, (label, role) in enumerate(WINDOW_ROLES):
+        origin = start + pd.Timedelta(hours=first_origin_offset + index * forecast_steps)
+        origins.append(
+            {
+                "label": label,
+                "role": role,
+                "history_start": str(origin - pd.Timedelta(hours=signature_window - 1)),
+                "forecast_origin": str(origin),
+                "first_target": str(origin + pd.Timedelta(hours=1)),
+                "last_target": str(origin + pd.Timedelta(hours=forecast_steps)),
+            }
+        )
+    plan = {
+        "datasets": [
+            {"dataset": DATASET, "feasibility": {str(forecast_steps): {"origins": origins}}}
+        ]
+    }
+    path = raw_root.parent / name
+    path.write_text(json.dumps(plan), encoding="utf-8")
+    return path
