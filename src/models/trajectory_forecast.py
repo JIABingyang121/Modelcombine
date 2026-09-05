@@ -209,7 +209,18 @@ def generate_member_trajectory(
     trajectory = np.empty(steps, dtype=float)
     for step in range(steps):
         row = _feature_row(own_history.tail(tail_rows), columns, country, lags, windows)
-        yhat = float(np.asarray(model.predict(row[columns]), dtype=float).ravel()[0])
+        features = row[columns]
+        if not np.isfinite(features.to_numpy(dtype=float)).all():
+            raise TrajectoryForecastError(
+                f"模型 {model_type} 递归至第 {step + 1} 步时产生 non-finite 特征，"
+                "无法生成完整轨迹"
+            )
+        yhat = float(np.asarray(model.predict(features), dtype=float).ravel()[0])
+        if not np.isfinite(yhat):
+            raise TrajectoryForecastError(
+                f"模型 {model_type} 递归至第 {step + 1} 步时产生 non-finite 预测，"
+                "无法生成完整轨迹"
+            )
         trajectory[step] = yhat
         # 只写回自己的历史：其他成员与组合输出都看不到这一步。
         own_history.loc[len(own_history)] = [

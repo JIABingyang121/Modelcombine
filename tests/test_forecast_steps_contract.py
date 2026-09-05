@@ -18,6 +18,7 @@ from src.models.trajectory_forecast import (
     calendar_frame,
     future_timestamps,
     generate_member_trajectory,
+    generate_trajectory_matrix,
 )
 from src.storage.model_store import ModelStore
 from tests.forecast_steps_fixtures import (
@@ -161,6 +162,36 @@ def test_trajectory_generation_rejects_underivable_features():
             required_features=["hour", "temp"],
             history=history, forecast_steps=24, country="US",
         )
+
+
+def test_trajectory_matrix_records_recursively_divergent_member_as_ineligible():
+    """递归生成出非有限 lag/rolling 特征时，该成员不能进入完整轨迹矩阵。"""
+    class ExplodingModel:
+        def predict(self, X):
+            return np.asarray([float(X["lag_1"].iloc[0]) * 1e50])
+
+    history = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2025-01-01", periods=200, freq="h"),
+            "load": np.linspace(100, 120, 200),
+        }
+    )
+    matrix, skipped = generate_trajectory_matrix(
+        members={
+            "exploding": {
+                "model": ExplodingModel(),
+                "model_type": "power_difference",
+                "required_features": ["hour", "lag_1"],
+            }
+        },
+        history=history,
+        forecast_steps=16,
+        country="US",
+    )
+
+    assert "exploding" not in matrix.columns
+    assert [entry["model_type"] for entry in skipped] == ["exploding"]
+    assert "non-finite" in skipped[0]["reason"]
 
 
 # -------------------------------------------------------------- 成员独立递归
