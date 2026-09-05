@@ -31,7 +31,8 @@ def _predict_command(argv):
     """在线模型库预测：匹配历史关系 -> 加载产物 -> 预测。输入不需要未来真实值。"""
     parser = argparse.ArgumentParser(prog="run.py predict")
     parser.add_argument("--database", required=True, help="SQLite 模型库路径")
-    parser.add_argument("--scenario", required=True, help="场景 JSON 路径")
+    parser.add_argument("--scenario", required=True,
+                        help="场景 JSON 路径（必须含 forecast_steps：24=1天 / 168=1周 / 720=30天）")
     input_group = parser.add_mutually_exclusive_group(required=True)
     input_group.add_argument("--features", help="已准备的未来特征 CSV 路径")
     input_group.add_argument("--history", help="历史用电 CSV 路径（含 timestamp 和 load）")
@@ -49,6 +50,7 @@ def _predict_command(argv):
         output=args.output,
     )
     print(f"预测完成: {args.output}")
+    print(f"预测长度: forecast_steps={trace['forecast_steps']}（输出 {trace['n_rows']} 行）")
     print(f"trace: {trace['trace_path']}")
     print(
         f"匹配场景: {trace['scenario_id']} (相似度 {trace['scenario_similarity']:.4f})，"

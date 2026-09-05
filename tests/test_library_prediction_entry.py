@@ -92,7 +92,7 @@ def _build_library(tmp_path: Path) -> dict:
     def _add_scenario(sid, region, sig, val_mae):
         store.add_scenario(
             scenario_id=sid, task_type="load_forecast", business_domain="power_load",
-            region=region, horizon=24, freq="h", signature=sig,
+            region=region, horizon=24, forecast_steps=720, freq="h", signature=sig,
         )
         pid = store.add_data_profile(
             scenario_id=sid, data_ref=f"data/{region}", target_column="y",
@@ -141,12 +141,14 @@ def _scenario_json(
     signature=None,
     include_signature=True,
     name="scenario.json",
+    forecast_steps=720,
 ):
     payload = {
         "task_type": "load_forecast",
         "business_domain": "power_load",
         "region": region,
         "horizon": horizon,
+        "forecast_steps": forecast_steps,
         "freq": "h",
     }
     if include_signature:
@@ -211,6 +213,9 @@ def test_predict_selects_expected_relation_and_emits_real_yhat(tmp_path):
     assert 0.0 <= trace["scenario_similarity"] <= 1.0
     assert trace["artifact_paths"]
     assert trace["model_selection_source"] == "saved_relation"
+    # 命中的是 V1 horizon=24 关系，基础预测器语义就是 24，不是恒为 1
+    assert trace["base_horizon"] == 24
+    assert trace["forecast_steps"] == 720
     assert trace["selector_invoked"] is False
     assert isinstance(trace["prediction_run_id"], int)
 
@@ -278,4 +283,19 @@ def test_predict_requires_non_empty_signature(tmp_path, scenario_kwargs):
     proc = _run_predict(tmp_path, db, scenario, features, output)
     assert proc.returncode != 0
     assert "signature" in (proc.stdout + proc.stderr)
+    assert not output.exists()
+
+
+def test_features_row_count_must_equal_requested_forecast_steps(tmp_path):
+    """§3.1.5：输出行数必须等于用户请求的预测长度，不接受任意长度的特征表。"""
+    lib = _build_library(tmp_path)
+    features = _future_features(tmp_path)  # 720 行
+    scenario = _scenario_json(tmp_path, forecast_steps=168)
+    output = tmp_path / "predictions.csv"
+
+    proc = _run_predict(tmp_path, lib["db"], scenario, features, output)
+
+    assert proc.returncode != 0
+    combined = proc.stdout + proc.stderr
+    assert "forecast_steps" in combined and "720" in combined
     assert not output.exists()

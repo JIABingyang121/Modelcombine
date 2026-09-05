@@ -3,11 +3,23 @@
 模型集合只能来自已保存的 scenario-data-combination 关系；本模块绝不调用候选
 选择器或 Protocol B 求解器，也不在用户未来数据上重新挑选或训练模型。
 没有兼容场景或必要产物缺失时直接失败，不回退旧引擎。
+
+在线步骤固定为（方案 §3.4）：
+
+```text
+用户场景 + 历史 timestamp,load + forecast_steps
+  -> 生成 signature
+  -> 精确过滤 task/business/region/freq/base_horizon/forecast_steps
+  -> 对剩余历史场景计算相似度
+  -> 加载已保存组合及成员模型
+  -> 每个成员生成完整轨迹
+  -> 用已保存权重融合
+  -> 输出和 trace
+```
 """
 from __future__ import annotations
 
 import json
-import re
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
@@ -16,18 +28,38 @@ import pandas as pd
 
 from src.core.index import ScenarioIndex
 from src.models.artifacts import load_artifact
-from src.storage.model_store import ModelStore
+from src.models.trajectory_forecast import (
+    TrajectoryForecastError,
+    calendar_frame,
+    future_timestamps,
+    generate_member_trajectory,
+)
+from src.storage.model_store import (
+    ModelStore,
+    UnsupportedForecastSteps,
+    validate_forecast_steps,
+)
+
+#: 基础预测器的单步语义：当前候选池全部按 X(t) -> y(t+1) 训练。
+BASE_HORIZON = 1
 
 _REQUIRED_SCENARIO_FIELDS = (
     "task_type",
     "business_domain",
     "region",
     "horizon",
+    "forecast_steps",
     "freq",
     "signature",
 )
 
-_HISTORY_SCENARIO_FIELDS = ("task_type", "business_domain", "region", "freq")
+_HISTORY_SCENARIO_FIELDS = (
+    "task_type",
+    "business_domain",
+    "region",
+    "forecast_steps",
+    "freq",
+)
 _COUNTRY_BY_REGION = {"pjm": "US", "aemo_vic": "AU", "aemo_nsw": "AU"}
 
 
@@ -41,6 +73,10 @@ def _load_scenario(path: str, *, history_mode: bool = False) -> Dict[str, Any]:
     missing = [field for field in required_fields if field not in payload]
     if missing:
         raise LibraryPredictionError(f"scenario 文件缺少必填字段: {missing}")
+    try:
+        payload["forecast_steps"] = validate_forecast_steps(payload["forecast_steps"])
+    except UnsupportedForecastSteps as exc:
+        raise LibraryPredictionError(str(exc)) from exc
     if history_mode:
         return payload
     if not isinstance(payload["signature"], dict) or not payload["signature"]:
@@ -50,18 +86,34 @@ def _load_scenario(path: str, *, history_mode: bool = False) -> Dict[str, Any]:
     return payload
 
 
+def _country_for(region: str) -> str:
+    try:
+        return _COUNTRY_BY_REGION[region]
+    except KeyError:
+        raise LibraryPredictionError(
+            f"未知 region={region!r}，无法确定日历特征所用节假日日历"
+        ) from None
+
+
 def _match_scenario(store: ModelStore, scenario: Dict[str, Any]) -> Tuple[str, float]:
+    """先按硬契约精确过滤，再在剩余场景上算相似度。
+
+    ``forecast_steps`` 是不能混用的任务契约，必须在相似度之前过滤：168 步请求
+    不得匹配 24 或 720 步关系。
+    """
+    forecast_steps = validate_forecast_steps(scenario["forecast_steps"])
     candidates = store.list_scenarios(
         task_type=scenario["task_type"],
         business_domain=scenario["business_domain"],
         region=scenario["region"],
         horizon=int(scenario["horizon"]),
+        forecast_steps=forecast_steps,
         freq=scenario["freq"],
     )
     if not candidates:
         raise LibraryPredictionError(
-            "no compatible scenario: 数据库中没有 "
-            "task_type/business_domain/horizon/freq 全部匹配的历史场景"
+            "no compatible scenario: 数据库中没有 task_type/business_domain/region/"
+            f"horizon/forecast_steps={forecast_steps}/freq 全部匹配的历史场景"
         )
     index = ScenarioIndex()
     for candidate in candidates:
@@ -102,14 +154,17 @@ def _predict(
     output_path: str,
 ) -> Dict[str, Any]:
     scenario = _load_scenario(scenario_path)
+    forecast_steps = scenario["forecast_steps"]
     features = pd.read_csv(features_path)
     if "timestamp" not in features.columns:
         raise LibraryPredictionError("features 文件缺少 timestamp 列")
+    if len(features) != forecast_steps:
+        raise LibraryPredictionError(
+            f"features 行数 {len(features)} 与请求的 forecast_steps={forecast_steps} 不一致"
+        )
 
     matched = _load_matched_combination(store, scenario)
-    scenario_id, similarity = matched["scenario_id"], matched["similarity"]
     relation = matched["relation"]
-    combination = matched["combination"]
     combination_predictor = matched["predictor"]
     for model_row in matched["models"]:
         missing = [column for column in model_row["required_features"] if column not in features.columns]
@@ -137,38 +192,18 @@ def _predict(
 
     prediction_run_id = store.record_prediction_run(relation["relation_id"], str(output))
 
-    trace = {
-        "mode": "model_library",
-        "model_selection_source": "saved_relation",
-        "selector_invoked": False,
-        "scenario_id": scenario_id,
-        "scenario_similarity": similarity,
-        "relation_id": relation["relation_id"],
-        "combination_id": combination["combination_id"],
-        "data_profile_id": relation["data_profile_id"],
-        "strategy": combination["strategy"],
-        "model_ids": matched["model_ids"],
-        "member_weights": {
-            member["model_id"]: float(member["weight"])
-            for member in combination["members"]
-        },
-        "member_types": matched["member_types"],
-        "artifact_paths": {
-            "combination": matched["combo_path"],
-            "models": matched["model_artifact_paths"],
-        },
-        "has_interaction": combination_predictor.interaction is not None,
-        "validation_mae": relation["validation_mae"],
-        "mean_actual_mae": relation["mean_actual_mae"],
-        "feedback_count": relation["feedback_count"],
-        "n_rows": int(len(features)),
-        "prediction_run_id": prediction_run_id,
-        "output": str(output),
-    }
-    trace_path = output.with_suffix(".trace.json")
-    trace_path.write_text(json.dumps(trace, indent=2, default=str), encoding="utf-8")
-    trace["trace_path"] = str(trace_path)
-    return trace
+    trace = _base_trace(
+        matched,
+        # --features 入口可以命中 V1 的 horizon=24 关系，基础预测器语义由匹配到的
+        # 场景决定，不是恒为 1。
+        base_horizon=int(scenario["horizon"]),
+        forecast_steps=forecast_steps,
+        n_rows=int(len(features)),
+        prediction_run_id=prediction_run_id,
+        output=output,
+    )
+    trace["signature_source"] = "caller"
+    return _write_trace(trace, output)
 
 
 def _load_matched_combination(store: ModelStore, scenario: Dict[str, Any]) -> Dict[str, Any]:
@@ -224,75 +259,26 @@ def _base_predictions(matched: Dict[str, Any], features: pd.DataFrame) -> Dict[s
     }
 
 
-def _history_signature(history: pd.DataFrame, freq: str) -> Dict[str, float]:
-    from scripts.train_combinations_kg import _scenario_signature
-
-    target_frame = history.rename(columns={"load": "y"})
-    return _scenario_signature(target_frame, history, horizon=1, freq=freq)
-
-
-def _forecast_origin_feature_row(
-    history: pd.DataFrame,
-    feature_names: set[str],
-    country: str,
-) -> pd.DataFrame:
-    from scripts.generate_features import add_holiday, add_lag_roll_grouped, add_time_features
-
-    lags = sorted({int(value) for value in re.findall(r"lag_(\d+)", " ".join(feature_names))})
-    windows = sorted({int(value) for value in re.findall(r"roll(\d+)_(?:mean|std)", " ".join(feature_names))})
-    frame = history.copy()
-    frame = add_time_features(frame, "timestamp")
-    frame = add_holiday(frame, "timestamp", country)
-    frame = add_lag_roll_grouped(frame, [], "timestamp", "load", lags, windows)
-    return frame.tail(1)
-
-
-def _predict_from_history(
-    store: ModelStore,
-    scenario_path: str,
-    history_path: str,
-    output_path: str,
+def _base_trace(
+    matched: Dict[str, Any],
+    *,
+    base_horizon: int,
+    forecast_steps: int,
+    n_rows: int,
+    prediction_run_id: int,
+    output: Path,
 ) -> Dict[str, Any]:
-    scenario = _load_scenario(scenario_path, history_mode=True)
-    history = pd.read_csv(history_path)
-    missing = [column for column in ("timestamp", "load") if column not in history.columns]
-    if missing:
-        raise LibraryPredictionError(f"history 文件缺少必填列: {missing}")
-    history = history[["timestamp", "load"]].copy()
-    history["timestamp"] = pd.to_datetime(history["timestamp"])
-    history["load"] = pd.to_numeric(history["load"])
-    history = history.sort_values("timestamp").reset_index(drop=True)
-    scenario["horizon"] = 1
-    scenario["signature"] = _history_signature(history, scenario["freq"])
-    matched = _load_matched_combination(store, scenario)
+    relation = matched["relation"]
     predictor = matched["predictor"]
-    feature_names = set(predictor.required_feature_names)
-    for model_row in matched["models"]:
-        feature_names.update(model_row["required_features"])
-    country = _COUNTRY_BY_REGION[scenario["region"]]
-    future = []
-    for _ in range(720):
-        origin = history["timestamp"].iloc[-1]
-        timestamp = origin + pd.Timedelta(hours=1)
-        features = _forecast_origin_feature_row(history, feature_names, country)
-        base_predictions = _base_predictions(matched, features)
-        yhat = float(predictor.predict(base_predictions, features)[0])
-        future.append({"timestamp": timestamp, "yhat": yhat})
-        history.loc[len(history)] = [timestamp, yhat]
-    output = Path(output_path)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    forecast = pd.DataFrame(future)
-    forecast.to_csv(output, index=False)
-    prediction_run_id = store.record_prediction_run(matched["relation"]["relation_id"], str(output))
-    trace = {
+    return {
         "mode": "model_library",
         "model_selection_source": "saved_relation",
         "selector_invoked": False,
         "scenario_id": matched["scenario_id"],
         "scenario_similarity": matched["similarity"],
-        "relation_id": matched["relation"]["relation_id"],
+        "relation_id": relation["relation_id"],
         "combination_id": matched["combination"]["combination_id"],
-        "data_profile_id": matched["relation"]["data_profile_id"],
+        "data_profile_id": relation["data_profile_id"],
         "strategy": matched["combination"]["strategy"],
         "model_ids": matched["model_ids"],
         "member_weights": {
@@ -305,16 +291,100 @@ def _predict_from_history(
             "models": matched["model_artifact_paths"],
         },
         "has_interaction": predictor.interaction is not None,
-        "validation_mae": matched["relation"]["validation_mae"],
-        "mean_actual_mae": matched["relation"]["mean_actual_mae"],
-        "feedback_count": matched["relation"]["feedback_count"],
-        "n_rows": 720,
-        "forecast_steps": 720,
-        "signature_source": "history",
+        "validation_mae": relation["validation_mae"],
+        "mean_actual_mae": relation["mean_actual_mae"],
+        "feedback_count": relation["feedback_count"],
+        "base_horizon": int(base_horizon),
+        "forecast_steps": int(forecast_steps),
+        "n_rows": int(n_rows),
         "prediction_run_id": prediction_run_id,
         "output": str(output),
     }
+
+
+def _write_trace(trace: Dict[str, Any], output: Path) -> Dict[str, Any]:
     trace_path = output.with_suffix(".trace.json")
     trace_path.write_text(json.dumps(trace, indent=2, default=str), encoding="utf-8")
     trace["trace_path"] = str(trace_path)
     return trace
+
+
+def _history_signature(history: pd.DataFrame, freq: str) -> Dict[str, float]:
+    """与离线建库共用同一个签名实现，保证两侧 key 集与数值口径一致。"""
+    from scripts.train_combinations_kg import history_window_signature
+
+    try:
+        return history_window_signature(history, freq=freq, base_horizon=BASE_HORIZON)
+    except ValueError as exc:
+        raise LibraryPredictionError(str(exc)) from exc
+
+
+def _read_history(history_path: str) -> pd.DataFrame:
+    history = pd.read_csv(history_path)
+    missing = [column for column in ("timestamp", "load") if column not in history.columns]
+    if missing:
+        raise LibraryPredictionError(f"history 文件缺少必填列: {missing}")
+    history = history[["timestamp", "load"]].copy()
+    history["timestamp"] = pd.to_datetime(history["timestamp"])
+    history["load"] = pd.to_numeric(history["load"])
+    return history.sort_values("timestamp").reset_index(drop=True)
+
+
+def _predict_from_history(
+    store: ModelStore,
+    scenario_path: str,
+    history_path: str,
+    output_path: str,
+) -> Dict[str, Any]:
+    scenario = _load_scenario(scenario_path, history_mode=True)
+    forecast_steps = scenario["forecast_steps"]
+    history = _read_history(history_path)
+    country = _country_for(scenario["region"])
+
+    # 基础预测器是 h=1；用户请求的是长度 forecast_steps 的完整轨迹，两者不混用。
+    scenario["horizon"] = BASE_HORIZON
+    scenario["signature"] = _history_signature(history, scenario["freq"])
+    matched = _load_matched_combination(store, scenario)
+    predictor = matched["predictor"]
+
+    timestamps = future_timestamps(history, forecast_steps)
+    base_predictions: Dict[str, np.ndarray] = {}
+    for model_row, member_type in zip(matched["models"], matched["member_types"]):
+        try:
+            # 每个成员独立递归：只把自己的预测写回自己的 lag/rolling 特征。
+            base_predictions[member_type] = generate_member_trajectory(
+                model=model_row["predictor"],
+                model_type=model_row["model_type"],
+                required_features=model_row["required_features"],
+                history=history,
+                forecast_steps=forecast_steps,
+                country=country,
+            )
+        except TrajectoryForecastError as exc:
+            raise LibraryPredictionError(
+                f"成员 {model_row['model_id']} 无法生成 {forecast_steps} 步轨迹: {exc}"
+            ) from exc
+
+    raw_features = calendar_frame(timestamps, country)
+    for feature_name in predictor.required_feature_names:
+        if feature_name not in raw_features.columns:
+            raise LibraryPredictionError(
+                f"组合器 interaction 需要的特征无法由未来时间戳生成: {feature_name}"
+            )
+    yhat = np.asarray(predictor.predict(base_predictions, raw_features), dtype=float)
+
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame({"timestamp": timestamps, "yhat": yhat}).to_csv(output, index=False)
+
+    prediction_run_id = store.record_prediction_run(matched["relation"]["relation_id"], str(output))
+    trace = _base_trace(
+        matched,
+        base_horizon=BASE_HORIZON,
+        forecast_steps=forecast_steps,
+        n_rows=int(len(yhat)),
+        prediction_run_id=prediction_run_id,
+        output=output,
+    )
+    trace["signature_source"] = "history"
+    return _write_trace(trace, output)

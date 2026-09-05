@@ -62,7 +62,8 @@ def _query_signature(raw_root: Path, dataset: str, horizon: int):
     """按调用方"根据预测发生前已有的历史负荷生成场景/数据特征"的口径生成签名。
 
     只读 validation 数据，绝不读取即将被评价的 test 真实负荷；否则 test 标签进入
-    关系选择。构造方式与 _build_library_task 写入 scenario 签名时一致。
+    关系选择。这里走的是 V1 单点（h=24）口径，与按完整轨迹建库的
+    _build_library_task 的 720 小时窗口签名不是同一套，不要混用。
     """
     raw = pd.read_csv(raw_root / dataset / "val.csv")
     _x, y, ts, freq = tb.prepare_supervised(raw, TARGET, horizon)

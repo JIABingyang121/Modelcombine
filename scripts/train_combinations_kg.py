@@ -10,7 +10,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -61,7 +61,16 @@ from src.eval.kg.feedback import KGFeedbackStore, make_config_fingerprint
 from src.core.scenario_id import compute_scenario_id
 from src.models.artifacts import load_artifact, save_artifact
 from src.models.combination_predictor import COMBINATION_PREDICTOR_KEY
-from src.storage.model_store import ModelStore
+from src.models.trajectory_forecast import (
+    calendar_frame,
+    future_timestamps,
+    generate_trajectory_matrix,
+)
+from src.storage.model_store import (
+    SUPPORTED_FORECAST_STEPS,
+    ModelStore,
+    validate_forecast_steps,
+)
 from scripts.train_baselines import prepare_supervised
 from src.eval.kg import load_candidate_audit_map, load_health_enabled_map
 from src.core.enums import ModelLifecycleStage, TaskType
@@ -1183,6 +1192,26 @@ MODEL_LIBRARY_BUSINESS_DOMAIN = "power_load"
 MODEL_LIBRARY_STRATEGY = "protocol_b_combination"
 TARGET = "load"
 
+#: 基础预测器的单步语义。用户请求的完整轨迹长度是 forecast_steps，与之正交。
+MODEL_LIBRARY_BASE_HORIZON = 1
+#: 构造场景/数据特征的历史窗口（小时）。离线与在线必须取同一个窗口长度，
+#: 否则两侧 signature 不可比，相似度检索失去意义。
+SIGNATURE_WINDOW = 720
+#: 用户在线只需提交这两列；离线建库也只从这两列派生成员输入。
+TRAJECTORY_INPUT_COLUMNS = ("timestamp", "load")
+MODEL_LIBRARY_COUNTRY_BY_REGION = {"pjm": "US", "aemo_vic": "AU", "aemo_nsw": "AU"}
+#: seasonal_naive 在 KG 基础候选里被排除（扩展池节点），但它在轨迹契约下有
+#: 明确定义的多步行为，是模型库的合法成员。
+MODEL_LIBRARY_EXTRA_CANDIDATES = ("seasonal_naive",)
+
+
+def _model_library_candidate_types() -> List[str]:
+    candidates = list(_build_kg_model_candidates())
+    for extra in MODEL_LIBRARY_EXTRA_CANDIDATES:
+        if extra not in candidates:
+            candidates.append(extra)
+    return candidates
+
 
 def _infer_freq(timestamps: pd.Series) -> str:
     ts = pd.to_datetime(timestamps, errors="coerce").dropna().sort_values()
@@ -1227,6 +1256,34 @@ def _scenario_signature(
     return {k: round(float(v), 8) for k, v in signature.items()}
 
 
+def history_window_signature(
+    history: pd.DataFrame,
+    *,
+    freq: str,
+    base_horizon: int = MODEL_LIBRARY_BASE_HORIZON,
+    window: int = SIGNATURE_WINDOW,
+) -> Dict[str, float]:
+    """由预测起点之前 ``window`` 小时的 ``(timestamp, load)`` 生成场景签名。
+
+    离线建库与在线查询共用这一个实现：两侧取同样长度的窗口、派生同样的 hour
+    列、走同样的统计口径，signature 的 key 集与数值才可比。签名里不放
+    ``forecast_steps``——它是硬契约过滤条件，不是"越接近越相似"的数值特征。
+    """
+    missing = [column for column in TRAJECTORY_INPUT_COLUMNS if column not in history.columns]
+    if missing:
+        raise ValueError(f"signature 需要的列缺失: {missing}")
+    if len(history) < window:
+        raise ValueError(
+            f"signature 需要预测起点之前至少 {window} 小时历史，收到 {len(history)} 行"
+        )
+    frame = history.tail(window)[list(TRAJECTORY_INPUT_COLUMNS)].reset_index(drop=True)
+    frame["timestamp"] = pd.to_datetime(frame["timestamp"])
+    frame["load"] = pd.to_numeric(frame["load"])
+    frame["hour"] = frame["timestamp"].dt.hour
+    target_frame = frame.rename(columns={"load": "y"})
+    return _scenario_signature(target_frame, frame, base_horizon, freq)
+
+
 def _forecast_origin_raw_frame(
     raw_root: Optional[Path], dataset: str, split: str, horizon: int
 ) -> Optional[pd.DataFrame]:
@@ -1247,62 +1304,271 @@ def _forecast_origin_raw_frame(
     return frame
 
 
+def _library_candidate_models(
+    store: ModelStore,
+    *,
+    dataset: str,
+    base_horizon: int,
+    model_types: Sequence[str],
+) -> Tuple[Dict[str, Dict[str, Any]], List[Dict[str, str]]]:
+    """取回本次建库声明的全部基础预测器产物。
+
+    候选完整性规则（正式实验口径）：``model_types`` 是本次建库**声明**的候选集合，
+    默认取 ``_model_library_candidate_types()``——它与 ``configs/pipeline.yaml``
+    的 ``models:`` 段同源，正是 ``train_baselines`` 会登记的那一批。声明的候选
+    未登记或产物文件丢失，都属于**建库不完整**，直接整体失败，绝不用一个缩水的
+    候选池产出正式数字。
+
+    只有"已登记、但在历史数据契约下产不出完整轨迹"才是可记录的无资格
+    （需要未来外生变量的模型、以及无法消费用户最新历史的 arima），由
+    :func:`generate_member_trajectory` 在轨迹生成时判定并记入 skipped。
+    """
+    members: Dict[str, Dict[str, Any]] = {}
+    skipped: List[Dict[str, str]] = []
+    for model_type in model_types:
+        model_id = f"{dataset}__h{base_horizon}__{model_type}"
+        row = store.get_model(model_id)
+        if row is None:
+            raise RuntimeError(
+                f"model library build failed for {dataset}: 声明的候选 {model_type} 未登记在"
+                f"模型库（期望 model_id={model_id}）——建库不完整，不产出报告"
+            )
+        artifact_path = Path(row["artifact_path"])
+        if not artifact_path.exists():
+            raise RuntimeError(
+                f"model library build failed for {dataset}: 模型 {model_id} 已登记但产物文件"
+                f"不存在: {artifact_path}——建库不完整，不产出报告"
+            )
+        members[model_type] = {
+            "model_id": model_id,
+            "model": load_artifact(artifact_path),
+            "model_type": row["model_type"],
+            "required_features": list(row["required_features"]),
+        }
+    return members, skipped
+
+
+def _library_split_frame(raw_root: Path, dataset: str, split: str) -> pd.DataFrame:
+    path = raw_root / dataset / f"{split}.csv"
+    if not path.exists():
+        raise RuntimeError(f"model library build needs {path}")
+    frame = pd.read_csv(path)
+    missing = [column for column in ("timestamp", TARGET) if column not in frame.columns]
+    if missing:
+        raise RuntimeError(f"{path} 缺少必填列: {missing}")
+    frame = frame[["timestamp", TARGET]].rename(columns={TARGET: "load"})
+    frame["timestamp"] = pd.to_datetime(frame["timestamp"])
+    frame["load"] = pd.to_numeric(frame["load"])
+    return frame.sort_values("timestamp").reset_index(drop=True)
+
+
+def _library_raw_frame(raw_root: Path, dataset: str) -> pd.DataFrame:
+    path = raw_root / dataset / "load.csv"
+    if not path.exists():
+        raise RuntimeError(f"model library build needs {path}")
+    frame = pd.read_csv(path)
+    missing = [column for column in ("timestamp", TARGET) if column not in frame.columns]
+    if missing:
+        raise RuntimeError(f"{path} 缺少必填列: {missing}")
+    frame = frame[["timestamp", TARGET]].rename(columns={TARGET: "load"})
+    frame["timestamp"] = pd.to_datetime(frame["timestamp"])
+    frame["load"] = pd.to_numeric(frame["load"])
+    return frame.sort_values("timestamp").reset_index(drop=True)
+
+
+def _frozen_windows(window_plan: Path, dataset: str, forecast_steps: int) -> Dict[str, Dict[str, Any]]:
+    """读取 Stage 0 冻结的一个数据集、一个预测长度的七个预测窗口。"""
+    plan = json.loads(window_plan.read_text(encoding="utf-8"))
+    dataset_entry = next(entry for entry in plan["datasets"] if entry["dataset"] == dataset)
+    origins = dataset_entry["feasibility"][str(forecast_steps)]["origins"]
+    return {entry["label"]: entry for entry in origins}
+
+
+def _library_window_frame(
+    raw_root: Path,
+    dataset: str,
+    window: Mapping[str, Any],
+) -> pd.DataFrame:
+    """取一个冻结窗口的 720 小时历史和其完整目标轨迹。"""
+    frame = _library_raw_frame(raw_root, dataset)
+    start = pd.Timestamp(window["history_start"])
+    end = pd.Timestamp(window["last_target"])
+    return frame[(frame["timestamp"] >= start) & (frame["timestamp"] <= end)].reset_index(drop=True)
+
+
+def _library_origin_split(
+    frame: pd.DataFrame, forecast_steps: int, *, label: str
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """把一个切分拆成「预测起点之前的历史」与「该起点之后的完整目标轨迹」。"""
+    needed = SIGNATURE_WINDOW + forecast_steps
+    if len(frame) < needed:
+        raise RuntimeError(
+            f"{label} 只有 {len(frame)} 行，不足以容纳 {SIGNATURE_WINDOW} 小时 signature 窗口 "
+            f"+ {forecast_steps} 步完整轨迹（需要 {needed} 行）"
+        )
+    cut = len(frame) - forecast_steps
+    history = frame.iloc[:cut].reset_index(drop=True)
+    targets = frame.iloc[cut:].reset_index(drop=True)
+    expected = future_timestamps(history, forecast_steps)
+    if not targets["timestamp"].reset_index(drop=True).equals(pd.Series(expected)):
+        raise RuntimeError(
+            f"{label} 的目标时间戳不是预测起点之后连续的 {forecast_steps} 个小时点；"
+            "本方案不在缺口上伪造目标"
+        )
+    return history, targets
+
+
+def _library_trajectory_matrix(
+    members: Mapping[str, Dict[str, Any]],
+    *,
+    frame: pd.DataFrame,
+    forecast_steps: int,
+    country: str,
+    label: str,
+) -> Tuple[pd.DataFrame, pd.DataFrame, List[Dict[str, str]], pd.Timestamp]:
+    """生成一个预测起点下的完整轨迹矩阵与其日历特征表。"""
+    history, targets = _library_origin_split(frame, forecast_steps, label=label)
+    matrix, skipped = generate_trajectory_matrix(
+        members=members,
+        history=history,
+        forecast_steps=forecast_steps,
+        country=country,
+    )
+    matrix["y"] = targets["load"].to_numpy(dtype=float)
+    calendar = calendar_frame(matrix["target_timestamp"], country)
+    return matrix, calendar, skipped, history["timestamp"].iloc[-1]
+
+
+def _library_candidate_maes(matrix: pd.DataFrame, model_cols: Sequence[str]) -> Dict[str, Dict[str, float]]:
+    """逐候选记录「单点（lead=1）」与「完整轨迹」两种 validation 表现。
+
+    两者的排序可以不同——这正是 §2.2 指出的问题：单点最优不等于长轨迹最稳。
+    """
+    y = matrix["y"].to_numpy(dtype=float)
+    lead1 = matrix["lead"].to_numpy(dtype=int) == 1
+    report: Dict[str, Dict[str, float]] = {}
+    for column in model_cols:
+        pred = matrix[column].to_numpy(dtype=float)
+        report[column] = {
+            "lead1_mae": float(np.mean(np.abs(pred[lead1] - y[lead1]))),
+            "trajectory_mae": float(np.mean(np.abs(pred - y))),
+        }
+    return report
+
+
 def _build_library_task(
     store: ModelStore,
     *,
     dataset: str,
-    horizon: int,
-    kg_models: List[str],
-    pred_root: Path,
+    forecast_steps: int,
+    model_types: Sequence[str],
     raw_root: Optional[Path],
     artifact_dir: Path,
     filter_threshold: float,
+    base_horizon: int = MODEL_LIBRARY_BASE_HORIZON,
+    val_frame: Optional[pd.DataFrame] = None,
+    test_frame: Optional[pd.DataFrame] = None,
+    library_window: Optional[str] = None,
+    audit_window: Optional[str] = None,
 ) -> Dict[str, Any]:
-    # 指定任务不得静默跳过：产物缺失 / 无共同候选 / 过滤后无候选均直接失败。
-    try:
-        df_val = load_predictions_safe(pred_root, dataset, horizon, list(kg_models), "val")
-        df_test = load_predictions_safe(pred_root, dataset, horizon, list(kg_models), "test")
-    except (FileNotFoundError, ValueError) as exc:
-        raise RuntimeError(
-            f"model library build failed for {dataset} h={horizon}: {exc}"
-        ) from exc
+    """按完整轨迹建立一条 scenario-data-combination 关系（方案 §3.3）。
 
-    model_cols = get_common_models(df_val, df_test, list(kg_models))
-    if not model_cols:
+    指定任务不得静默跳过：原始数据缺失 / 无可用候选 / 过滤后无候选 / 重放不一致
+    均直接失败。
+    """
+    forecast_steps = validate_forecast_steps(forecast_steps)
+    if raw_root is None:
         raise RuntimeError(
-            f"model library build failed for {dataset} h={horizon}: val/test 无共同候选模型"
+            f"model library build needs --raw-root for {dataset} forecast_steps={forecast_steps}"
+        )
+    country = MODEL_LIBRARY_COUNTRY_BY_REGION.get(dataset)
+    if country is None:
+        raise RuntimeError(f"未知数据集 {dataset}：无法确定日历特征所用节假日日历")
+
+    candidates, skipped = _library_candidate_models(
+        store, dataset=dataset, base_horizon=base_horizon, model_types=model_types
+    )
+    if not candidates:
+        raise RuntimeError(
+            f"model library build failed for {dataset} forecast_steps={forecast_steps}: "
+            f"没有任何已登记的 h={base_horizon} 候选模型"
         )
 
-    df_val_i, df_test_i, _ = _impute_prediction_nans(df_val, df_test, model_cols)
-    safe_models, _filter_meta = filter_weak_models(
-        df_val_i, model_cols, threshold_ratio=filter_threshold, horizon=horizon
+    label = f"{dataset} forecast_steps={forecast_steps}"
+    if library_window is not None:
+        label = f"{label} {library_window}"
+    if val_frame is None:
+        val_frame = _library_split_frame(raw_root, dataset, "val")
+    val_matrix, val_calendar, val_skipped, val_origin = _library_trajectory_matrix(
+        candidates,
+        frame=val_frame,
+        forecast_steps=forecast_steps,
+        country=country,
+        label=f"{label} val",
+    )
+    # 候选资格由离线边界判定：能在 val 上产出轨迹的才进入 test 与组合枚举。
+    eligible = {name: candidates[name] for name in candidates if name in val_matrix.columns}
+    skipped.extend(val_skipped)
+    for entry in skipped:
+        print(f"  [model-library] {label}: 候选 {entry['model_type']} 无资格——{entry['reason']}")
+    if not eligible:
+        raise RuntimeError(
+            f"model library build failed for {label}: 所有候选都无法在当前输入契约下产出完整轨迹"
+        )
+
+    if test_frame is None:
+        test_frame = _library_split_frame(raw_root, dataset, "test")
+    test_matrix, test_calendar, test_skipped, test_origin = _library_trajectory_matrix(
+        eligible,
+        frame=test_frame,
+        forecast_steps=forecast_steps,
+        country=country,
+        label=f"{label} test",
+    )
+    if test_skipped:
+        raise RuntimeError(
+            f"model library build failed for {label}: 候选在 test 起点无法产出轨迹 {test_skipped}"
+        )
+
+    model_cols = sorted(eligible)
+    candidate_maes = _library_candidate_maes(val_matrix, model_cols)
+    # min_keep=1：递归轨迹下一个成员可能放大若干数量级，强行保底反而会把数值
+    # 爆炸的列塞进每一个被枚举的子集。安全候选就是能稳定跑完整条轨迹的那些。
+    # horizon 在这里只用于挑选 naive 基线的容忍度，取的是"预测多远"，因此传
+    # forecast_steps；下面 Protocol B 的 horizon 是基础预测器的单步语义，传
+    # base_horizon。两处含义不同，不要统一。
+    safe_models, filter_meta = filter_weak_models(
+        val_matrix.rename(columns={"target_timestamp": "timestamp"}),
+        model_cols,
+        threshold_ratio=filter_threshold,
+        min_keep=1,
+        horizon=forecast_steps,
     )
     if not safe_models:
         raise RuntimeError(
-            f"model library build failed for {dataset} h={horizon}: 弱模型/稳定性过滤后无可用模型"
+            f"model library build failed for {label}: 弱模型/稳定性过滤后无可用模型"
         )
     safe_models = sorted(safe_models)
 
-    df_raw_val = _forecast_origin_raw_frame(raw_root, dataset, "val", horizon)
-    df_raw_test = _forecast_origin_raw_frame(raw_root, dataset, "test", horizon)
-    if df_raw_val is None or df_raw_test is None:
-        raise RuntimeError(
-            f"model library build needs raw features for {dataset} h={horizon}: "
-            f"raw_root={raw_root}"
-        )
-
     cols = list(dict.fromkeys(list(safe_models) + ["y", "timestamp"]))
-    dval = df_val_i[cols]
-    dtest = df_test_i[cols]
+    dval = val_matrix.rename(columns={"target_timestamp": "timestamp"})[cols]
+    dtest = test_matrix.rename(columns={"target_timestamp": "timestamp"})[cols]
 
     # 非空子集全枚举：不写死二/三模型上限。相同实际成员只保留 validation 最小者。
-    candidates: Dict[Tuple[str, ...], Dict[str, Any]] = {}
+    #
+    # 枚举时把 val 同时当作引擎的 test 入参：Protocol B 会用 val/test 两侧的
+    # **预测分布** 估 PSI 得到 drift_level，再据此做稳定性过滤与 interaction 门控
+    # （src/eval/kg/stability.py:270）。只要真实 test 预测进入这一步，即使 test
+    # 标签完全没参与拟合，候选集合和被选组合也会随 test 分布改变。方案 §3.3.6 要求
+    # test 只在冻结后评价，因此这里从结构上不给引擎任何 test 数据；冻结时刻本来
+    # 也没有合法的未来窗口可用于估漂移。
+    candidates_by_members: Dict[Tuple[str, ...], Dict[str, Any]] = {}
     for size in range(1, len(safe_models) + 1):
         for members in itertools.combinations(safe_models, size):
             res = evaluate_fixed_protocol_b_combination(
-                dval, dtest, df_raw_val, df_raw_test,
+                dval, dval, val_calendar, val_calendar,
                 selected_models=list(members),
-                horizon=horizon,
+                horizon=base_horizon,
                 dataset_name=dataset,
                 base_model_cols=list(safe_models),
                 return_combination_predictor=True,
@@ -1310,53 +1576,62 @@ def _build_library_task(
             predictor = res[COMBINATION_PREDICTOR_KEY]
             effective = tuple(predictor.member_ids)
             val_mae = float(res["val"]["mae"])
-            existing = candidates.get(effective)
+            existing = candidates_by_members.get(effective)
             if existing is None or val_mae < existing["validation_mae"]:
-                candidates[effective] = {
+                candidates_by_members[effective] = {
                     "requested_members": list(members),
                     "validation_mae": val_mae,
-                    "test_mae": float(res["test"]["mae"]),
                     "predictor": predictor,
                     "val_prediction": np.asarray(
                         res["_runtime_predictions"]["val"], dtype=float
                     ),
-                    "test_prediction": np.asarray(
-                        res["_runtime_predictions"]["test"], dtype=float
-                    ),
                 }
 
-    # 选择 validation MAE 最小者；完全相同才按排序后的模型 ID 元组做确定性选择。
-    best_key = min(candidates, key=lambda k: (candidates[k]["validation_mae"], k))
-    best = candidates[best_key]
+    # 排名目标是整条 validation 轨迹的 MAE；完全相同才按成员 ID 元组确定性排序。
+    best_key = min(
+        candidates_by_members,
+        key=lambda k: (candidates_by_members[k]["validation_mae"], k),
+    )
+    best = candidates_by_members[best_key]
     predictor = best["predictor"]
 
-    freq = _infer_freq(dtest["timestamp"])
-    signature = _scenario_signature(dval, df_raw_val, horizon, freq)
-    scenario_id = compute_scenario_id(signature, prefix=f"{dataset}_h{horizon}")
-    effective_model_ids = [f"{dataset}__h{horizon}__{m}" for m in predictor.member_ids]
+    freq = _infer_freq(dval["timestamp"])
+    val_history = val_frame.iloc[: len(val_frame) - forecast_steps]
+    signature = history_window_signature(val_history, freq=freq, base_horizon=base_horizon)
+    scenario_id = compute_scenario_id(
+        signature, prefix=f"{dataset}_h{base_horizon}_s{forecast_steps}"
+    )
+    effective_model_ids = [eligible[m]["model_id"] for m in predictor.member_ids]
     artifact_path = artifact_dir / dataset / f"{scenario_id}__combo.pkl"
     save_artifact(predictor, artifact_path)
 
-    # §9.3：保存后立即重放，与离线最终预测逐点比对；不可重放的组合任何数据库写入都不发生。
+    # §9.3：保存后立即重放，与离线最终预测逐点比对；比较对象是完整 validation
+    # 轨迹。不可重放的组合任何数据库写入都不发生。
     reloaded = load_artifact(artifact_path)
-    for split_name, frame, engine_prediction, raw_frame in (
-        ("val", dval, best["val_prediction"], df_raw_val),
-        ("test", dtest, best["test_prediction"], df_raw_test),
-    ):
-        aligned_raw = _align_raw_to_pred(raw_frame.copy(), frame.copy()).reset_index(drop=True)
-        replay = np.asarray(
-            reloaded.predict(
-                {m: frame[m].to_numpy(dtype=float) for m in reloaded.member_ids},
-                aligned_raw,
-            ),
-            dtype=float,
+    val_replay = np.asarray(
+        reloaded.predict(
+            {m: dval[m].to_numpy(dtype=float) for m in reloaded.member_ids},
+            val_calendar,
+        ),
+        dtype=float,
+    )
+    max_abs = float(np.max(np.abs(val_replay - best["val_prediction"])))
+    if max_abs > 1e-8:
+        raise RuntimeError(
+            f"model library build failed for {label}: "
+            f"组合器重放误差 {max_abs:.3e} > 1e-8（val），不写入数据库"
         )
-        max_abs = float(np.max(np.abs(replay - np.asarray(engine_prediction, dtype=float))))
-        if max_abs > 1e-8:
-            raise RuntimeError(
-                f"model library build failed for {dataset} h={horizon}: "
-                f"组合器重放误差 {max_abs:.3e} > 1e-8（{split_name}），不写入数据库"
-            )
+
+    # test 只在组合、权重和全部规则冻结之后评价：由已保存的组合器重放 test 轨迹，
+    # 不再走一次引擎。这条轨迹也正是在线入口应当逐点复现的目标。
+    test_prediction = np.asarray(
+        reloaded.predict(
+            {m: dtest[m].to_numpy(dtype=float) for m in reloaded.member_ids},
+            test_calendar,
+        ),
+        dtype=float,
+    )
+    test_mae = float(np.mean(np.abs(test_prediction - dtest["y"].to_numpy(dtype=float))))
 
     if store.get_scenario(scenario_id) is None:
         store.add_scenario(
@@ -1364,19 +1639,19 @@ def _build_library_task(
             task_type=MODEL_LIBRARY_TASK_TYPE,
             business_domain=MODEL_LIBRARY_BUSINESS_DOMAIN,
             region=dataset,
-            horizon=horizon,
+            horizon=base_horizon,
+            forecast_steps=forecast_steps,
             freq=freq,
             signature=signature,
         )
-    ts_val = pd.to_datetime(dval["timestamp"], errors="coerce")
     data_profile_id = store.add_data_profile(
         scenario_id=scenario_id,
-        data_ref=str((raw_root / dataset) if raw_root else (pred_root / dataset)),
-        target_column="y",
-        features=sorted(c for c in df_raw_val.columns if c != "timestamp"),
-        sample_count=len(dval),
-        start_at=str(ts_val.min()),
-        end_at=str(ts_val.max()),
+        data_ref=str(raw_root / dataset),
+        target_column="load",
+        features=sorted(TRAJECTORY_INPUT_COLUMNS),
+        sample_count=int(len(dval)),
+        start_at=str(dval["timestamp"].min()),
+        end_at=str(dval["timestamp"].max()),
         signature=signature,
     )
 
@@ -1395,69 +1670,113 @@ def _build_library_task(
         data_profile_id,
         combination_id,
         validation_mae=best["validation_mae"],
-        test_mae=best["test_mae"],
+        test_mae=test_mae,
     )
     print(
-        f"  [model-library] {dataset} h={horizon}: 最佳组合 {list(predictor.member_ids)} "
-        f"(val_mae={best['validation_mae']:.4f}, {len(candidates)} 个去重候选)"
+        f"  [model-library] {label}: 最佳组合 {list(predictor.member_ids)} "
+        f"(val_mae={best['validation_mae']:.4f}, "
+        f"{len(candidates_by_members)} 个去重候选组合)"
     )
     return {
         "dataset": dataset,
-        "horizon": horizon,
+        "base_horizon": base_horizon,
+        "forecast_steps": forecast_steps,
+        "library_window": library_window,
+        "audit_window": audit_window,
         "scenario_id": scenario_id,
         "data_profile_id": data_profile_id,
         "combination_id": combination_id,
         "relation_id": relation_id,
         "safe_models": list(safe_models),
+        "declared_candidates": list(model_types),
+        "skipped_candidates": skipped,
+        "candidate_validation_mae": candidate_maes,
+        "filter_excluded": list(filter_meta.get("final_excluded", [])),
         "requested_members": best["requested_members"],
         "effective_members": effective_model_ids,
         "linear_weights": [float(w) for w in predictor.linear_weights],
         "has_interaction": predictor.interaction is not None,
         "validation_mae": best["validation_mae"],
-        "test_mae": best["test_mae"],
-        "val_prediction": best["val_prediction"].tolist(),
-        "test_prediction": best["test_prediction"].tolist(),
+        "test_mae": test_mae,
+        "enumerated_combinations": [
+            {
+                "members": list(members),
+                "validation_mae": entry["validation_mae"],
+            }
+            for members, entry in sorted(
+                candidates_by_members.items(), key=lambda kv: (kv[1]["validation_mae"], kv[0])
+            )
+        ],
+        "val_origin": str(val_origin),
+        "test_origin": str(test_origin),
+        "test_target_timestamps": [str(ts) for ts in dtest["timestamp"]],
+        "val_trajectory": best["val_prediction"].tolist(),
+        "test_trajectory": test_prediction.tolist(),
     }
 
 
 def build_model_library(
     *,
     datasets: Optional[Sequence[str]],
-    selected_horizons: Optional[Sequence[int]],
-    kg_models: List[str],
-    pred_root: Path,
+    selected_forecast_steps: Optional[Sequence[int]],
+    model_types: Sequence[str],
     raw_root: Optional[Path],
     out_root: Path,
     database: Path,
     artifact_dir: Path,
     filter_threshold: float,
+    window_plan: Optional[Path] = None,
 ) -> Dict[str, Any]:
     ensure_dir(out_root)
     store = ModelStore(str(database))
     store.create_schema()
-    horizon_filter = set(int(h) for h in selected_horizons) if selected_horizons else None
-    dataset_filter = set(datasets) if datasets else None
+    steps_filter = [
+        validate_forecast_steps(s)
+        for s in (selected_forecast_steps or SUPPORTED_FORECAST_STEPS)
+    ]
+    dataset_filter = list(datasets) if datasets else list(DATASET_HORIZONS)
 
-    report: Dict[str, Any] = {"tasks": []}
+    report: Dict[str, Any] = {
+        "base_horizon": MODEL_LIBRARY_BASE_HORIZON,
+        "signature_window": SIGNATURE_WINDOW,
+        "candidate_model_types": list(model_types),
+        "tasks": [],
+    }
     try:
-        for dataset, all_horizons in DATASET_HORIZONS.items():
-            if dataset_filter and dataset not in dataset_filter:
-                continue
-            for horizon in all_horizons:
-                if horizon_filter is not None and int(horizon) not in horizon_filter:
-                    continue
-                report["tasks"].append(
-                    _build_library_task(
-                        store,
-                        dataset=dataset,
-                        horizon=int(horizon),
-                        kg_models=kg_models,
-                        pred_root=pred_root,
-                        raw_root=raw_root,
-                        artifact_dir=artifact_dir,
-                        filter_threshold=filter_threshold,
+        for dataset in dataset_filter:
+            for forecast_steps in steps_filter:
+                if window_plan is None:
+                    report["tasks"].append(
+                        _build_library_task(
+                            store,
+                            dataset=dataset,
+                            forecast_steps=int(forecast_steps),
+                            model_types=model_types,
+                            raw_root=raw_root,
+                            artifact_dir=artifact_dir,
+                            filter_threshold=filter_threshold,
+                        )
                     )
-                )
+                    continue
+
+                windows = _frozen_windows(window_plan, dataset, int(forecast_steps))
+                audit_frame = _library_window_frame(raw_root, dataset, windows["A"])
+                for label in ("H1", "H2", "H3"):
+                    report["tasks"].append(
+                        _build_library_task(
+                            store,
+                            dataset=dataset,
+                            forecast_steps=int(forecast_steps),
+                            model_types=model_types,
+                            raw_root=raw_root,
+                            artifact_dir=artifact_dir,
+                            filter_threshold=filter_threshold,
+                            val_frame=_library_window_frame(raw_root, dataset, windows[label]),
+                            test_frame=audit_frame,
+                            library_window=label,
+                            audit_window="A",
+                        )
+                    )
     finally:
         store.close()
 
@@ -1520,11 +1839,20 @@ def main():
                         help="可选：加载 kg_results.json 作为 latency/drift 信号源")
     # P1-1: G0/G1/G2 消融分解
     parser.add_argument("--model-library", action="store_true",
-                        help="离线模型库构建模式：枚举任意非空组合、写入最佳关系到 SQLite")
+                        help="离线模型库构建模式：按完整轨迹枚举任意非空组合、写入最佳关系到 SQLite")
+    parser.add_argument("--forecast-steps", nargs="*", type=int, default=None,
+                        help=f"--model-library 的用户预测长度，默认全部 "
+                             f"{list(SUPPORTED_FORECAST_STEPS)}")
+    parser.add_argument("--candidates", nargs="*", default=None,
+                        help="本次建库声明的候选模型类型；默认取 pipeline.yaml models: 段"
+                             "（train_baselines 登记的同一批）。声明的候选未登记或产物丢失"
+                             "一律整体失败，不静默缩小候选池")
     parser.add_argument("--database", type=Path, default=None,
                         help="SQLite 模型库路径（--model-library 必需）")
     parser.add_argument("--model-artifacts", type=Path, default=None,
                         help="组合预测器产物目录（--model-library 必需）")
+    parser.add_argument("--window-plan", type=Path, default=None,
+                        help="Stage 0 冻结窗口 JSON；指定时用 H1—H3 建库，并共用 A 评价")
     parser.add_argument("--ablation-mode", type=str, default=None,
                         choices=["g0", "g1", "g2", "all"],
                         help="消融实验模式: g0=无扩展候选, g1=扩展无审计, g2=扩展+审计, all=依次跑全部")
@@ -1543,17 +1871,16 @@ def main():
     if args.model_library:
         if args.database is None or args.model_artifacts is None:
             parser.error("--model-library 需要同时提供 --database 与 --model-artifacts")
-        kg_models = _build_kg_model_candidates()
         build_model_library(
             datasets=args.datasets,
-            selected_horizons=args.horizons,
-            kg_models=kg_models,
-            pred_root=pred_root,
+            selected_forecast_steps=args.forecast_steps,
+            model_types=args.candidates or _model_library_candidate_types(),
             raw_root=raw_root,
             out_root=out_root,
             database=args.database,
             artifact_dir=args.model_artifacts,
             filter_threshold=float(args.filter_threshold),
+            window_plan=args.window_plan,
         )
         return
     health_config_path = None

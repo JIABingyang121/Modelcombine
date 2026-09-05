@@ -36,6 +36,7 @@ def _seed_scenario_and_profile(store, scenario_id="pjm_h1"):
         business_domain="power_load",
         region="pjm",
         horizon=1,
+        forecast_steps=24,
         freq="h",
         signature={"mean_load": 100.0, "cv_load": 0.2},
     )
@@ -206,3 +207,25 @@ def test_json_columns_round_trip_with_sorted_keys(store):
         "SELECT model_params_json FROM models WHERE model_id = 'm_a'"
     ).fetchone()[0]
     assert raw == '{"max_depth": 6, "n_estimators": 200}'
+
+
+def test_opening_a_pre_forecast_steps_database_fails_with_a_clear_message(tmp_path):
+    """旧库的 scenarios 没有 forecast_steps，CREATE TABLE IF NOT EXISTS 补不上列。
+
+    旧关系是按固定 720 步递归语义建的，不做迁移；在边界上直接说清楚要重建，
+    而不是等查询时抛 `no such column: forecast_steps`。
+    """
+    from src.storage.model_store import LegacySchemaError
+
+    legacy = tmp_path / "legacy_v2.sqlite3"
+    conn = sqlite3.connect(legacy)
+    conn.execute(
+        "CREATE TABLE scenarios (scenario_id TEXT PRIMARY KEY, task_type TEXT NOT NULL, "
+        "business_domain TEXT NOT NULL, region TEXT NOT NULL, horizon INTEGER NOT NULL, "
+        "freq TEXT NOT NULL, signature_json TEXT NOT NULL)"
+    )
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(LegacySchemaError, match="重新建库"):
+        ModelStore(str(legacy))

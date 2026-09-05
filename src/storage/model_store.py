@@ -34,6 +34,7 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
         business_domain TEXT NOT NULL,
         region TEXT NOT NULL,
         horizon INTEGER NOT NULL,
+        forecast_steps INTEGER NOT NULL,
         freq TEXT NOT NULL,
         signature_json TEXT NOT NULL
     )
@@ -98,8 +99,40 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
 )
 
 
+#: 一次用户请求需输出的连续点数。``horizon`` 表示基础预测器的单步语义（当前 1
+#: 小时），``forecast_steps`` 表示用户请求的完整轨迹长度；两者是不同维度，不能
+#: 互相替代。第一版只接受这三种长度，其他值直接报错，不做最近长度回退。
+SUPPORTED_FORECAST_STEPS: tuple[int, ...] = (24, 168, 720)
+
+
+class UnsupportedForecastSteps(ValueError):
+    """``forecast_steps`` 不在第一版支持的 24/168/720 内。"""
+
+
+def validate_forecast_steps(value: Any) -> int:
+    """把用户/调用方给出的预测长度收敛为受支持的整数，否则报错。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise UnsupportedForecastSteps(f"forecast_steps 必须是整数，收到 {value!r}")
+    try:
+        steps = int(value)
+    except (TypeError, ValueError):
+        raise UnsupportedForecastSteps(f"forecast_steps 必须是整数，收到 {value!r}") from None
+    if steps != float(value):
+        raise UnsupportedForecastSteps(f"forecast_steps 必须是整数，收到 {value!r}")
+    if steps not in SUPPORTED_FORECAST_STEPS:
+        raise UnsupportedForecastSteps(
+            f"不支持的 forecast_steps={steps}；第一版只接受 "
+            f"{list(SUPPORTED_FORECAST_STEPS)}，不做最近长度回退"
+        )
+    return steps
+
+
 class FeedbackAlreadyRecorded(RuntimeError):
     """对同一个 prediction run 第二次写反馈时抛出。"""
+
+
+class LegacySchemaError(RuntimeError):
+    """打开的是 forecast_steps 之前的旧库。"""
 
 
 def _utcnow() -> str:
@@ -115,6 +148,28 @@ class ModelStore:
         self._conn = sqlite3.connect(database)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys = ON")
+        self._assert_not_legacy_schema(database)
+
+    def _assert_not_legacy_schema(self, database: str) -> None:
+        """旧库的 scenarios 没有 forecast_steps，``CREATE TABLE IF NOT EXISTS``
+        也不会补列。这里在边界上直接报清楚，而不是等查询时抛
+        ``no such column: forecast_steps``。
+
+        旧库里的关系是按固定 720 步递归语义建的，与新的完整轨迹契约不是同一个
+        东西，不做迁移：要用新契约就重新建一个库。
+        """
+        exists = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'scenarios'"
+        ).fetchone()
+        if exists is None:
+            return
+        columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(scenarios)")}
+        if "forecast_steps" not in columns:
+            self._conn.close()
+            raise LegacySchemaError(
+                f"{database} 是 forecast_steps 之前的旧模型库，其关系按固定 720 步递归"
+                "语义建立，与完整轨迹契约不兼容。请用新的数据库重新建库，不要迁移旧关系。"
+            )
 
     @property
     def connection(self) -> sqlite3.Connection:
@@ -186,19 +241,21 @@ class ModelStore:
         business_domain: str,
         region: str,
         horizon: int,
+        forecast_steps: int,
         freq: str,
         signature: Mapping[str, Any],
     ) -> str:
         with self._conn:
             self._conn.execute(
                 "INSERT INTO scenarios (scenario_id, task_type, business_domain, region, "
-                "horizon, freq, signature_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "horizon, forecast_steps, freq, signature_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     scenario_id,
                     task_type,
                     business_domain,
                     region,
                     int(horizon),
+                    validate_forecast_steps(forecast_steps),
                     freq,
                     _dumps(dict(signature)),
                 ),
@@ -223,8 +280,11 @@ class ModelStore:
         business_domain: Optional[str] = None,
         region: Optional[str] = None,
         horizon: Optional[int] = None,
+        forecast_steps: Optional[int] = None,
         freq: Optional[str] = None,
     ) -> list[dict]:
+        """``forecast_steps`` 是硬契约过滤条件，不是相似度特征：168 步请求绝不
+        允许落到 24 或 720 步的场景上。"""
         clauses: list[str] = []
         params: list[Any] = []
         for column, value in (
@@ -232,6 +292,10 @@ class ModelStore:
             ("business_domain", business_domain),
             ("region", region),
             ("horizon", None if horizon is None else int(horizon)),
+            (
+                "forecast_steps",
+                None if forecast_steps is None else validate_forecast_steps(forecast_steps),
+            ),
             ("freq", freq),
         ):
             if value is not None:

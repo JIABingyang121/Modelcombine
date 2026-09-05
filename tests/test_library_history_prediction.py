@@ -1,4 +1,7 @@
-"""V2：用户只提交历史负荷，模型库递归生成未来 720 小时预测。"""
+"""用户只提交历史负荷，模型库按请求的 forecast_steps 生成完整预测轨迹。
+
+多预测长度契约本身由 tests/test_forecast_steps_contract.py 覆盖；这里守住
+历史输入入口的其余行为：区域硬约束、预测起点特征语义、反馈闭环。"""
 from __future__ import annotations
 
 import json
@@ -76,6 +79,7 @@ def _build_h1_library(tmp_path: Path) -> tuple[Path, int]:
         business_domain="power_load",
         region="pjm",
         horizon=1,
+        forecast_steps=720,
         freq="h",
         signature={"horizon": 1.0, "y_mean": 100.0, "y_std": 15.0},
     )
@@ -129,6 +133,7 @@ def _build_origin_time_h1_library(tmp_path: Path) -> Path:
         business_domain="power_load",
         region="pjm",
         horizon=1,
+        forecast_steps=720,
         freq="h",
         signature={"horizon": 1.0, "y_mean": 100.0, "y_std": 1.0},
     )
@@ -149,7 +154,7 @@ def _build_origin_time_h1_library(tmp_path: Path) -> Path:
 
 def test_history_input_generates_30_day_forecast_and_accepts_feedback(tmp_path):
     db, relation_id = _build_h1_library(tmp_path)
-    ts = pd.date_range("2026-01-01", periods=72, freq="h")
+    ts = pd.date_range("2026-01-01", periods=800, freq="h")
     history = tmp_path / "history.csv"
     pd.DataFrame({
         "timestamp": ts,
@@ -161,6 +166,7 @@ def test_history_input_generates_30_day_forecast_and_accepts_feedback(tmp_path):
         "business_domain": "power_load",
         "region": "pjm",
         "freq": "h",
+        "forecast_steps": 720,
     }), encoding="utf-8")
     output = tmp_path / "forecast.csv"
 
@@ -206,6 +212,7 @@ def test_matching_keeps_user_region_as_a_hard_constraint(tmp_path):
         business_domain="power_load",
         region="aemo_vic",
         horizon=1,
+        forecast_steps=720,
         freq="h",
         signature={"horizon": 1.0, "y_mean": 100.0, "y_std": 15.0},
     )
@@ -215,6 +222,7 @@ def test_matching_keeps_user_region_as_a_hard_constraint(tmp_path):
         "business_domain": "power_load",
         "region": "pjm",
         "horizon": 1,
+        "forecast_steps": 720,
         "freq": "h",
         "signature": {"horizon": 1.0, "y_mean": 100.0, "y_std": 15.0},
     })
@@ -225,7 +233,7 @@ def test_matching_keeps_user_region_as_a_hard_constraint(tmp_path):
 
 def test_history_prediction_uses_h1_feature_at_forecast_origin(tmp_path):
     db = _build_origin_time_h1_library(tmp_path)
-    timestamps = pd.date_range("2026-01-01", periods=48, freq="h")
+    timestamps = pd.date_range("2026-01-01", periods=800, freq="h")
     history = tmp_path / "history.csv"
     pd.DataFrame({"timestamp": timestamps, "load": 100.0}).to_csv(history, index=False)
     scenario = tmp_path / "scenario.json"
@@ -234,6 +242,7 @@ def test_history_prediction_uses_h1_feature_at_forecast_origin(tmp_path):
         "business_domain": "power_load",
         "region": "pjm",
         "freq": "h",
+        "forecast_steps": 720,
     }), encoding="utf-8")
     output = tmp_path / "forecast.csv"
 
@@ -247,4 +256,4 @@ def test_history_prediction_uses_h1_feature_at_forecast_origin(tmp_path):
     )
 
     assert predict.returncode == 0, predict.stdout + predict.stderr
-    assert pd.read_csv(output)["yhat"].iloc[0] == pytest.approx(23.0)
+    assert pd.read_csv(output)["yhat"].iloc[0] == pytest.approx(7.0)
