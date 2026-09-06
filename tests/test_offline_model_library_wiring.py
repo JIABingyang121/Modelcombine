@@ -23,6 +23,7 @@ import pandas as pd
 import pytest
 
 from src.eval.combination_utils import load_predictions_safe
+from src.models.artifacts import load_artifact
 from src.storage.model_store import ModelStore
 from tests.forecast_steps_fixtures import (
     DATASET,
@@ -340,3 +341,40 @@ def test_registered_but_contract_ineligible_candidate_is_recorded_not_fatal(tmp_
     assert "arima" not in {m.split("__")[-1] for m in task["effective_members"]}
     # 声明过就要在报告里留痕，便于验收文件核对候选完整性
     assert set(task["declared_candidates"]) == set(FIXTURE_CANDIDATES) | {"arima"}
+
+
+def test_single_member_relation_uses_the_model_as_is(tmp_path):
+    """最终关系只剩一个模型时，就是"用这个模型"，不是"这个模型的加权组合"。
+
+    让 Ridge 自由拟合单列系数得到的是一个一般不等于 1 的缩放（关掉本修正后本装置
+    实测 1.0087，另一个装置上是 0.9993，两个方向都出现过），等于给单模型关系加了一个
+    无理由的系统性偏置。装置只声明两个候选，其中 xgboost_reg 需要未来 temp、按输入
+    契约无资格，于是只剩一个合格候选，必定产出单成员关系——不靠运气命中该分支。
+    """
+    result = run_build(
+        tmp_path, [STEPS], rows=ROWS, candidates=["catboost_reg", "xgboost_reg"]
+    )
+    task = task_of(result["report"], STEPS)
+
+    assert task["effective_members"] == [f"{DATASET}__h1__catboost_reg"]
+    assert task["linear_weights"] == [1.0]
+    assert task["has_interaction"] is False
+
+    # 记录的 validation MAE 就是该成员自己的轨迹 MAE，不是被收缩后的组合 MAE
+    candidate_mae = task["candidate_validation_mae"]["catboost_reg"]["trajectory_mae"]
+    assert task["validation_mae"] == pytest.approx(candidate_mae, abs=1e-12)
+
+    store = ModelStore(str(result["db"]))
+    combo = store.get_combination(task["combination_id"])
+    store.close()
+    assert [m["weight"] for m in combo["members"]] == [1.0]
+
+    predictor = load_artifact(combo["artifact_path"])
+    assert predictor.linear_weights == [1.0]
+    assert predictor.interaction is None
+    assert predictor.required_feature_names == []
+    # 原样使用：给定成员轨迹，组合输出就等于它本身
+    probe = np.array([1.0, 2.0, 3.0])
+    np.testing.assert_allclose(
+        predictor.predict({predictor.member_ids[0]: probe}), probe, rtol=0, atol=0
+    )

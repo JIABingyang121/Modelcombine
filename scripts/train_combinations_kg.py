@@ -60,7 +60,10 @@ from src.eval.kg.data_io import _align_raw_to_pred
 from src.eval.kg.feedback import KGFeedbackStore, make_config_fingerprint
 from src.core.scenario_id import compute_scenario_id
 from src.models.artifacts import load_artifact, save_artifact
-from src.models.combination_predictor import COMBINATION_PREDICTOR_KEY
+from src.models.combination_predictor import (
+    COMBINATION_PREDICTOR_KEY,
+    CombinationPredictor,
+)
 from src.models.trajectory_forecast import (
     calendar_frame,
     future_timestamps,
@@ -1562,6 +1565,7 @@ def _build_library_task(
     # 标签完全没参与拟合，候选集合和被选组合也会随 test 分布改变。方案 §3.3.6 要求
     # test 只在冻结后评价，因此这里从结构上不给引擎任何 test 数据；冻结时刻本来
     # 也没有合法的未来窗口可用于估漂移。
+    y_val = dval["y"].to_numpy(dtype=float)
     candidates_by_members: Dict[Tuple[str, ...], Dict[str, Any]] = {}
     for size in range(1, len(safe_models) + 1):
         for members in itertools.combinations(safe_models, size):
@@ -1575,16 +1579,32 @@ def _build_library_task(
             )
             predictor = res[COMBINATION_PREDICTOR_KEY]
             effective = tuple(predictor.member_ids)
-            val_mae = float(res["val"]["mae"])
+            if len(effective) == 1:
+                # 只剩一个成员时就是"用这个模型"，不是"这个模型的加权组合"：
+                # 权重固定为 1、不带 interaction。让 Ridge 自由拟合单列系数得到的
+                # 是一个一般不等于 1 的缩放（实测两个装置上分别是 0.9993 和 1.0087，
+                # 两个方向都出现过），等于给单模型关系加了一个无理由的系统性偏置。
+                # 排名也用这份原样预测，保证选出来的和存下去的是同一个东西。
+                predictor = CombinationPredictor(
+                    member_ids=[effective[0]],
+                    linear_weights=[1.0],
+                    strategy=predictor.strategy,
+                    interaction=None,
+                )
+                val_prediction = dval[effective[0]].to_numpy(dtype=float)
+                val_mae = float(np.mean(np.abs(val_prediction - y_val)))
+            else:
+                val_prediction = np.asarray(
+                    res["_runtime_predictions"]["val"], dtype=float
+                )
+                val_mae = float(res["val"]["mae"])
             existing = candidates_by_members.get(effective)
             if existing is None or val_mae < existing["validation_mae"]:
                 candidates_by_members[effective] = {
                     "requested_members": list(members),
                     "validation_mae": val_mae,
                     "predictor": predictor,
-                    "val_prediction": np.asarray(
-                        res["_runtime_predictions"]["val"], dtype=float
-                    ),
+                    "val_prediction": val_prediction,
                 }
 
     # 排名目标是整条 validation 轨迹的 MAE；完全相同才按成员 ID 元组确定性排序。

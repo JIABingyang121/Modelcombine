@@ -135,7 +135,8 @@ def seed_models(db: Path, artifacts: Path, train: pd.DataFrame) -> None:
     ])
 
 
-def run_build(tmp_path: Path, forecast_steps: list[int], *, rows: int) -> dict:
+def run_build(tmp_path: Path, forecast_steps: list[int], *, rows: int,
+              candidates: list[str] | None = None) -> dict:
     """通过真实脚本入口建库，返回 (report, db, raw_root, artifacts)。"""
     raw_root = tmp_path / "features"
     artifacts = tmp_path / "artifacts"
@@ -150,7 +151,7 @@ def run_build(tmp_path: Path, forecast_steps: list[int], *, rows: int) -> dict:
             "--model-library",
             "--datasets", DATASET,
             "--forecast-steps", *[str(s) for s in forecast_steps],
-            "--candidates", *FIXTURE_CANDIDATES,
+            "--candidates", *(candidates or FIXTURE_CANDIDATES),
             "--raw-root", str(raw_root),
             "--out-root", str(out_root),
             "--database", str(db),
