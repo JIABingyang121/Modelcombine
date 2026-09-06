@@ -1,6 +1,6 @@
 """Stage 2 三基线质量门控（scripts/stage2_quality_gate.py）。
 
-这套评估代码要在**看到真实 Q1—Q3 真值之前**冻结，所以它必须先在合成数据上把
+这套评估代码要在**看到真实 T1—T3 真值之前**冻结，所以它必须先在合成数据上把
 以下几件事钉死：基线只由 S1—S3 决定、MASE 分母取训练段而不是查询窗口、门槛比较
 方向和边界严格按 §11.2、运行不完整时不产出任何结论。
 """
@@ -105,7 +105,7 @@ def stage2(tmp_path_factory):
 # --------------------------------------------------------------- 产出与契约
 def test_every_query_window_gets_all_four_methods(stage2):
     task = stage2["metrics"]["tasks"][0]
-    assert [q["window"] for q in task["queries"]] == ["Q1", "Q2", "Q3"]
+    assert [q["window"] for q in task["queries"]] == ["T1", "T2", "T3"]
 
     for query in task["queries"]:
         assert set(query["metrics"]) == set(METHODS)
@@ -120,7 +120,7 @@ def test_every_query_window_gets_all_four_methods(stage2):
         assert query["trace"]["selector_invoked"] is False
 
     predictions = stage2["out"] / "predictions"
-    for window in ("Q1", "Q2", "Q3"):
+    for window in ("T1", "T2", "T3"):
         frame = pd.read_csv(predictions / f"{DATASET}_s{STEPS}_{window}.csv")
         assert len(frame) == STEPS
         assert set(METHODS) <= set(frame.columns) and "y" in frame.columns
@@ -139,7 +139,7 @@ def test_frozen_constants_are_recorded_in_the_definition(stage2):
     assert frozen["thresholds"]["11.2.2_seasonal_naive_per_task_ratio_lt"] == 1.00
     assert frozen["thresholds"]["11.2.3_ridge_mean_ratio_le"] == 1.00
     assert stage2["definition"]["scenario_samples"] == ["S1", "S2", "S3"]
-    assert stage2["definition"]["query_windows"] == ["Q1", "Q2", "Q3"]
+    assert stage2["definition"]["test_windows"] == ["T1", "T2", "T3"]
 
 
 # ------------------------------------------------------- MASE 分母取训练段
@@ -149,7 +149,7 @@ def test_mase_denominator_comes_from_the_training_segment(stage2):
     raw["timestamp"] = pd.to_datetime(raw["timestamp"])
     plan = json.loads(stage2["built"]["window_plan"].read_text())
     h1 = next(
-        o for o in plan["datasets"][0]["feasibility"][str(STEPS)]["origins"]
+        o for o in plan["datasets"][0]["origins"]
         if o["label"] == "S1"
     )
     segment = raw[raw["timestamp"] < pd.Timestamp(h1["history_start"])]["load"].to_numpy(float)
@@ -168,8 +168,8 @@ def test_mase_denominator_comes_from_the_training_segment(stage2):
 
 
 # ----------------------------------------------- 基线只由 S1—S3 冻结，不看 Q
-def test_baselines_are_frozen_on_validation_and_ignore_query_windows(tmp_path):
-    """扰动 Q1—Q3 区段的真值：Best Single 的选择与 Ridge 的系数必须一字不变。
+def test_baselines_are_frozen_on_validation_and_ignore_test_windows(tmp_path):
+    """扰动 T1—T3 区段的真值：Best Single 的选择与 Ridge 的系数必须一字不变。
 
     这是 §8 公平性规则在 Stage 2 侧的对应保证——基线若被查询窗口影响，
     整个比较就不再是"未见窗口"。
@@ -180,14 +180,11 @@ def test_baselines_are_frozen_on_validation_and_ignore_query_windows(tmp_path):
     task_a = json.loads((out_a / "main_metrics.json").read_text())["tasks"][0]
 
     plan = json.loads(built["window_plan"].read_text())
-    q1 = next(
-        o for o in plan["datasets"][0]["feasibility"][str(STEPS)]["origins"]
-        if o["label"] == "Q1"
-    )
+    q1 = next(o for o in plan["datasets"][0]["origins"] if o["label"] == "T1")
     load_path = built["raw_root"] / DATASET / "load.csv"
     raw = pd.read_csv(load_path)
     raw["timestamp"] = pd.to_datetime(raw["timestamp"])
-    mask = raw["timestamp"] >= pd.Timestamp(q1["first_target"])
+    mask = raw["timestamp"] >= pd.Timestamp(q1["targets"][str(STEPS)]["first_target"])
     assert mask.any(), "扰动区间为空，断言无意义"
     raw.loc[mask, "load"] = raw.loc[mask, "load"] + 500.0
     raw.to_csv(load_path, index=False)
@@ -242,7 +239,7 @@ def _task(dataset, steps, *, mc, best_single, seasonal, ridge):
                 "trace": {"forecast_steps": steps, "n_rows": steps, "selector_invoked": False},
                 "metrics": {m: {"mae": v, "rmse": v, "mase": v} for m, v in metrics.items()},
             }
-            for w in ("Q1", "Q2", "Q3")
+            for w in ("T1", "T2", "T3")
         ],
     }
 

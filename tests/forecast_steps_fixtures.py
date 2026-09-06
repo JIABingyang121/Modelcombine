@@ -205,7 +205,7 @@ def run_predict(db: Path, scenario: Path, history: Path, output: Path):
 
 WINDOW_ROLES = (
     ("S1", "library"), ("S2", "library"), ("S3", "library"),
-    ("A", "audit"), ("Q1", "query"), ("Q2", "query"), ("Q3", "query"),
+    ("A", "audit"), ("T1", "test"), ("T2", "test"), ("T3", "test"),
 )
 
 
@@ -217,7 +217,7 @@ def write_frozen_window_plan(
     signature_window: int = 720,
     name: str = "frozen_windows.json",
 ) -> Path:
-    """写出原始序列 `<ds>/load.csv` 与 Stage 0 已冻结的 S1—S3/A/Q1—Q3 起点。
+    """写出原始序列 `<ds>/load.csv` 与 Stage 0 已冻结的 S1—S3/A/T1—T3 起点。
 
     末尾对齐排布，与 scripts/stage0_data_inventory.py 的 _proposed_origins 一致。
     """
@@ -226,25 +226,28 @@ def write_frozen_window_plan(
     series.to_csv(raw_root / DATASET / "load.csv", index=False)
 
     start = pd.Timestamp(series["timestamp"].iloc[0])
-    first_origin_offset = len(series) - len(WINDOW_ROLES) * forecast_steps - 1
+    stride = forecast_steps
+    first_origin_offset = len(series) - len(WINDOW_ROLES) * stride - 1
     origins = []
     for index, (label, role) in enumerate(WINDOW_ROLES):
-        origin = start + pd.Timedelta(hours=first_origin_offset + index * forecast_steps)
+        origin = start + pd.Timedelta(hours=first_origin_offset + index * stride)
         origins.append(
             {
                 "label": label,
                 "role": role,
                 "history_start": str(origin - pd.Timedelta(hours=signature_window - 1)),
+                "history_end": str(origin),
                 "forecast_origin": str(origin),
-                "first_target": str(origin + pd.Timedelta(hours=1)),
-                "last_target": str(origin + pd.Timedelta(hours=forecast_steps)),
+                "targets": {
+                    str(forecast_steps): {
+                        "forecast_steps": forecast_steps,
+                        "first_target": str(origin + pd.Timedelta(hours=1)),
+                        "last_target": str(origin + pd.Timedelta(hours=forecast_steps)),
+                    }
+                },
             }
         )
-    plan = {
-        "datasets": [
-            {"dataset": DATASET, "feasibility": {str(forecast_steps): {"origins": origins}}}
-        ]
-    }
+    plan = {"datasets": [{"dataset": DATASET, "origins": origins}]}
     path = raw_root.parent / name
     path.write_text(json.dumps(plan), encoding="utf-8")
     return path

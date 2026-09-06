@@ -51,7 +51,7 @@ def attribution(tmp_path_factory):
 
 def test_every_query_is_scored_against_all_three_history_relations(attribution):
     task = attribution["report"]["tasks"][0]
-    assert [q["window"] for q in task["queries"]] == ["Q1", "Q2", "Q3"]
+    assert [q["window"] for q in task["queries"]] == ["T1", "T2", "T3"]
     assert [r["window"] for r in task["history_relations"]] == ["S1", "S2", "S3"]
 
     for query in task["queries"]:

@@ -5,9 +5,9 @@
 每一条历史关系时的反事实 MAE：
 
 ```text
-Q1 × {S1, S2, S3} -> (相似度, 反事实 MAE)
-Q2 × {S1, S2, S3} -> (相似度, 反事实 MAE)
-Q3 × {S1, S2, S3} -> (相似度, 反事实 MAE)
+T1 × {S1, S2, S3} -> (相似度, 反事实 MAE)
+T2 × {S1, S2, S3} -> (相似度, 反事实 MAE)
+T3 × {S1, S2, S3} -> (相似度, 反事实 MAE)
 ```
 
 由此可以直接读出两种完全不同的失败模式：
@@ -40,7 +40,7 @@ from scripts.stage2_quality_gate import (
     BASELINE_BEST_SINGLE,
     BASELINE_SEASONAL_NAIVE,
     SCENARIO_SAMPLES,
-    QUERY_WINDOWS,
+    TEST_WINDOWS,
     Stage2Error,
     _candidate_matrix,
     _cross_check_library_report,
@@ -154,7 +154,7 @@ def attribute_task(
     columns = frozen["columns"]
 
     queries: List[Dict[str, Any]] = []
-    for label in QUERY_WINDOWS:
+    for label in TEST_WINDOWS:
         history, target = _window_slice(
             raw, windows[label], forecast_steps, label=f"{dataset} {label}"
         )

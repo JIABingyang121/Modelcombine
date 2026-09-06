@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Stage 2：三基线质量门控（方案 §7.1 基线、§9.1 指标、§11.2 第 1—3 条门槛）。
 
-在 Q1—Q3 三个未见查询窗口上，把 Modelcombine 的检索—重放结果与三个基础基线
+在 T1—T3 三个未见查询窗口上，把 Modelcombine 的检索—重放结果与三个基础基线
 逐点对比：
 
 ```text
@@ -12,7 +12,7 @@ Ridge Stacking          所有合格候选的固定 Ridge 融合，无场景检�
 ```
 
 **冻结声明**：本文件中的指标定义、基线定义、Ridge 超参与门槛数值都是预注册常量，
-在查看 Q1—Q3 真值之前写死。Stage 2 跑完之后不得回头调整这些常量、再在同一批 Q
+在查看 T1—T3 真值之前写死。Stage 2 跑完之后不得回头调整这些常量、再在同一批 T
 窗口上重新宣称通过（§12 Stage 4 的停止规则）。
 
 **任务集合必须恰好等于 3×3**：允许只跑一部分、或额外跑别的数据集/长度做诊断，但
@@ -61,10 +61,10 @@ from src.models.trajectory_forecast import (
 from src.storage.model_store import SUPPORTED_FORECAST_STEPS, ModelStore
 
 # ---------------------------------------------------------------- 预注册常量
-#: §6.2 的窗口角色。S1—S3 是 validation（基线在这里选定/拟合），Q1—Q3 是未见查询。
+#: §6.2 的窗口角色。S1—S3 是 validation（基线在这里选定/拟合），T1—T3 是未见查询。
 #: A 是建库阶段的审计窗口，Stage 2 完全不碰。
 SCENARIO_SAMPLES: Tuple[str, ...] = ("S1", "S2", "S3")
-QUERY_WINDOWS: Tuple[str, ...] = ("Q1", "Q2", "Q3")
+TEST_WINDOWS: Tuple[str, ...] = ("T1", "T2", "T3")
 
 #: §9.1：MASE 分母用训练段的 mean(|y_t - y_{t-168}|)，不用 test 上 Seasonal Naive
 #: 的 MAE 临时充当分母。"训练段"在这里冻结为：原始序列中严格早于 S1 历史窗口起点
@@ -409,7 +409,7 @@ def evaluate_task(
 
     columns = frozen["columns"]
     queries: List[Dict[str, Any]] = []
-    for label in QUERY_WINDOWS:
+    for label in TEST_WINDOWS:
         history, target = _window_slice(
             raw, windows[label], forecast_steps, label=f"{dataset} {label}"
         )
@@ -668,7 +668,7 @@ def main() -> int:
         "forecast_steps": list(args.forecast_steps),
         "declared_candidates": list(args.candidates),
         "scenario_samples": list(SCENARIO_SAMPLES),
-        "query_windows": list(QUERY_WINDOWS),
+        "test_windows": list(TEST_WINDOWS),
         "methods": list(METHODS),
         "frozen_constants": {
             "ridge_stacking_alpha": RIDGE_STACKING_ALPHA,

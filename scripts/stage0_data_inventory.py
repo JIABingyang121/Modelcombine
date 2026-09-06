@@ -4,14 +4,15 @@
 方案 §12 Stage 0：只读输出三个数据集的时间范围、频率、重复时间戳、缺失区间，
 确认能否容纳每个预测长度的 6 条不重叠轨迹；盘点后一次性写定具体日期。
 
-容量口径来自 §6.1 与 §6.2：
+容量与窗口口径：
 - 每个预测起点之前必须有完整的 ``signature_window`` 小时真实历史（默认 720）；
-- 每条轨迹覆盖 ``forecast_steps`` 小时目标，相邻起点至少间隔 ``forecast_steps``
-  小时，使目标区间互不重叠；
-- 窗口序列固定为 ``S1,S2,S3,A,Q1,Q2,Q3``（§6.2/§6.3）：S1—S3 建三条历史关系，
-  A 是三条关系共用的冻结后审计窗口（不参与成员/权重/阈值/路由选择），
-  Q1—Q3 是未见查询窗口；
-- 因此需要一段连续的 ``signature_window + 7 * forecast_steps`` 小时数据。
+- **同一个起点同时产生 H1=24、H2=168、H3=720**：三种长度共享同一份输入历史与
+  同一个 ``forecast_origin``，短长度的目标区间是长长度的前缀；
+- 因此窗口按**最长长度 720** 排布，相邻起点间隔 720 小时，使 720 步目标互不重叠；
+- 窗口序列固定为 ``S1,S2,S3,A,T1,T2,T3``：S1—S3 建三条历史关系，A 是三条关系共用的
+  冻结后审计窗口（不参与成员/权重/阈值/路由选择），T1—T3 是最终未见测试窗口；
+- 因此需要一段连续的 ``signature_window + 7 * 720`` 小时数据，与本次请求了哪几种
+  预测长度无关。
 
 数据集装不下预设窗口时**停止并报告**（非零退出），不压缩该数据集窗口后继续
 声称同口径。本脚本不写任何数据文件，只写一份盘点 JSON。
@@ -22,7 +23,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 import pandas as pd
 
@@ -32,16 +33,21 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.storage.model_store import SUPPORTED_FORECAST_STEPS
 
-#: §6.2 的窗口序列与各自角色。顺序即时间顺序，不可重排。
+#: 窗口序列与各自角色。顺序即时间顺序，不可重排。
 WINDOW_ROLES: tuple[tuple[str, str], ...] = (
     ("S1", "library"),
     ("S2", "library"),
     ("S3", "library"),
     ("A", "audit"),
-    ("Q1", "query"),
-    ("Q2", "query"),
-    ("Q3", "query"),
+    ("T1", "test"),
+    ("T2", "test"),
+    ("T3", "test"),
 )
+
+#: 预测长度的可读别名。H1/H2/H3 只表示长度，历史数据样例一律叫 S1/S2/S3。
+FORECAST_HORIZONS: Dict[str, int] = {"H1": 24, "H2": 168, "H3": 720}
+#: 窗口按最长长度排布，容量判据与请求了哪几种长度无关。
+WINDOW_STRIDE_HOURS = max(FORECAST_HORIZONS.values())
 
 SPLITS = ("train", "val", "test")
 TARGET = "load"
@@ -109,19 +115,20 @@ def _proposed_origins(
     run_start: pd.Timestamp,
     run_hours: int,
     *,
-    forecast_steps: int,
+    forecast_steps: Sequence[int],
     signature_window: int,
     trajectories: int,
 ) -> List[Dict[str, Any]]:
-    """在连续段内自末尾向前排布 ``trajectories`` 条互不重叠的轨迹。
+    """在连续段内自末尾向前排布 ``trajectories`` 个共享预测起点。
 
-    末尾对齐：最后一条轨迹的目标区间贴着可用数据的末端，越靠近现在越有代表性。
+    每个起点给出一份 720 小时输入历史，以及三种预测长度各自的目标区间——它们从
+    同一个起点截取不同长度的前缀。末尾对齐：最后一个窗口的 720 步目标贴着可用
+    数据的末端，越靠近现在越有代表性。
     """
-    needed = signature_window + trajectories * forecast_steps
-    first_origin_offset = run_hours - trajectories * forecast_steps
+    first_origin_offset = run_hours - trajectories * WINDOW_STRIDE_HOURS
     origins = []
     for index in range(trajectories):
-        origin_offset = first_origin_offset + index * forecast_steps
+        origin_offset = first_origin_offset + index * WINDOW_STRIDE_HOURS
         origin = run_start + pd.Timedelta(hours=origin_offset - 1)
         label, role = (
             WINDOW_ROLES[index] if index < len(WINDOW_ROLES) else (f"W{index + 1}", "extra")
@@ -130,13 +137,19 @@ def _proposed_origins(
             {
                 "label": label,
                 "role": role,
-                "forecast_origin": str(origin),
-                "first_target": str(origin + STEP),
-                "last_target": str(origin + pd.Timedelta(hours=forecast_steps)),
                 "history_start": str(origin - pd.Timedelta(hours=signature_window - 1)),
+                "history_end": str(origin),
+                "forecast_origin": str(origin),
+                "targets": {
+                    str(steps): {
+                        "forecast_steps": int(steps),
+                        "first_target": str(origin + STEP),
+                        "last_target": str(origin + pd.Timedelta(hours=int(steps))),
+                    }
+                    for steps in sorted(forecast_steps)
+                },
             }
         )
-    assert needed <= run_hours
     return origins
 
 
@@ -153,7 +166,6 @@ def inventory_dataset(
     root = raw_root / dataset
     if not root.exists():
         record["issues"].append(f"数据目录不存在: {root}")
-        record["feasibility"] = {}
         return record
 
     frames = []
@@ -176,7 +188,6 @@ def inventory_dataset(
         frames.append(frame)
 
     if not frames:
-        record["feasibility"] = {}
         return record
 
     union = (
@@ -204,30 +215,25 @@ def inventory_dataset(
         "longest_contiguous_run": run,
     }
 
-    feasibility = {}
-    for steps in forecast_steps:
-        needed = signature_window + trajectories * steps
-        fits = run["hours"] >= needed
-        entry: Dict[str, Any] = {
-            "required_contiguous_hours": needed,
-            "available_contiguous_hours": run["hours"],
-            "fits": bool(fits),
-        }
-        if fits:
-            entry["origins"] = _proposed_origins(
-                pd.Timestamp(run["start"]), run["hours"],
-                forecast_steps=steps,
-                signature_window=signature_window,
-                trajectories=trajectories,
-            )
-        else:
-            entry["shortfall_hours"] = int(needed - run["hours"])
-            record["issues"].append(
-                f"forecast_steps={steps}: 最长连续段 {run['hours']} 小时 < 需要的 {needed} 小时"
-                f"（缺 {needed - run['hours']} 小时）"
-            )
-        feasibility[str(steps)] = entry
-    record["feasibility"] = feasibility
+    # 起点由最长长度决定，一套共享给全部预测长度
+    needed = signature_window + trajectories * WINDOW_STRIDE_HOURS
+    fits = run["hours"] >= needed
+    record["required_contiguous_hours"] = needed
+    record["available_contiguous_hours"] = run["hours"]
+    record["fits"] = bool(fits)
+    if fits:
+        record["origins"] = _proposed_origins(
+            pd.Timestamp(run["start"]), run["hours"],
+            forecast_steps=forecast_steps,
+            signature_window=signature_window,
+            trajectories=trajectories,
+        )
+    else:
+        record["shortfall_hours"] = int(needed - run["hours"])
+        record["issues"].append(
+            f"最长连续段 {run['hours']} 小时 < 需要的 {needed} 小时"
+            f"（缺 {needed - run['hours']} 小时）"
+        )
     return record
 
 
@@ -244,7 +250,7 @@ def main() -> int:
                         help="预测起点之前必须具备的真实历史小时数（§6.1）")
     parser.add_argument("--trajectories", type=int, default=len(WINDOW_ROLES),
                         help="每个数据集×预测长度需要的不重叠轨迹条数"
-                             "（§6.2：S1,S2,S3,A,Q1,Q2,Q3 共 7 条）")
+                             "（§6.2：S1,S2,S3,A,T1,T2,T3 共 7 条）")
     parser.add_argument("--out", type=Path, default=Path("reports/stage0/data_inventory.json"))
     args = parser.parse_args()
 
@@ -255,6 +261,8 @@ def main() -> int:
         "signature_window": args.signature_window,
         "trajectories": args.trajectories,
         "forecast_steps": list(args.forecast_steps),
+        "forecast_horizons": dict(FORECAST_HORIZONS),
+        "windows": [label for label, _role in WINDOW_ROLES],
         "layout": args.layout,
         "datasets": [],
     }
@@ -287,11 +295,11 @@ def main() -> int:
                   f"，{union['rows']} 行，重复 {union['duplicate_timestamps']}，"
                   f"缺口 {union['gap_count']}，最长连续段 "
                   f"{union['longest_contiguous_run']['hours']} 小时")
-        for steps, info in (entry.get("feasibility") or {}).items():
-            mark = "OK" if info["fits"] else "不足"
-            print(f"           forecast_steps={steps}: {mark}"
-                  f"（需要 {info['required_contiguous_hours']}，可用 "
-                  f"{info['available_contiguous_hours']}）")
+        if "fits" in entry:
+            mark = "OK" if entry["fits"] else "不足"
+            print(f"           共享起点容量: {mark}"
+                  f"（需要 {entry['required_contiguous_hours']}，可用 "
+                  f"{entry['available_contiguous_hours']}）")
         for issue in entry["issues"]:
             print(f"           ！{entry['dataset']}: {issue}")
     print(f"\n[stage0] 盘点已保存: {out}")

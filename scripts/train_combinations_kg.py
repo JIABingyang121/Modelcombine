@@ -1384,11 +1384,22 @@ def _library_raw_frame(raw_root: Path, dataset: str) -> pd.DataFrame:
 
 
 def _frozen_windows(window_plan: Path, dataset: str, forecast_steps: int) -> Dict[str, Dict[str, Any]]:
-    """读取 Stage 0 冻结的一个数据集、一个预测长度的七个预测窗口。"""
+    """读取 Stage 0 冻结的七个共享预测窗口，并取出该长度的目标区间。
+
+    七个窗口的输入历史与预测起点由所有预测长度共享；``forecast_steps`` 只决定从
+    同一个起点截取多长的目标前缀。
+    """
     plan = json.loads(window_plan.read_text(encoding="utf-8"))
     dataset_entry = next(entry for entry in plan["datasets"] if entry["dataset"] == dataset)
-    origins = dataset_entry["feasibility"][str(forecast_steps)]["origins"]
-    return {entry["label"]: entry for entry in origins}
+    windows = {}
+    for origin in dataset_entry["origins"]:
+        target = origin["targets"][str(forecast_steps)]
+        windows[origin["label"]] = {
+            **{k: v for k, v in origin.items() if k != "targets"},
+            "first_target": target["first_target"],
+            "last_target": target["last_target"],
+        }
+    return windows
 
 
 def _scenario_sample_frame(

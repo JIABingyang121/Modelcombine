@@ -93,7 +93,7 @@ def _run_library(tmp_path: Path, raw_root: Path, db: Path, out_root: Path):
 
 
 def test_window_plan_builds_three_relations_against_one_shared_audit_window(tmp_path):
-    """Stage 1：S1—S3 分别建库，共用 A；Q1—Q3 尚不进入建库。"""
+    """Stage 1：S1—S3 分别建库，共用 A；T1—T3 尚不进入建库。"""
     raw_root = tmp_path / "raw"
     artifacts = tmp_path / "artifacts"
     db = tmp_path / "lib.sqlite3"
