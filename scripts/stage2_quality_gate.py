@@ -15,6 +15,10 @@ Ridge Stacking          所有合格候选的固定 Ridge 融合，无场景检�
 在查看 Q1—Q3 真值之前写死。Stage 2 跑完之后不得回头调整这些常量、再在同一批 Q
 窗口上重新宣称通过（§12 Stage 4 的停止规则）。
 
+**不完整实验不产出通过结论**：允许只跑一部分数据集/长度做诊断，但只要 3 数据集 ×
+3 预测长度这 9 个格子没齐，覆盖度规则就不通过，逐长度的"等权平均"也一律判不通过——
+不存在用子集拿到 passed=true 的路径。
+
 退出码：0=全部门槛通过；2=运行完整但门槛未通过（按 §12 停止，不进 Stage 3）；
 1=运行不完整（数据缺失、窗口产不出轨迹等），此时不产出结论。
 """
@@ -44,8 +48,10 @@ from scripts.train_combinations_kg import (
     _library_candidate_models,
     _library_raw_frame,
 )
+from src.models.artifacts import load_artifact
 from src.models.trajectory_forecast import (
     TrajectoryForecastError,
+    calendar_frame,
     generate_member_trajectory,
     generate_trajectory_matrix,
 )
@@ -72,6 +78,14 @@ MASE_SEASONAL_PERIOD = 168
 #: 本身会压低劣质列的权重，这正是静态 stacking 该做的事。
 RIDGE_STACKING_ALPHA = 1.0
 RIDGE_STACKING_FIT_INTERCEPT = True
+
+#: §11.1.4：离线冻结轨迹与保存后在线重放必须逐值一致。
+REPLAY_TOLERANCE = 1e-8
+
+#: §5：核心任务是 3 数据集 × 3 预测长度 = 9 个任务。少一个格子，"等权平均"就不是
+#: 方案定义的那个口径，任何"通过"结论都不成立。
+REQUIRED_DATASETS: Tuple[str, ...] = ("pjm", "aemo_vic", "aemo_nsw")
+REQUIRED_FORECAST_STEPS: Tuple[int, ...] = (24, 168, 720)
 
 METHOD_MODELCOMBINE = "modelcombine"
 BASELINE_SEASONAL_NAIVE = "seasonal_naive_168"
@@ -234,27 +248,48 @@ def _cross_check_library_report(
     *,
     dataset: str,
     forecast_steps: int,
+    declared_candidates: Sequence[str],
     validation_window_mae: Mapping[str, Mapping[str, float]],
-    tolerance: float = 1e-8,
+    tolerance: float = REPLAY_TOLERANCE,
 ) -> None:
-    """Stage 2 重算的 validation 轨迹必须与建库当时用的是同一批。
+    """Stage 2 必须和建库是同一批：同样的三个历史窗口、同样的候选集合、同样的
+    validation 轨迹。
 
-    对不上就说明窗口计划、模型库或候选集合与建库时不一致，此时任何门槛结论都没有
-    意义，直接失败而不是继续算。
+    任何一项对不上都说明窗口计划、模型库或候选集合与建库时不一致，此时门槛结论没有
+    意义，直接判运行不完整，而不是继续算。
     """
     tasks = [
         task for task in report.get("tasks", [])
         if task.get("dataset") == dataset
         and int(task.get("forecast_steps", -1)) == int(forecast_steps)
-        and task.get("library_window") in validation_window_mae
     ]
     if not tasks:
         raise Stage2Error(
-            f"{dataset} forecast_steps={forecast_steps}: 建库报告里找不到 H1—H3 任务，"
+            f"{dataset} forecast_steps={forecast_steps}: 建库报告里找不到对应任务，"
             "无法核对 Stage 2 与建库是否同一批 validation"
         )
+
+    windows = [task.get("library_window") for task in tasks]
+    if sorted(w for w in windows if w is not None) != sorted(LIBRARY_WINDOWS):
+        raise Stage2Error(
+            f"{dataset} forecast_steps={forecast_steps}: 建库报告的历史窗口是 {windows}，"
+            f"要求恰好各一条 {list(LIBRARY_WINDOWS)}——关系不齐或有重复批次，不能用于门槛判定"
+        )
+
+    expected_candidates = sorted(set(declared_candidates))
+    for task in tasks:
+        recorded_candidates = sorted(set(task.get("declared_candidates") or []))
+        if recorded_candidates != expected_candidates:
+            raise Stage2Error(
+                f"{dataset} {task['library_window']}: 建库声明的候选是 {recorded_candidates}，"
+                f"Stage 2 传入的是 {expected_candidates}——基线与建库不是同一批候选"
+            )
     for task in tasks:
         label = task["library_window"]
+        if label not in validation_window_mae:
+            raise Stage2Error(
+                f"{dataset} {label}: Stage 2 没有重算这个历史窗口的 validation 轨迹"
+            )
         recorded = task.get("candidate_validation_mae") or {}
         recomputed = validation_window_mae[label]
         for model_type, scores in recorded.items():
@@ -271,6 +306,32 @@ def _cross_check_library_report(
 
 
 # ------------------------------------------------------------------ 在线检索
+def _offline_replay(
+    trace: Mapping[str, Any],
+    matrix: pd.DataFrame,
+    timestamps: Sequence[Any],
+    country: str,
+    *,
+    label: str,
+) -> np.ndarray:
+    """用命中关系的已保存组合器，在本窗口独立重算一遍最终预测。
+
+    §11.1.4 的门槛对象：这条轨迹与在线输出必须逐值一致。它独立地加载组合器产物、
+    独立地取成员轨迹并按保存的权重融合，因此在线侧一旦用错成员、权重、成员顺序或
+    interaction 的特征表，都会在这里暴露。
+    """
+    predictor = load_artifact(Path(trace["artifact_paths"]["combination"]))
+    missing = [m for m in predictor.member_ids if m not in matrix.columns]
+    if missing:
+        raise Stage2Error(
+            f"{label}: 命中关系的成员 {missing} 不在本窗口的候选轨迹矩阵里，无法做离线重放"
+        )
+    base = {m: matrix[m].to_numpy(dtype=float) for m in predictor.member_ids}
+    return np.asarray(
+        predictor.predict(base, calendar_frame(timestamps, country)), dtype=float
+    )
+
+
 def _modelcombine_prediction(
     *, database: Path, dataset: str, forecast_steps: int, history: pd.DataFrame, workdir: Path,
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
@@ -339,6 +400,7 @@ def evaluate_task(
     )
     _cross_check_library_report(
         library_report, dataset=dataset, forecast_steps=forecast_steps,
+        declared_candidates=declared_candidates,
         validation_window_mae=frozen["validation_window_mae"],
     )
 
@@ -364,6 +426,13 @@ def evaluate_task(
             model=None, model_type="seasonal_naive", required_features=[],
             history=history, forecast_steps=forecast_steps, country=country,
         )
+        # §11.1.4：在线输出必须与离线重放逐值一致
+        replay = _offline_replay(
+            trace, matrix, target["timestamp"], country,
+            label=f"{dataset} {label}",
+        )
+        replay_error = float(np.max(np.abs(replay - yhat_mc))) if len(replay) else float("inf")
+
         predictions = {
             METHOD_MODELCOMBINE: yhat_mc,
             BASELINE_SEASONAL_NAIVE: seasonal,
@@ -391,11 +460,13 @@ def evaluate_task(
                 "trace": {
                     "scenario_id": trace["scenario_id"],
                     "relation_id": trace["relation_id"],
+                    "combination_id": trace["combination_id"],
                     "selector_invoked": trace["selector_invoked"],
                     "forecast_steps": trace["forecast_steps"],
                     "n_rows": trace["n_rows"],
                     "member_types": trace["member_types"],
                 },
+                "replay_max_abs_error": replay_error,
                 "metrics": {
                     method: {
                         "mae": mae(y, values),
@@ -444,22 +515,37 @@ def _ratio(task: Mapping[str, Any], baseline: str) -> float:
 
 
 def evaluate_gates(tasks: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
-    """§11.2 第 1—3 条，逐 forecast_steps 判定。"""
+    """§11.2 第 1—3 条，逐 forecast_steps 判定；外加覆盖度与 §11.1 功能门槛。"""
     by_steps: Dict[int, List[Mapping[str, Any]]] = {}
     for task in tasks:
         by_steps.setdefault(int(task["forecast_steps"]), []).append(task)
 
-    rules: List[Dict[str, Any]] = []
+    # 覆盖度：少一个格子就不是方案定义的 3×3 口径，任何"通过"都不成立
+    present = {(t["dataset"], int(t["forecast_steps"])) for t in tasks}
+    expected = {(d, s) for d in REQUIRED_DATASETS for s in REQUIRED_FORECAST_STEPS}
+    missing = sorted(expected - present)
+    rules: List[Dict[str, Any]] = [{
+        "rule": "coverage",
+        "description": "核心任务必须是完整的 3 数据集 × 3 预测长度 = 9 个任务",
+        "expected_tasks": len(expected), "present_tasks": len(present & expected),
+        "missing_tasks": [{"dataset": d, "forecast_steps": s} for d, s in missing],
+        "extra_tasks": [
+            {"dataset": d, "forecast_steps": s} for d, s in sorted(present - expected)
+        ],
+        "passed": not missing,
+    }]
     for steps in sorted(by_steps):
         group = by_steps[steps]
         bs_ratios = {t["dataset"]: _ratio(t, BASELINE_BEST_SINGLE) for t in group}
         bs_mean = float(np.mean(list(bs_ratios.values())))
+        # 等权平均只有在三个数据集齐全时才是方案定义的口径
+        complete = set(bs_ratios) >= set(REQUIRED_DATASETS)
         rules.append({
             "rule": "11.2.1a", "forecast_steps": steps,
             "description": "相对 Validation Best Single：三数据集等权平均 MAE 比值 < 1.00",
             "value": bs_mean, "threshold": THRESHOLD_BEST_SINGLE_MEAN_RATIO,
-            "comparison": "<", "per_dataset": bs_ratios,
-            "passed": bool(bs_mean < THRESHOLD_BEST_SINGLE_MEAN_RATIO),
+            "comparison": "<", "per_dataset": bs_ratios, "datasets_complete": complete,
+            "passed": bool(complete and bs_mean < THRESHOLD_BEST_SINGLE_MEAN_RATIO),
         })
         worst_dataset = max(bs_ratios, key=bs_ratios.get) if bs_ratios else None
         rules.append({
@@ -468,9 +554,10 @@ def evaluate_gates(tasks: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
             "value": bs_ratios[worst_dataset] if worst_dataset else None,
             "threshold": THRESHOLD_BEST_SINGLE_PER_DATASET_RATIO,
             "comparison": "<=", "worst_dataset": worst_dataset, "per_dataset": bs_ratios,
-            "passed": all(
+            "datasets_complete": complete,
+            "passed": bool(complete and all(
                 r <= THRESHOLD_BEST_SINGLE_PER_DATASET_RATIO for r in bs_ratios.values()
-            ),
+            )),
         })
         sn_ratios = {t["dataset"]: _ratio(t, BASELINE_SEASONAL_NAIVE) for t in group}
         rules.append({
@@ -478,10 +565,10 @@ def evaluate_gates(tasks: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
             "description": "相对 Seasonal Naive (168)：每个数据集×长度任务比值 < 1.00",
             "value": max(sn_ratios.values()) if sn_ratios else None,
             "threshold": THRESHOLD_SEASONAL_NAIVE_PER_TASK_RATIO,
-            "comparison": "<", "per_dataset": sn_ratios,
-            "passed": all(
+            "comparison": "<", "per_dataset": sn_ratios, "datasets_complete": complete,
+            "passed": bool(complete and all(
                 r < THRESHOLD_SEASONAL_NAIVE_PER_TASK_RATIO for r in sn_ratios.values()
-            ),
+            )),
         })
         ridge_ratios = {t["dataset"]: _ratio(t, BASELINE_RIDGE) for t in group}
         ridge_mean = float(np.mean(list(ridge_ratios.values())))
@@ -489,24 +576,32 @@ def evaluate_gates(tasks: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
             "rule": "11.2.3", "forecast_steps": steps,
             "description": "相对 Ridge Stacking：该长度的等权平均 MAE 比值 <= 1.00",
             "value": ridge_mean, "threshold": THRESHOLD_RIDGE_MEAN_RATIO,
-            "comparison": "<=", "per_dataset": ridge_ratios,
-            "passed": bool(ridge_mean <= THRESHOLD_RIDGE_MEAN_RATIO),
+            "comparison": "<=", "per_dataset": ridge_ratios, "datasets_complete": complete,
+            "passed": bool(complete and ridge_mean <= THRESHOLD_RIDGE_MEAN_RATIO),
         })
 
-    functional = [
-        {
-            "rule": "11.1.2/11.1.3", "dataset": task["dataset"],
-            "forecast_steps": task["forecast_steps"], "window": query["window"],
-            "description": "输出行数=请求长度=trace 长度，且 selector_invoked=false",
-            "passed": bool(
-                query["n_rows"] == task["forecast_steps"]
-                and query["trace"]["forecast_steps"] == task["forecast_steps"]
-                and query["trace"]["n_rows"] == task["forecast_steps"]
-                and query["trace"]["selector_invoked"] is False
-            ),
-        }
-        for task in tasks for query in task["queries"]
-    ]
+    functional = []
+    for task in tasks:
+        for query in task["queries"]:
+            functional.append({
+                "rule": "11.1.2/11.1.3", "dataset": task["dataset"],
+                "forecast_steps": task["forecast_steps"], "window": query["window"],
+                "description": "输出行数=请求长度=trace 长度，且 selector_invoked=false",
+                "passed": bool(
+                    query["n_rows"] == task["forecast_steps"]
+                    and query["trace"]["forecast_steps"] == task["forecast_steps"]
+                    and query["trace"]["n_rows"] == task["forecast_steps"]
+                    and query["trace"]["selector_invoked"] is False
+                ),
+            })
+            functional.append({
+                "rule": "11.1.4", "dataset": task["dataset"],
+                "forecast_steps": task["forecast_steps"], "window": query["window"],
+                "description": "在线输出与离线冻结组合器重放逐值一致（<= 1e-8）",
+                "value": query["replay_max_abs_error"], "threshold": REPLAY_TOLERANCE,
+                "comparison": "<=",
+                "passed": bool(query["replay_max_abs_error"] <= REPLAY_TOLERANCE),
+            })
     all_rules = rules + functional
     return {
         "rules": all_rules,
@@ -551,6 +646,9 @@ def main() -> int:
             "ridge_stacking_alpha": RIDGE_STACKING_ALPHA,
             "ridge_stacking_fit_intercept": RIDGE_STACKING_FIT_INTERCEPT,
             "mase_seasonal_period": MASE_SEASONAL_PERIOD,
+            "replay_tolerance": REPLAY_TOLERANCE,
+            "required_datasets": list(REQUIRED_DATASETS),
+            "required_forecast_steps": list(REQUIRED_FORECAST_STEPS),
             "mase_train_segment": "原始序列中严格早于 H1 history_start 的全部数据",
             "mean_ratio_definition": "逐数据集比值的等权平均（不是先平均 MAE 再相除）",
             "qualified_candidates_definition":
@@ -605,8 +703,17 @@ def main() -> int:
         metrics = task["task_metrics"]
         print(f"[stage2] {task['dataset']} s={task['forecast_steps']}: "
               + "，".join(f"{m} MAE={metrics[m]['mae']:.4f}" for m in METHODS))
+    coverage = next(r for r in acceptance["rules"] if r["rule"] == "coverage")
+    if not coverage["passed"]:
+        print(f"[stage2] 覆盖度不足：缺少 {coverage['missing_tasks']}；"
+              "这不是完整的 3×3 口径，所有等权平均门槛一律判不通过。")
     for rule in acceptance["rules"]:
-        if "value" in rule and rule["value"] is not None:
+        if rule["rule"] == "11.1.4" and not rule["passed"]:
+            print(f"[stage2] {rule['dataset']} s={rule['forecast_steps']} "
+                  f"{rule['window']}: 在线输出与离线重放最大逐值误差 "
+                  f"{rule['value']:.3e} > {REPLAY_TOLERANCE:g}")
+    for rule in acceptance["rules"]:
+        if rule["rule"].startswith("11.2") and rule.get("value") is not None:
             print(f"[stage2] {rule['rule']} s={rule.get('forecast_steps')}: "
                   f"{rule['value']:.4f} {rule['comparison']} {rule['threshold']} -> "
                   f"{'通过' if rule['passed'] else '未通过'}")

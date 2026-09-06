@@ -17,6 +17,9 @@ import pytest
 
 from scripts.stage2_quality_gate import (
     BASELINE_BEST_SINGLE,
+    REPLAY_TOLERANCE,
+    REQUIRED_DATASETS,
+    REQUIRED_FORECAST_STEPS,
     BASELINE_RIDGE,
     BASELINE_SEASONAL_NAIVE,
     EXIT_GATE_FAILED,
@@ -67,7 +70,8 @@ def _build_stage1(tmp_path: Path):
     }
 
 
-def _run_stage2(tmp_path: Path, built: dict, *, out_name="stage2", library_report=None):
+def _run_stage2(tmp_path: Path, built: dict, *, out_name="stage2", library_report=None,
+                candidates=None):
     out = tmp_path / out_name
     proc = subprocess.run(
         [
@@ -76,7 +80,7 @@ def _run_stage2(tmp_path: Path, built: dict, *, out_name="stage2", library_repor
             "--window-plan", str(built["window_plan"]),
             "--library-report", str(library_report or built["library_report"]),
             "--datasets", DATASET, "--forecast-steps", str(STEPS),
-            "--candidates", *FIXTURE_CANDIDATES,
+            "--candidates", *(candidates or FIXTURE_CANDIDATES),
             "--out", str(out),
         ],
         cwd=REPO_ROOT, capture_output=True, text=True,
@@ -234,13 +238,25 @@ def _task(dataset, steps, *, mc, best_single, seasonal, ridge):
         "task_metrics": {m: {"mae": v, "rmse": v, "mase": v} for m, v in metrics.items()},
         "queries": [
             {
-                "window": w, "n_rows": steps,
+                "window": w, "n_rows": steps, "replay_max_abs_error": 0.0,
                 "trace": {"forecast_steps": steps, "n_rows": steps, "selector_invoked": False},
                 "metrics": {m: {"mae": v, "rmse": v, "mase": v} for m, v in metrics.items()},
             }
             for w in ("Q1", "Q2", "Q3")
         ],
     }
+
+
+def _full_grid(**kwargs):
+    """完整 3 数据集 × 3 长度，用于隔离"覆盖度"之外的规则。"""
+    return [
+        _task(dataset, steps, **kwargs)
+        for steps in REQUIRED_FORECAST_STEPS for dataset in REQUIRED_DATASETS
+    ]
+
+
+def _rule_by_name(acceptance, name):
+    return next(r for r in acceptance["rules"] if r["rule"] == name)
 
 
 def _rule(acceptance, name, steps):
@@ -252,11 +268,9 @@ def _rule(acceptance, name, steps):
 
 def test_ratio_exactly_one_fails_strict_rules_and_passes_non_strict():
     """§11.2 的比较方向必须严格区分：1a/2 是 `<`，1b/3 是 `<=`。"""
-    tasks = [
-        _task(ds, 24, mc=100.0, best_single=100.0, seasonal=100.0, ridge=100.0)
-        for ds in ("pjm", "aemo_vic", "aemo_nsw")
-    ]
-    acceptance = evaluate_gates(tasks)
+    acceptance = evaluate_gates(
+        _full_grid(mc=100.0, best_single=100.0, seasonal=100.0, ridge=100.0)
+    )
 
     assert _rule(acceptance, "11.2.1a", 24)["passed"] is False   # 1.00 < 1.00 不成立
     assert _rule(acceptance, "11.2.2", 24)["passed"] is False    # 1.00 < 1.00 不成立
@@ -271,7 +285,8 @@ def test_mean_ratio_is_equal_weight_over_datasets_not_over_pooled_mae():
     这里 PJM 的比值 1.02、两个 AEMO 的比值各 0.80，逐数据集等权平均 = 0.874 < 1.00
     应当通过；若改成先平均 MAE 再相除则约 1.019，会被 PJM 拖成不通过。
     """
-    tasks = [
+    tasks = _full_grid(mc=1.0, best_single=1.0, seasonal=1e9, ridge=1e9)
+    tasks = [t for t in tasks if t["forecast_steps"] != 168] + [
         _task("pjm", 168, mc=30600.0, best_single=30000.0, seasonal=1e9, ridge=1e9),
         _task("aemo_vic", 168, mc=320.0, best_single=400.0, seasonal=1e9, ridge=1e9),
         _task("aemo_nsw", 168, mc=400.0, best_single=500.0, seasonal=1e9, ridge=1e9),
@@ -285,7 +300,8 @@ def test_mean_ratio_is_equal_weight_over_datasets_not_over_pooled_mae():
 
 
 def test_per_dataset_rule_fails_when_a_single_dataset_exceeds_tolerance():
-    tasks = [
+    tasks = [t for t in _full_grid(mc=1.0, best_single=1.0, seasonal=1e9, ridge=1e9)
+             if t["forecast_steps"] != 720] + [
         _task("pjm", 720, mc=104.0, best_single=100.0, seasonal=1e9, ridge=1e9),  # 1.04
         _task("aemo_vic", 720, mc=80.0, best_single=100.0, seasonal=1e9, ridge=1e9),
         _task("aemo_nsw", 720, mc=80.0, best_single=100.0, seasonal=1e9, ridge=1e9),
@@ -299,7 +315,8 @@ def test_per_dataset_rule_fails_when_a_single_dataset_exceeds_tolerance():
 
 def test_seasonal_naive_rule_is_judged_per_task_not_on_average():
     """§11.2 第 2 条是 9 个任务逐个判定，一个任务输了就不通过。"""
-    tasks = [
+    tasks = [t for t in _full_grid(mc=1.0, best_single=1e9, seasonal=1e9, ridge=1e9)
+             if t["forecast_steps"] != 24] + [
         _task("pjm", 24, mc=50.0, best_single=1e9, seasonal=100.0, ridge=1e9),
         _task("aemo_vic", 24, mc=50.0, best_single=1e9, seasonal=100.0, ridge=1e9),
         _task("aemo_nsw", 24, mc=101.0, best_single=1e9, seasonal=100.0, ridge=1e9),
@@ -320,3 +337,111 @@ def test_functional_gate_catches_wrong_row_count_or_invoked_selector():
     functional = [r for r in acceptance["rules"] if r["rule"] == "11.1.2/11.1.3"]
     assert [r["passed"] for r in functional] == [False, False, True]
     assert acceptance["passed"] is False
+
+
+# ------------------------------------------- 缺口 1：离线—在线逐值一致性门槛
+def test_online_output_matches_offline_replay_value_by_value(stage2):
+    """§11.1.4：在线输出必须与离线冻结组合器的重放逐值一致。"""
+    task = stage2["metrics"]["tasks"][0]
+    for query in task["queries"]:
+        assert query["replay_max_abs_error"] <= REPLAY_TOLERANCE, query
+
+    rules = [r for r in stage2["acceptance"]["rules"] if r["rule"] == "11.1.4"]
+    assert len(rules) == len(task["queries"])
+    assert all(r["passed"] for r in rules)
+    assert all(r["threshold"] == REPLAY_TOLERANCE for r in rules)
+
+
+def test_replay_mismatch_fails_the_gate():
+    """重放对不上时必须判不通过，而不是只报长度和 selector_invoked 正常。"""
+    tasks = _full_grid(mc=1.0, best_single=2.0, seasonal=2.0, ridge=2.0)
+    tasks[0]["queries"][1]["replay_max_abs_error"] = 1e-6  # 超过 1e-8
+
+    acceptance = evaluate_gates(tasks)
+
+    failed = [r for r in acceptance["failed_rules"] if r["rule"] == "11.1.4"]
+    assert len(failed) == 1
+    assert failed[0]["value"] == 1e-6
+    # 长度/selector 那条仍然通过，说明新门槛确实是独立的一条
+    assert all(r["passed"] for r in acceptance["rules"] if r["rule"] == "11.1.2/11.1.3")
+    assert acceptance["passed"] is False
+
+
+# ------------------------------------------------- 缺口 2：必须是完整 3×3
+def test_partial_grid_cannot_produce_a_pass_verdict():
+    """只跑一个数据集时，即使数字再好也不得给出通过结论。"""
+    tasks = [_task("pjm", 24, mc=1.0, best_single=100.0, seasonal=100.0, ridge=100.0)]
+
+    acceptance = evaluate_gates(tasks)
+
+    coverage = _rule_by_name(acceptance, "coverage")
+    assert coverage["passed"] is False
+    assert coverage["present_tasks"] == 1 and coverage["expected_tasks"] == 9
+    assert {(m["dataset"], m["forecast_steps"]) for m in coverage["missing_tasks"]} == {
+        (d, s) for d in REQUIRED_DATASETS for s in REQUIRED_FORECAST_STEPS
+    } - {("pjm", 24)}
+    # 比值本身很好，但因为该长度缺两个数据集，等权平均一律不通过
+    for name in ("11.2.1a", "11.2.1b", "11.2.2", "11.2.3"):
+        rule = _rule(acceptance, name, 24)
+        assert rule["datasets_complete"] is False
+        assert rule["passed"] is False
+    assert acceptance["passed"] is False
+
+
+def test_full_grid_passes_coverage(stage2):
+    tasks = _full_grid(mc=1.0, best_single=100.0, seasonal=100.0, ridge=100.0)
+
+    acceptance = evaluate_gates(tasks)
+
+    assert _rule_by_name(acceptance, "coverage")["passed"] is True
+    assert acceptance["passed"] is True
+    # 真实合成装置只跑了单数据集单长度，因此它的覆盖度必然不过
+    assert _rule_by_name(stage2["acceptance"], "coverage")["passed"] is False
+    assert stage2["acceptance"]["passed"] is False
+
+
+# --------------------------------- 缺口 3：候选与 H1—H3 必须与建库完全一致
+def test_candidates_must_match_the_library_report(tmp_path):
+    built = _build_stage1(tmp_path)
+    proc, out = _run_stage2(
+        tmp_path, built, out_name="stage2_cand",
+        candidates=[c for c in FIXTURE_CANDIDATES if c != "seasonal_naive"],
+    )
+
+    assert proc.returncode == EXIT_INCOMPLETE
+    assert "不是同一批候选" in (proc.stdout + proc.stderr)
+    assert not (out / "acceptance.json").exists()
+
+
+def test_missing_history_window_in_report_is_incomplete(tmp_path):
+    """建库报告里 H1—H3 不齐（或有重复批次）时，不得给出任何门槛结论。"""
+    built = _build_stage1(tmp_path)
+    report = json.loads(built["library_report"].read_text())
+    report["tasks"] = [t for t in report["tasks"] if t["library_window"] != "H2"]
+    partial = tmp_path / "partial_report.json"
+    partial.write_text(json.dumps(report), encoding="utf-8")
+
+    proc, out = _run_stage2(
+        tmp_path, built, out_name="stage2_h2", library_report=partial
+    )
+
+    assert proc.returncode == EXIT_INCOMPLETE
+    assert "关系不齐或有重复批次" in (proc.stdout + proc.stderr)
+    assert not (out / "acceptance.json").exists()
+
+
+def test_duplicate_history_window_in_report_is_incomplete(tmp_path):
+    built = _build_stage1(tmp_path)
+    report = json.loads(built["library_report"].read_text())
+    duplicated = next(t for t in report["tasks"] if t["library_window"] == "H1")
+    report["tasks"].append(dict(duplicated))
+    doubled = tmp_path / "doubled_report.json"
+    doubled.write_text(json.dumps(report), encoding="utf-8")
+
+    proc, out = _run_stage2(
+        tmp_path, built, out_name="stage2_dup", library_report=doubled
+    )
+
+    assert proc.returncode == EXIT_INCOMPLETE
+    assert "关系不齐或有重复批次" in (proc.stdout + proc.stderr)
+    assert not (out / "acceptance.json").exists()
