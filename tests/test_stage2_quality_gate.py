@@ -388,12 +388,66 @@ def test_partial_grid_cannot_produce_a_pass_verdict():
     assert acceptance["passed"] is False
 
 
+def test_extra_dataset_cannot_produce_a_pass_verdict():
+    """多出一个数据集同样不得通过：它的比值会被平均进该长度的等权平均。
+
+    这里 london 在 24 步上表现极好，若被计入会把 24 步的均值从 1.00 拉到 0.755；
+    覆盖度和该长度的四条规则都必须判负。
+    """
+    tasks = _full_grid(mc=100.0, best_single=100.0, seasonal=100.0, ridge=100.0)
+    tasks.append(
+        _task("london", 24, mc=2.0, best_single=100.0, seasonal=100.0, ridge=100.0)
+    )
+
+    acceptance = evaluate_gates(tasks)
+
+    coverage = _rule_by_name(acceptance, "coverage")
+    assert coverage["passed"] is False
+    assert coverage["missing_tasks"] == []
+    assert coverage["extra_tasks"] == [{"dataset": "london", "forecast_steps": 24}]
+
+    for name in ("11.2.1a", "11.2.1b", "11.2.2", "11.2.3"):
+        rule = _rule(acceptance, name, 24)
+        assert rule["datasets_complete"] is False, name
+        assert rule["passed"] is False, name
+        assert "london" in rule["per_dataset"]
+    # 其余两个长度不受污染，仍按各自数据是否达标判定
+    assert _rule(acceptance, "11.2.1a", 168)["datasets_complete"] is True
+    assert acceptance["passed"] is False
+
+
+def test_extra_forecast_steps_cannot_produce_a_pass_verdict():
+    """多出一个预测长度同样不得通过，且该长度的规则不得显示"通过"。"""
+    tasks = _full_grid(mc=100.0, best_single=100.0, seasonal=100.0, ridge=100.0)
+    tasks += [
+        _task(ds, 48, mc=1.0, best_single=100.0, seasonal=100.0, ridge=100.0)
+        for ds in REQUIRED_DATASETS
+    ]
+
+    acceptance = evaluate_gates(tasks)
+
+    coverage = _rule_by_name(acceptance, "coverage")
+    assert coverage["passed"] is False
+    assert coverage["missing_tasks"] == []
+    assert {e["forecast_steps"] for e in coverage["extra_tasks"]} == {48}
+
+    # 48 步上三个数据集齐全且数字极好，但它不是核心长度，不得判通过
+    for name in ("11.2.1a", "11.2.1b", "11.2.2", "11.2.3"):
+        rule = _rule(acceptance, name, 48)
+        assert rule["core_forecast_steps"] is False, name
+        assert rule["datasets_complete"] is False, name
+        assert rule["passed"] is False, name
+    assert acceptance["passed"] is False
+
+
 def test_full_grid_passes_coverage(stage2):
     tasks = _full_grid(mc=1.0, best_single=100.0, seasonal=100.0, ridge=100.0)
 
     acceptance = evaluate_gates(tasks)
 
-    assert _rule_by_name(acceptance, "coverage")["passed"] is True
+    coverage = _rule_by_name(acceptance, "coverage")
+    assert coverage["passed"] is True
+    assert coverage["missing_tasks"] == [] and coverage["extra_tasks"] == []
     assert acceptance["passed"] is True
     # 真实合成装置只跑了单数据集单长度，因此它的覆盖度必然不过
     assert _rule_by_name(stage2["acceptance"], "coverage")["passed"] is False

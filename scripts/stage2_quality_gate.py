@@ -15,9 +15,11 @@ Ridge Stacking          所有合格候选的固定 Ridge 融合，无场景检�
 在查看 Q1—Q3 真值之前写死。Stage 2 跑完之后不得回头调整这些常量、再在同一批 Q
 窗口上重新宣称通过（§12 Stage 4 的停止规则）。
 
-**不完整实验不产出通过结论**：允许只跑一部分数据集/长度做诊断，但只要 3 数据集 ×
-3 预测长度这 9 个格子没齐，覆盖度规则就不通过，逐长度的"等权平均"也一律判不通过——
-不存在用子集拿到 passed=true 的路径。
+**任务集合必须恰好等于 3×3**：允许只跑一部分、或额外跑别的数据集/长度做诊断，但
+覆盖度规则要求任务集合与 9 个核心格子**完全相等**——缺格子不行，多格子同样不行。
+多出来的任务会混进同一长度的等权平均，把本应只由 PJM/VIC/NSW 三者决定的指标改掉，
+所以逐长度的比值规则也要求该长度的数据集集合**恰好**是这三个、且该长度本身是核心
+长度。不存在用子集或超集拿到 passed=true 的路径。
 
 退出码：0=全部门槛通过；2=运行完整但门槛未通过（按 §12 停止，不进 Stage 3）；
 1=运行不完整（数据缺失、窗口产不出轨迹等），此时不产出结论。
@@ -520,31 +522,34 @@ def evaluate_gates(tasks: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
     for task in tasks:
         by_steps.setdefault(int(task["forecast_steps"]), []).append(task)
 
-    # 覆盖度：少一个格子就不是方案定义的 3×3 口径，任何"通过"都不成立
+    # 覆盖度：任务集合必须"恰好等于"3×3。缺格子不是方案口径；多格子会混进同一长度的
+    # 等权平均，同样不是方案口径。
     present = {(t["dataset"], int(t["forecast_steps"])) for t in tasks}
     expected = {(d, s) for d in REQUIRED_DATASETS for s in REQUIRED_FORECAST_STEPS}
     missing = sorted(expected - present)
+    extra = sorted(present - expected)
     rules: List[Dict[str, Any]] = [{
         "rule": "coverage",
-        "description": "核心任务必须是完整的 3 数据集 × 3 预测长度 = 9 个任务",
+        "description": "任务集合必须恰好等于 3 数据集 × 3 预测长度 = 9 个任务，不多不少",
         "expected_tasks": len(expected), "present_tasks": len(present & expected),
         "missing_tasks": [{"dataset": d, "forecast_steps": s} for d, s in missing],
-        "extra_tasks": [
-            {"dataset": d, "forecast_steps": s} for d, s in sorted(present - expected)
-        ],
-        "passed": not missing,
+        "extra_tasks": [{"dataset": d, "forecast_steps": s} for d, s in extra],
+        "passed": not missing and not extra,
     }]
     for steps in sorted(by_steps):
         group = by_steps[steps]
         bs_ratios = {t["dataset"]: _ratio(t, BASELINE_BEST_SINGLE) for t in group}
         bs_mean = float(np.mean(list(bs_ratios.values())))
-        # 等权平均只有在三个数据集齐全时才是方案定义的口径
-        complete = set(bs_ratios) >= set(REQUIRED_DATASETS)
+        # 等权平均只有在"该长度的数据集恰好是这三个"时才是方案定义的口径：多一个
+        # 数据集就会把它的比值一起平均进去，改掉本应由 PJM/VIC/NSW 决定的结论。
+        core_steps = steps in REQUIRED_FORECAST_STEPS
+        complete = core_steps and set(bs_ratios) == set(REQUIRED_DATASETS)
         rules.append({
             "rule": "11.2.1a", "forecast_steps": steps,
             "description": "相对 Validation Best Single：三数据集等权平均 MAE 比值 < 1.00",
             "value": bs_mean, "threshold": THRESHOLD_BEST_SINGLE_MEAN_RATIO,
             "comparison": "<", "per_dataset": bs_ratios, "datasets_complete": complete,
+            "core_forecast_steps": core_steps,
             "passed": bool(complete and bs_mean < THRESHOLD_BEST_SINGLE_MEAN_RATIO),
         })
         worst_dataset = max(bs_ratios, key=bs_ratios.get) if bs_ratios else None
@@ -555,6 +560,7 @@ def evaluate_gates(tasks: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
             "threshold": THRESHOLD_BEST_SINGLE_PER_DATASET_RATIO,
             "comparison": "<=", "worst_dataset": worst_dataset, "per_dataset": bs_ratios,
             "datasets_complete": complete,
+            "core_forecast_steps": core_steps,
             "passed": bool(complete and all(
                 r <= THRESHOLD_BEST_SINGLE_PER_DATASET_RATIO for r in bs_ratios.values()
             )),
@@ -566,6 +572,7 @@ def evaluate_gates(tasks: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
             "value": max(sn_ratios.values()) if sn_ratios else None,
             "threshold": THRESHOLD_SEASONAL_NAIVE_PER_TASK_RATIO,
             "comparison": "<", "per_dataset": sn_ratios, "datasets_complete": complete,
+            "core_forecast_steps": core_steps,
             "passed": bool(complete and all(
                 r < THRESHOLD_SEASONAL_NAIVE_PER_TASK_RATIO for r in sn_ratios.values()
             )),
@@ -577,6 +584,7 @@ def evaluate_gates(tasks: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
             "description": "相对 Ridge Stacking：该长度的等权平均 MAE 比值 <= 1.00",
             "value": ridge_mean, "threshold": THRESHOLD_RIDGE_MEAN_RATIO,
             "comparison": "<=", "per_dataset": ridge_ratios, "datasets_complete": complete,
+            "core_forecast_steps": core_steps,
             "passed": bool(complete and ridge_mean <= THRESHOLD_RIDGE_MEAN_RATIO),
         })
 
