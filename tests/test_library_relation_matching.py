@@ -174,3 +174,81 @@ def test_trace_explains_which_data_and_which_combination_were_chosen(tmp_path):
     assert trace["model_ids"] == [f"{DATASET}__h1__{near['member']}"]
     assert trace["forecast_steps"] == STEPS
     assert trace["selector_invoked"] is False
+
+
+def _seed_identical_profile_relation(
+    store: ModelStore, artifacts: Path, *, scenario_id: str, member: str,
+    signature: dict, validation_mae: float,
+) -> int:
+    """在一个新场景下建一条关系，数据画像与其他场景**完全相同**。"""
+    store.add_scenario(
+        scenario_id=scenario_id, task_type="load_forecast", business_domain="power_load",
+        region=DATASET, horizon=1, forecast_steps=STEPS, freq="h", signature=signature,
+    )
+    profile_id = store.add_data_profile(
+        scenario_id=scenario_id, data_ref=f"data/{scenario_id}.csv", target_column="load",
+        features=["timestamp", "load"], sample_count=900,
+        start_at="2025-01-01 00:00:00", end_at="2025-02-07 11:00:00", signature=signature,
+    )
+    predictor = CombinationPredictor(
+        member_ids=[member], linear_weights=[1.0],
+        strategy="protocol_b_combination", interaction=None,
+    )
+    combo_path = save_artifact(predictor, artifacts / f"{scenario_id}__combo.pkl")
+    combo_id = store.add_combination(
+        "protocol_b_combination", str(combo_path), [(f"{DATASET}__h1__{member}", 0, 1.0)]
+    )
+    return store.add_relation(scenario_id, profile_id, combo_id, validation_mae=validation_mae)
+
+
+def test_feedback_tiebreak_applies_across_scenarios_not_only_within_one(tmp_path):
+    """数据画像完全相同但分属不同 scenario 时，并列判据必须**全局**按反馈排序。
+
+    三条关系画像一模一样，相似度必然相等：
+
+    - scenario_a：无反馈，validation_mae 最小（0.1）
+    - scenario_b：有反馈，mean_actual_mae = 9.0
+    - scenario_c：有反馈，mean_actual_mae = 1.0
+
+    必须选 scenario_c——它既不是 scenario_id 最小的，也不是 relation_id 最小的，
+    更不是 validation_mae 最小的，只有"有反馈优先 + 实际 MAE 最小"能解释。
+    """
+    db = tmp_path / "lib.sqlite3"
+    artifacts = tmp_path / "artifacts"
+    train = make_series(2000, start="2024-01-01", seed=3)
+    daily = ["hour", "dayofweek", "lag_24"]
+    register_models(db, artifacts, [
+        ("catboost_reg", fit_weekly(train), WEEKLY_FEATURES),
+        ("lgbm_reg", Ridge(alpha=1.0).fit(*_supervised(train, daily)), daily),
+    ])
+
+    shared = history_window_signature(
+        _series(900, seed=NEAR_LEVEL_SEED, start="2025-01-01"), freq="h", base_horizon=1
+    )
+    store = ModelStore(str(db))
+    rel_a = _seed_identical_profile_relation(
+        store, artifacts, scenario_id="pjm_scenario_a", member="catboost_reg",
+        signature=shared, validation_mae=0.1,
+    )
+    rel_b = _seed_identical_profile_relation(
+        store, artifacts, scenario_id="pjm_scenario_b", member="catboost_reg",
+        signature=shared, validation_mae=5.0,
+    )
+    rel_c = _seed_identical_profile_relation(
+        store, artifacts, scenario_id="pjm_scenario_c", member="lgbm_reg",
+        signature=shared, validation_mae=5.0,
+    )
+    store.record_feedback(store.record_prediction_run(rel_b, "b.csv"), actual_mae=9.0)
+    store.record_feedback(store.record_prediction_run(rel_c, "c.csv"), actual_mae=1.0)
+    store.close()
+
+    proc, output = _predict_with_user_history(tmp_path, db, scale=1.0)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    trace = json.loads(output.with_suffix(".trace.json").read_text())
+
+    assert trace["relation_id"] == rel_c
+    assert trace["scenario_id"] == "pjm_scenario_c"
+    assert trace["member_types"] == ["lgbm_reg"]
+    # 排除三种"看起来也对"的解释
+    assert trace["relation_id"] != rel_a  # 不是 scenario_id / relation_id 最小的
+    assert trace["relation_id"] != rel_b  # 不是"有反馈里排在前面"的

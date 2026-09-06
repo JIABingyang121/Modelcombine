@@ -100,6 +100,14 @@ def _country_for(region: str) -> str:
         ) from None
 
 
+def _relation_rank(relation: Dict[str, Any]) -> tuple:
+    """并列关系的次级排序键，与 ``ModelStore.list_relations_for_scenario`` 同一套口径：
+    有真实反馈的优先、按 ``mean_actual_mae`` 升序，其次 ``validation_mae``，再 relation_id。"""
+    has_feedback = int(relation["feedback_count"]) > 0
+    performance = relation["mean_actual_mae"] if has_feedback else relation["validation_mae"]
+    return (0 if has_feedback else 1, float(performance), int(relation["relation_id"]))
+
+
 def _match_relation(store: ModelStore, scenario: Dict[str, Any]) -> Dict[str, Any]:
     """先按硬契约精确过滤，再在剩余的**每一条关系**上按其数据画像算相似度。
 
@@ -107,10 +115,13 @@ def _match_relation(store: ModelStore, scenario: Dict[str, Any]) -> Dict[str, An
     不得匹配 24 或 720 步关系。过滤之后按 ``data_profile`` 的 signature 排序，
     **不看** validation MAE——那是历史表现，不是"这段数据像不像"。
 
-    只有相似度完全并列时（两段历史数据的画像无法区分），才退回 ``ModelStore``
-    既有的关系排序做 tie-break：有真实反馈的优先、按 ``mean_actual_mae`` 升序，
-    其次按 ``validation_mae`` 升序、再按 ``relation_id`` 升序。``ScenarioIndex.query``
-    的排序是稳定的，因此按该顺序插入即可让它成为 tie-break。
+    只有相似度**完全并列**时（两段历史数据的画像无法区分），才按
+    :func:`_relation_rank` 做 tie-break：有真实反馈的优先、按 ``mean_actual_mae``
+    升序，其次按 ``validation_mae`` 升序、再按 ``relation_id`` 升序。
+
+    这一步必须在**取出全部最高同分关系之后全局**做。靠"按顺序插入 + 稳定排序"
+    是不够的：候选是按 scenario 分组取回来的，稳定排序只能保住各 scenario 内部的
+    反馈优先级；两个不同 scenario 的画像完全相同时，实际按 scenario_id 决定了胜负。
     """
     forecast_steps = validate_forecast_steps(scenario["forecast_steps"])
     scenarios = store.list_scenarios(
@@ -127,7 +138,6 @@ def _match_relation(store: ModelStore, scenario: Dict[str, Any]) -> Dict[str, An
             f"horizon/forecast_steps={forecast_steps}/freq 全部匹配的历史场景"
         )
 
-    # 保持 store 给出的关系顺序：它就是并列时的 tie-break 依据
     candidates: Dict[str, Dict[str, Any]] = {}
     for candidate in scenarios:
         for relation in store.list_relations_for_scenario(candidate["scenario_id"]):
@@ -147,9 +157,12 @@ def _match_relation(store: ModelStore, scenario: Dict[str, Any]) -> Dict[str, An
             "signature": entry["profile"]["signature"],
             "business_domain": entry["scenario"]["business_domain"],
         })
-    best = index.query(signature=scenario["signature"])[0]
-    chosen = candidates[best["scenario_id"]]
-    chosen["data_similarity"] = float(best["_score"])
+    ranked = index.query(signature=scenario["signature"])
+    top_score = ranked[0]["_score"]
+    tied = [row["scenario_id"] for row in ranked if row["_score"] == top_score]
+    best_key = min(tied, key=lambda key: _relation_rank(candidates[key]["relation"]))
+    chosen = candidates[best_key]
+    chosen["data_similarity"] = float(top_score)
     return chosen
 
 
