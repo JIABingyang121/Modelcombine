@@ -5,9 +5,9 @@
 逐点对比：
 
 ```text
-Modelcombine            检索 H1—H3 已存关系并重放（run.py predict 同一条代码路径）
+Modelcombine            检索 S1—S3 已存关系并重放（run.py predict 同一条代码路径）
 Seasonal Naive (168)    重复查询窗口自己历史的最近 168 小时
-Validation Best Single  只用 H1—H3 validation 选出的最优单模型，不看 Q
+Validation Best Single  只用 S1—S3 validation 选出的最优单模型，不看 Q
 Ridge Stacking          所有合格候选的固定 Ridge 融合，无场景检索、无可变成员
 ```
 
@@ -61,13 +61,13 @@ from src.models.trajectory_forecast import (
 from src.storage.model_store import SUPPORTED_FORECAST_STEPS, ModelStore
 
 # ---------------------------------------------------------------- 预注册常量
-#: §6.2 的窗口角色。H1—H3 是 validation（基线在这里选定/拟合），Q1—Q3 是未见查询。
+#: §6.2 的窗口角色。S1—S3 是 validation（基线在这里选定/拟合），Q1—Q3 是未见查询。
 #: A 是建库阶段的审计窗口，Stage 2 完全不碰。
-LIBRARY_WINDOWS: Tuple[str, ...] = ("H1", "H2", "H3")
+SCENARIO_SAMPLES: Tuple[str, ...] = ("S1", "S2", "S3")
 QUERY_WINDOWS: Tuple[str, ...] = ("Q1", "Q2", "Q3")
 
 #: §9.1：MASE 分母用训练段的 mean(|y_t - y_{t-168}|)，不用 test 上 Seasonal Naive
-#: 的 MAE 临时充当分母。"训练段"在这里冻结为：原始序列中严格早于 H1 历史窗口起点
+#: 的 MAE 临时充当分母。"训练段"在这里冻结为：原始序列中严格早于 S1 历史窗口起点
 #: 的全部数据——它与任何评价窗口、任何窗口的输入历史都不重叠。
 MASE_SEASONAL_PERIOD = 168
 
@@ -77,7 +77,7 @@ MASE_SEASONAL_PERIOD = 168
 #: (timestamp, load) 派生出完整轨迹），而不是建库里再经 filter_weak_models 得到的
 #: safe_models。理由：§7.1 的措辞是"所有…固定…不用可变成员子集"，其对照物正是
 #: Modelcombine 的按场景变成员；若改用逐窗口 safe_models 的交集，本装置上会退化成
-#: 单模型（H2/H3 的 safe 只剩一个），那就不再是一个静态融合基线了。Ridge 的 L2
+#: 单模型（S2/S3 的 safe 只剩一个），那就不再是一个静态融合基线了。Ridge 的 L2
 #: 本身会压低劣质列的权重，这正是静态 stacking 该做的事。
 RIDGE_STACKING_ALPHA = 1.0
 RIDGE_STACKING_FIT_INTERCEPT = True
@@ -199,13 +199,13 @@ def _freeze_baselines(
     country: str,
     dataset: str,
 ) -> Dict[str, Any]:
-    """只用 H1—H3 定下 Validation Best Single 与 Ridge Stacking，绝不看 Q。"""
+    """只用 S1—S3 定下 Validation Best Single 与 Ridge Stacking，绝不看 Q。"""
     blocks: List[pd.DataFrame] = []
     targets: List[np.ndarray] = []
     per_window_mae: Dict[str, Dict[str, float]] = {}
     columns: Optional[List[str]] = None
 
-    for label in LIBRARY_WINDOWS:
+    for label in SCENARIO_SAMPLES:
         history, target = _window_slice(
             raw, windows[label], forecast_steps, label=f"{dataset} {label}"
         )
@@ -223,7 +223,7 @@ def _freeze_baselines(
         per_window_mae[label] = {c: mae(y, matrix[c].to_numpy(float)) for c in available}
 
     if not columns:
-        raise Stage2Error(f"{dataset}: H1—H3 没有共同的合格候选，无法冻结基线")
+        raise Stage2Error(f"{dataset}: S1—S3 没有共同的合格候选，无法冻结基线")
 
     stacked = np.vstack([block[columns].to_numpy(dtype=float) for block in blocks])
     y_stacked = np.concatenate(targets)
@@ -272,11 +272,11 @@ def _cross_check_library_report(
             "无法核对 Stage 2 与建库是否同一批 validation"
         )
 
-    windows = [task.get("library_window") for task in tasks]
-    if sorted(w for w in windows if w is not None) != sorted(LIBRARY_WINDOWS):
+    windows = [task.get("scenario_sample") for task in tasks]
+    if sorted(w for w in windows if w is not None) != sorted(SCENARIO_SAMPLES):
         raise Stage2Error(
             f"{dataset} forecast_steps={forecast_steps}: 建库报告的历史窗口是 {windows}，"
-            f"要求恰好各一条 {list(LIBRARY_WINDOWS)}——关系不齐或有重复批次，不能用于门槛判定"
+            f"要求恰好各一条 {list(SCENARIO_SAMPLES)}——关系不齐或有重复批次，不能用于门槛判定"
         )
 
     expected_candidates = sorted(set(declared_candidates))
@@ -284,11 +284,11 @@ def _cross_check_library_report(
         recorded_candidates = sorted(set(task.get("declared_candidates") or []))
         if recorded_candidates != expected_candidates:
             raise Stage2Error(
-                f"{dataset} {task['library_window']}: 建库声明的候选是 {recorded_candidates}，"
+                f"{dataset} {task['scenario_sample']}: 建库声明的候选是 {recorded_candidates}，"
                 f"Stage 2 传入的是 {expected_candidates}——基线与建库不是同一批候选"
             )
     for task in tasks:
-        label = task["library_window"]
+        label = task["scenario_sample"]
         if label not in validation_window_mae:
             raise Stage2Error(
                 f"{dataset} {label}: Stage 2 没有重算这个历史窗口的 validation 轨迹"
@@ -392,8 +392,8 @@ def evaluate_task(
         model_types=declared_candidates,
     )
 
-    # MASE 分母：严格早于 H1 输入历史起点的训练段
-    train_cut = pd.Timestamp(windows[LIBRARY_WINDOWS[0]]["history_start"])
+    # MASE 分母：严格早于 S1 输入历史起点的训练段
+    train_cut = pd.Timestamp(windows[SCENARIO_SAMPLES[0]]["history_start"])
     train_segment = raw[raw["timestamp"] < train_cut]
     scale = mase_scale(train_segment["load"])
 
@@ -464,6 +464,9 @@ def evaluate_task(
                     "scenario_id": trace["scenario_id"],
                     "relation_id": trace["relation_id"],
                     "combination_id": trace["combination_id"],
+                    "data_profile_id": trace["data_profile_id"],
+                    "data_ref": trace["data_ref"],
+                    "data_similarity": trace["data_similarity"],
                     "selector_invoked": trace["selector_invoked"],
                     "forecast_steps": trace["forecast_steps"],
                     "n_rows": trace["n_rows"],
@@ -664,7 +667,7 @@ def main() -> int:
         "datasets": list(args.datasets),
         "forecast_steps": list(args.forecast_steps),
         "declared_candidates": list(args.candidates),
-        "library_windows": list(LIBRARY_WINDOWS),
+        "scenario_samples": list(SCENARIO_SAMPLES),
         "query_windows": list(QUERY_WINDOWS),
         "methods": list(METHODS),
         "frozen_constants": {
@@ -674,7 +677,7 @@ def main() -> int:
             "replay_tolerance": REPLAY_TOLERANCE,
             "required_datasets": list(REQUIRED_DATASETS),
             "required_forecast_steps": list(REQUIRED_FORECAST_STEPS),
-            "mase_train_segment": "原始序列中严格早于 H1 history_start 的全部数据",
+            "mase_train_segment": "原始序列中严格早于 S1 history_start 的全部数据",
             "mean_ratio_definition": "逐数据集比值的等权平均（不是先平均 MAE 再相除）",
             "qualified_candidates_definition":
                 "输入契约下合格的全部候选（已登记、产物存在、能产出完整轨迹），"

@@ -84,8 +84,8 @@ def test_proposed_origins_are_non_overlapping_and_have_full_history(tmp_path):
     assert proc.returncode == 0, proc.stdout + proc.stderr
 
     origins = report["datasets"][0]["feasibility"]["720"]["origins"]
-    assert [o["label"] for o in origins] == ["H1", "H2", "H3", "A", "Q1", "Q2", "Q3"]
-    # H1—H3 建库、A 是共用的冻结后审计窗口、Q1—Q3 未见查询（§6.3）
+    assert [o["label"] for o in origins] == ["S1", "S2", "S3", "A", "Q1", "Q2", "Q3"]
+    # S1—S3 建库、A 是共用的冻结后审计窗口、Q1—Q3 未见查询（§6.3）
     assert [o["role"] for o in origins] == (
         ["library"] * 3 + ["audit"] + ["query"] * 3
     )

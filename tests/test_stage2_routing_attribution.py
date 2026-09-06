@@ -52,11 +52,11 @@ def attribution(tmp_path_factory):
 def test_every_query_is_scored_against_all_three_history_relations(attribution):
     task = attribution["report"]["tasks"][0]
     assert [q["window"] for q in task["queries"]] == ["Q1", "Q2", "Q3"]
-    assert [r["window"] for r in task["history_relations"]] == ["H1", "H2", "H3"]
+    assert [r["window"] for r in task["history_relations"]] == ["S1", "S2", "S3"]
 
     for query in task["queries"]:
         per_history = query["per_history_relation"]
-        assert [e["window"] for e in per_history] == ["H1", "H2", "H3"]
+        assert [e["window"] for e in per_history] == ["S1", "S2", "S3"]
         for entry in per_history:
             assert 0.0 <= entry["similarity"] <= 1.0
             assert np.isfinite(entry["counterfactual_mae"]) and entry["counterfactual_mae"] > 0
@@ -73,6 +73,7 @@ def test_selected_oracle_regret_and_hit_rate_are_self_consistent(attribution):
         by_mae = min(per_history, key=lambda e: (e["counterfactual_mae"], e["window"]))
 
         assert query["selected"]["window"] == by_similarity["window"]
+        assert query["selected"]["relation_id"] == by_similarity["relation_id"]
         assert query["selected"]["counterfactual_mae"] == pytest.approx(
             by_similarity["counterfactual_mae"], rel=1e-12
         )

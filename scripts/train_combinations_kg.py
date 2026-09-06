@@ -1197,6 +1197,10 @@ TARGET = "load"
 
 #: 基础预测器的单步语义。用户请求的完整轨迹长度是 forecast_steps，与之正交。
 MODEL_LIBRARY_BASE_HORIZON = 1
+#: 预测长度的可读别名：H1=未来一天、H2=未来一周、H3=未来三十天。
+#: 数据库真正的字段始终是 forecast_steps，不额外增加重复的 H 字段；这里只进报告。
+#: 注意：H1/H2/H3 从此只表示预测长度，历史数据样例一律叫 S1/S2/S3。
+FORECAST_HORIZON_LABELS: Dict[int, str] = {24: "H1", 168: "H2", 720: "H3"}
 #: 构造场景/数据特征的历史窗口（小时）。离线与在线必须取同一个窗口长度，
 #: 否则两侧 signature 不可比，相似度检索失去意义。
 SIGNATURE_WINDOW = 720
@@ -1387,7 +1391,7 @@ def _frozen_windows(window_plan: Path, dataset: str, forecast_steps: int) -> Dic
     return {entry["label"]: entry for entry in origins}
 
 
-def _library_window_frame(
+def _scenario_sample_frame(
     raw_root: Path,
     dataset: str,
     window: Mapping[str, Any],
@@ -1471,7 +1475,7 @@ def _build_library_task(
     base_horizon: int = MODEL_LIBRARY_BASE_HORIZON,
     val_frame: Optional[pd.DataFrame] = None,
     test_frame: Optional[pd.DataFrame] = None,
-    library_window: Optional[str] = None,
+    scenario_sample: Optional[str] = None,
     audit_window: Optional[str] = None,
 ) -> Dict[str, Any]:
     """按完整轨迹建立一条 scenario-data-combination 关系（方案 §3.3）。
@@ -1498,8 +1502,8 @@ def _build_library_task(
         )
 
     label = f"{dataset} forecast_steps={forecast_steps}"
-    if library_window is not None:
-        label = f"{label} {library_window}"
+    if scenario_sample is not None:
+        label = f"{label} {scenario_sample}"
     if val_frame is None:
         val_frame = _library_split_frame(raw_root, dataset, "val")
     val_matrix, val_calendar, val_skipped, val_origin = _library_trajectory_matrix(
@@ -1701,7 +1705,8 @@ def _build_library_task(
         "dataset": dataset,
         "base_horizon": base_horizon,
         "forecast_steps": forecast_steps,
-        "library_window": library_window,
+        "forecast_horizon": FORECAST_HORIZON_LABELS[forecast_steps],
+        "scenario_sample": scenario_sample,
         "audit_window": audit_window,
         "scenario_id": scenario_id,
         "data_profile_id": data_profile_id,
@@ -1780,8 +1785,8 @@ def build_model_library(
                     continue
 
                 windows = _frozen_windows(window_plan, dataset, int(forecast_steps))
-                audit_frame = _library_window_frame(raw_root, dataset, windows["A"])
-                for label in ("H1", "H2", "H3"):
+                audit_frame = _scenario_sample_frame(raw_root, dataset, windows["A"])
+                for label in ("S1", "S2", "S3"):
                     report["tasks"].append(
                         _build_library_task(
                             store,
@@ -1791,9 +1796,9 @@ def build_model_library(
                             raw_root=raw_root,
                             artifact_dir=artifact_dir,
                             filter_threshold=filter_threshold,
-                            val_frame=_library_window_frame(raw_root, dataset, windows[label]),
+                            val_frame=_scenario_sample_frame(raw_root, dataset, windows[label]),
                             test_frame=audit_frame,
-                            library_window=label,
+                            scenario_sample=label,
                             audit_window="A",
                         )
                     )
@@ -1872,7 +1877,7 @@ def main():
     parser.add_argument("--model-artifacts", type=Path, default=None,
                         help="组合预测器产物目录（--model-library 必需）")
     parser.add_argument("--window-plan", type=Path, default=None,
-                        help="Stage 0 冻结窗口 JSON；指定时用 H1—H3 建库，并共用 A 评价")
+                        help="Stage 0 冻结窗口 JSON；指定时用 S1—S3 建库，并共用 A 评价")
     parser.add_argument("--ablation-mode", type=str, default=None,
                         choices=["g0", "g1", "g2", "all"],
                         help="消融实验模式: g0=无扩展候选, g1=扩展无审计, g2=扩展+审计, all=依次跑全部")

@@ -1,7 +1,7 @@
 """Stage 2 三基线质量门控（scripts/stage2_quality_gate.py）。
 
 这套评估代码要在**看到真实 Q1—Q3 真值之前**冻结，所以它必须先在合成数据上把
-以下几件事钉死：基线只由 H1—H3 决定、MASE 分母取训练段而不是查询窗口、门槛比较
+以下几件事钉死：基线只由 S1—S3 决定、MASE 分母取训练段而不是查询窗口、门槛比较
 方向和边界严格按 §11.2、运行不完整时不产出任何结论。
 """
 from __future__ import annotations
@@ -44,7 +44,7 @@ ROWS = 1800  # 训练段 + 720 小时 signature 窗口 + 7×24 目标
 
 
 def _build_stage1(tmp_path: Path):
-    """真实建库：冻结窗口计划 -> H1—H3 三条关系（A 作审计窗口）。"""
+    """真实建库：冻结窗口计划 -> S1—S3 三条关系（A 作审计窗口）。"""
     raw_root = tmp_path / "raw"
     db = tmp_path / "lib.sqlite3"
     frames = write_dataset(tmp_path / "splits", rows=ROWS)
@@ -138,7 +138,7 @@ def test_frozen_constants_are_recorded_in_the_definition(stage2):
     assert frozen["thresholds"]["11.2.1b_best_single_per_dataset_ratio_le"] == 1.03
     assert frozen["thresholds"]["11.2.2_seasonal_naive_per_task_ratio_lt"] == 1.00
     assert frozen["thresholds"]["11.2.3_ridge_mean_ratio_le"] == 1.00
-    assert stage2["definition"]["library_windows"] == ["H1", "H2", "H3"]
+    assert stage2["definition"]["scenario_samples"] == ["S1", "S2", "S3"]
     assert stage2["definition"]["query_windows"] == ["Q1", "Q2", "Q3"]
 
 
@@ -150,7 +150,7 @@ def test_mase_denominator_comes_from_the_training_segment(stage2):
     plan = json.loads(stage2["built"]["window_plan"].read_text())
     h1 = next(
         o for o in plan["datasets"][0]["feasibility"][str(STEPS)]["origins"]
-        if o["label"] == "H1"
+        if o["label"] == "S1"
     )
     segment = raw[raw["timestamp"] < pd.Timestamp(h1["history_start"])]["load"].to_numpy(float)
     expected = float(np.mean(np.abs(segment[MASE_SEASONAL_PERIOD:]
@@ -167,7 +167,7 @@ def test_mase_denominator_comes_from_the_training_segment(stage2):
     )
 
 
-# ----------------------------------------------- 基线只由 H1—H3 冻结，不看 Q
+# ----------------------------------------------- 基线只由 S1—S3 冻结，不看 Q
 def test_baselines_are_frozen_on_validation_and_ignore_query_windows(tmp_path):
     """扰动 Q1—Q3 区段的真值：Best Single 的选择与 Ridge 的系数必须一字不变。
 
@@ -485,7 +485,7 @@ def test_full_grid_passes_coverage(stage2):
     assert stage2["acceptance"]["passed"] is False
 
 
-# --------------------------------- 缺口 3：候选与 H1—H3 必须与建库完全一致
+# --------------------------------- 缺口 3：候选与 S1—S3 必须与建库完全一致
 def test_candidates_must_match_the_library_report(tmp_path):
     built = _build_stage1(tmp_path)
     proc, out = _run_stage2(
@@ -499,10 +499,10 @@ def test_candidates_must_match_the_library_report(tmp_path):
 
 
 def test_missing_history_window_in_report_is_incomplete(tmp_path):
-    """建库报告里 H1—H3 不齐（或有重复批次）时，不得给出任何门槛结论。"""
+    """建库报告里 S1—S3 不齐（或有重复批次）时，不得给出任何门槛结论。"""
     built = _build_stage1(tmp_path)
     report = json.loads(built["library_report"].read_text())
-    report["tasks"] = [t for t in report["tasks"] if t["library_window"] != "H2"]
+    report["tasks"] = [t for t in report["tasks"] if t["scenario_sample"] != "S2"]
     partial = tmp_path / "partial_report.json"
     partial.write_text(json.dumps(report), encoding="utf-8")
 
@@ -518,7 +518,7 @@ def test_missing_history_window_in_report_is_incomplete(tmp_path):
 def test_duplicate_history_window_in_report_is_incomplete(tmp_path):
     built = _build_stage1(tmp_path)
     report = json.loads(built["library_report"].read_text())
-    duplicated = next(t for t in report["tasks"] if t["library_window"] == "H1")
+    duplicated = next(t for t in report["tasks"] if t["scenario_sample"] == "S1")
     report["tasks"].append(dict(duplicated))
     doubled = tmp_path / "doubled_report.json"
     doubled.write_text(json.dumps(report), encoding="utf-8")

@@ -10,18 +10,23 @@
 用户场景 + 历史 timestamp,load + forecast_steps
   -> 生成 signature
   -> 精确过滤 task/business/region/freq/base_horizon/forecast_steps
-  -> 对剩余历史场景计算相似度
-  -> 加载已保存组合及成员模型
+  -> 对剩余的每一条"场景—数据—组合"关系，按其 data_profile 的数据特征算相似度
+  -> 取最相似的那条完整关系
+  -> 加载该关系已保存的组合及成员模型
   -> 每个成员生成完整轨迹
   -> 用已保存权重融合
   -> 输出和 trace
 ```
+
+匹配单位是**整条关系**，不是"先挑场景、再在该场景下挑一条误差较小的关系"。同一个场景
+下会积累多段历史数据，各自关联不同的已验证组合；用户提交自己的历史负荷时要拿到的是
+**数据画像与之最相似**的那条关系。命中之后不再按 validation MAE 或反馈统计改选。
 """
 from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
 import numpy as np
 import pandas as pd
@@ -95,14 +100,20 @@ def _country_for(region: str) -> str:
         ) from None
 
 
-def _match_scenario(store: ModelStore, scenario: Dict[str, Any]) -> Tuple[str, float]:
-    """先按硬契约精确过滤，再在剩余场景上算相似度。
+def _match_relation(store: ModelStore, scenario: Dict[str, Any]) -> Dict[str, Any]:
+    """先按硬契约精确过滤，再在剩余的**每一条关系**上按其数据画像算相似度。
 
     ``forecast_steps`` 是不能混用的任务契约，必须在相似度之前过滤：168 步请求
-    不得匹配 24 或 720 步关系。
+    不得匹配 24 或 720 步关系。过滤之后按 ``data_profile`` 的 signature 排序，
+    **不看** validation MAE——那是历史表现，不是"这段数据像不像"。
+
+    只有相似度完全并列时（两段历史数据的画像无法区分），才退回 ``ModelStore``
+    既有的关系排序做 tie-break：有真实反馈的优先、按 ``mean_actual_mae`` 升序，
+    其次按 ``validation_mae`` 升序、再按 ``relation_id`` 升序。``ScenarioIndex.query``
+    的排序是稳定的，因此按该顺序插入即可让它成为 tie-break。
     """
     forecast_steps = validate_forecast_steps(scenario["forecast_steps"])
-    candidates = store.list_scenarios(
+    scenarios = store.list_scenarios(
         task_type=scenario["task_type"],
         business_domain=scenario["business_domain"],
         region=scenario["region"],
@@ -110,24 +121,36 @@ def _match_scenario(store: ModelStore, scenario: Dict[str, Any]) -> Tuple[str, f
         forecast_steps=forecast_steps,
         freq=scenario["freq"],
     )
-    if not candidates:
+    if not scenarios:
         raise LibraryPredictionError(
             "no compatible scenario: 数据库中没有 task_type/business_domain/region/"
             f"horizon/forecast_steps={forecast_steps}/freq 全部匹配的历史场景"
         )
-    index = ScenarioIndex()
-    for candidate in candidates:
-        index.add(
-            {
-                "scenario_id": candidate["scenario_id"],
-                "signature": candidate["signature"],
-                "business_domain": candidate["business_domain"],
+
+    # 保持 store 给出的关系顺序：它就是并列时的 tie-break 依据
+    candidates: Dict[str, Dict[str, Any]] = {}
+    for candidate in scenarios:
+        for relation in store.list_relations_for_scenario(candidate["scenario_id"]):
+            profile = store.get_data_profile(relation["data_profile_id"])
+            candidates[str(relation["relation_id"])] = {
+                "scenario": candidate, "relation": relation, "profile": profile,
             }
+    if not candidates:
+        raise LibraryPredictionError(
+            "no compatible relation: 匹配到的历史场景下没有任何已保存的组合关系"
         )
-    # signature 由 _load_scenario 保证存在且非空；每条 candidate 产出一条排序结果，
-    # 无需数据库首条记录回退。
+
+    index = ScenarioIndex()
+    for key, entry in candidates.items():
+        index.add({
+            "scenario_id": key,
+            "signature": entry["profile"]["signature"],
+            "business_domain": entry["scenario"]["business_domain"],
+        })
     best = index.query(signature=scenario["signature"])[0]
-    return best["scenario_id"], float(best["_score"])
+    chosen = candidates[best["scenario_id"]]
+    chosen["data_similarity"] = float(best["_score"])
+    return chosen
 
 
 def predict(
@@ -165,6 +188,7 @@ def _predict(
 
     matched = _load_matched_combination(store, scenario)
     relation = matched["relation"]
+    combination = matched["combination"]
     combination_predictor = matched["predictor"]
     for model_row in matched["models"]:
         missing = [column for column in model_row["required_features"] if column not in features.columns]
@@ -207,11 +231,10 @@ def _predict(
 
 
 def _load_matched_combination(store: ModelStore, scenario: Dict[str, Any]) -> Dict[str, Any]:
-    scenario_id, similarity = _match_scenario(store, scenario)
-    relations = store.list_relations_for_scenario(scenario_id)
-    if not relations:
-        raise LibraryPredictionError(f"scenario {scenario_id} 没有已保存的组合关系")
-    relation = relations[0]
+    matched = _match_relation(store, scenario)
+    relation = matched["relation"]
+    profile = matched["profile"]
+    scenario_id = matched["scenario"]["scenario_id"]
     combination = store.get_combination(relation["combination_id"])
     if combination is None:
         raise LibraryPredictionError(f"combination {relation['combination_id']} 不存在")
@@ -240,7 +263,8 @@ def _load_matched_combination(store: ModelStore, scenario: Dict[str, Any]) -> Di
         model_artifact_paths[member["model_id"]] = str(artifact_path)
     return {
         "scenario_id": scenario_id,
-        "similarity": similarity,
+        "data_similarity": matched["data_similarity"],
+        "data_profile": profile,
         "relation": relation,
         "combination": combination,
         "combo_path": str(combo_path),
@@ -275,10 +299,14 @@ def _base_trace(
         "model_selection_source": "saved_relation",
         "selector_invoked": False,
         "scenario_id": matched["scenario_id"],
-        "scenario_similarity": matched["similarity"],
         "relation_id": relation["relation_id"],
         "combination_id": matched["combination"]["combination_id"],
+        # 命中的是哪一段历史数据——trace 要能回答"这次为什么选了这个组合"
         "data_profile_id": relation["data_profile_id"],
+        "data_ref": matched["data_profile"]["data_ref"],
+        "data_start_at": matched["data_profile"]["start_at"],
+        "data_end_at": matched["data_profile"]["end_at"],
+        "data_similarity": matched["data_similarity"],
         "strategy": matched["combination"]["strategy"],
         "model_ids": matched["model_ids"],
         "member_weights": {

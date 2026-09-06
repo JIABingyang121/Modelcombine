@@ -204,7 +204,7 @@ def run_predict(db: Path, scenario: Path, history: Path, output: Path):
 
 
 WINDOW_ROLES = (
-    ("H1", "library"), ("H2", "library"), ("H3", "library"),
+    ("S1", "library"), ("S2", "library"), ("S3", "library"),
     ("A", "audit"), ("Q1", "query"), ("Q2", "query"), ("Q3", "query"),
 )
 
@@ -217,7 +217,7 @@ def write_frozen_window_plan(
     signature_window: int = 720,
     name: str = "frozen_windows.json",
 ) -> Path:
-    """写出原始序列 `<ds>/load.csv` 与 Stage 0 已冻结的 H1—H3/A/Q1—Q3 起点。
+    """写出原始序列 `<ds>/load.csv` 与 Stage 0 已冻结的 S1—S3/A/Q1—Q3 起点。
 
     末尾对齐排布，与 scripts/stage0_data_inventory.py 的 _proposed_origins 一致。
     """

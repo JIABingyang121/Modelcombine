@@ -16,7 +16,7 @@ from sklearn.linear_model import Ridge
 
 from src.models.artifacts import save_artifact
 from src.models.combination_predictor import CombinationPredictor
-from src.pipeline.library_prediction import _match_scenario
+from src.pipeline.library_prediction import _match_relation
 from src.storage.model_store import ModelStore
 
 
@@ -217,7 +217,7 @@ def test_matching_keeps_user_region_as_a_hard_constraint(tmp_path):
         signature={"horizon": 1.0, "y_mean": 100.0, "y_std": 15.0},
     )
 
-    scenario_id, _ = _match_scenario(store, {
+    matched = _match_relation(store, {
         "task_type": "load_forecast",
         "business_domain": "power_load",
         "region": "pjm",
@@ -228,7 +228,11 @@ def test_matching_keeps_user_region_as_a_hard_constraint(tmp_path):
     })
 
     store.close()
-    assert scenario_id == "pjm_h1_reference"
+    assert matched["scenario"]["scenario_id"] == "pjm_h1_reference"
+    # 命中的是一条完整关系：场景、数据画像、组合三者都定下来了
+    assert matched["relation"]["scenario_id"] == "pjm_h1_reference"
+    assert matched["profile"]["scenario_id"] == "pjm_h1_reference"
+    assert 0.0 <= matched["data_similarity"] <= 1.0
 
 
 def test_history_prediction_uses_h1_feature_at_forecast_origin(tmp_path):

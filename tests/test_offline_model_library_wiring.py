@@ -93,7 +93,7 @@ def _run_library(tmp_path: Path, raw_root: Path, db: Path, out_root: Path):
 
 
 def test_window_plan_builds_three_relations_against_one_shared_audit_window(tmp_path):
-    """Stage 1：H1—H3 分别建库，共用 A；Q1—Q3 尚不进入建库。"""
+    """Stage 1：S1—S3 分别建库，共用 A；Q1—Q3 尚不进入建库。"""
     raw_root = tmp_path / "raw"
     artifacts = tmp_path / "artifacts"
     db = tmp_path / "lib.sqlite3"
@@ -116,7 +116,7 @@ def test_window_plan_builds_three_relations_against_one_shared_audit_window(tmp_
 
     assert proc.returncode == 0, proc.stdout + proc.stderr
     tasks = json.loads((out_root / "model_library_report.json").read_text())["tasks"]
-    assert [task["library_window"] for task in tasks] == ["H1", "H2", "H3"]
+    assert [task["scenario_sample"] for task in tasks] == ["S1", "S2", "S3"]
     assert {task["audit_window"] for task in tasks} == {"A"}
     assert len({task["test_origin"] for task in tasks}) == 1
 
@@ -378,3 +378,47 @@ def test_single_member_relation_uses_the_model_as_is(tmp_path):
     np.testing.assert_allclose(
         predictor.predict({predictor.member_ids[0]: probe}), probe, rtol=0, atol=0
     )
+
+
+def test_report_names_samples_and_horizons_without_conflating_them(tmp_path):
+    """S1/S2/S3 是历史数据样例；H1/H2/H3 只表示预测长度（24/168/720）。
+
+    数据库真正的字段仍是 forecast_steps，不新增重复的 H 字段。
+    """
+    from scripts.train_combinations_kg import FORECAST_HORIZON_LABELS
+
+    assert FORECAST_HORIZON_LABELS == {24: "H1", 168: "H2", 720: "H3"}
+
+    raw_root = tmp_path / "raw"
+    db = tmp_path / "lib.sqlite3"
+    frames = write_dataset(tmp_path / "splits", rows=ROWS)
+    seed_models(db, tmp_path / "artifacts", frames["train"])
+    window_plan = write_frozen_window_plan(raw_root, frames, forecast_steps=STEPS)
+    out_root = tmp_path / "out"
+
+    proc = subprocess.run(
+        [
+            sys.executable, "-m", "scripts.train_combinations_kg", "--model-library",
+            "--datasets", DATASET, "--forecast-steps", str(STEPS),
+            "--candidates", *FIXTURE_CANDIDATES,
+            "--raw-root", str(raw_root), "--window-plan", str(window_plan),
+            "--out-root", str(out_root), "--database", str(db),
+            "--model-artifacts", str(tmp_path / "combo_artifacts"),
+        ],
+        cwd=REPO_ROOT, capture_output=True, text=True,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    tasks = json.loads((out_root / "model_library_report.json").read_text())["tasks"]
+
+    # 三段历史数据样例叫 S1/S2/S3，不再借用 H1/H2/H3
+    assert [t["scenario_sample"] for t in tasks] == ["S1", "S2", "S3"]
+    # 预测长度别名与 forecast_steps 一一对应
+    assert {t["forecast_horizon"] for t in tasks} == {FORECAST_HORIZON_LABELS[STEPS]}
+    assert {t["forecast_steps"] for t in tasks} == {STEPS}
+
+    # 数据库里没有多出一个 H 字段，forecast_steps 仍是唯一真源
+    store = ModelStore(str(db))
+    columns = {row["name"] for row in store.connection.execute("PRAGMA table_info(scenarios)")}
+    store.close()
+    assert "forecast_steps" in columns
+    assert not any(c in columns for c in ("forecast_horizon", "horizon_label", "h_label"))

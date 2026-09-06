@@ -210,7 +210,7 @@ def test_predict_selects_expected_relation_and_emits_real_yhat(tmp_path):
             trace["model_ids"], lib["predictor"].linear_weights
         )
     }
-    assert 0.0 <= trace["scenario_similarity"] <= 1.0
+    assert 0.0 <= trace["data_similarity"] <= 1.0
     assert trace["artifact_paths"]
     assert trace["model_selection_source"] == "saved_relation"
     # 命中的是 V1 horizon=24 关系，基础预测器语义就是 24，不是恒为 1

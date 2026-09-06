@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Stage 2 归因：把"相似度选错"和"三条历史组合本身都不好"分开（只读）。
 
-对每个查询窗口 Q，分别算出它与 H1/H2/H3 三个历史场景的相似度，以及**强制**使用
+对每个查询窗口 Q，分别算出它与 S1/S2/S3 三个历史场景的相似度，以及**强制**使用
 每一条历史关系时的反事实 MAE：
 
 ```text
-Q1 × {H1, H2, H3} -> (相似度, 反事实 MAE)
-Q2 × {H1, H2, H3} -> (相似度, 反事实 MAE)
-Q3 × {H1, H2, H3} -> (相似度, 反事实 MAE)
+Q1 × {S1, S2, S3} -> (相似度, 反事实 MAE)
+Q2 × {S1, S2, S3} -> (相似度, 反事实 MAE)
+Q3 × {S1, S2, S3} -> (相似度, 反事实 MAE)
 ```
 
 由此可以直接读出两种完全不同的失败模式：
@@ -39,7 +39,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from scripts.stage2_quality_gate import (
     BASELINE_BEST_SINGLE,
     BASELINE_SEASONAL_NAIVE,
-    LIBRARY_WINDOWS,
+    SCENARIO_SAMPLES,
     QUERY_WINDOWS,
     Stage2Error,
     _candidate_matrix,
@@ -72,23 +72,26 @@ def _history_relations(
     dataset: str,
     forecast_steps: int,
 ) -> List[Dict[str, Any]]:
-    """按 H1—H3 取回建库时写下的三条关系及其组合器产物。"""
+    """按 S1—S3 取回建库时写下的三条关系及其组合器产物。"""
     relations = []
-    for window in LIBRARY_WINDOWS:
+    for window in SCENARIO_SAMPLES:
         task = next(
             t for t in report["tasks"]
             if t.get("dataset") == dataset
             and int(t.get("forecast_steps", -1)) == int(forecast_steps)
-            and t.get("library_window") == window
+            and t.get("scenario_sample") == window
         )
-        scenario = store.get_scenario(task["scenario_id"])
+        profile = store.get_data_profile(task["data_profile_id"])
         combination = store.get_combination(task["combination_id"])
         relations.append({
             "window": window,
             "scenario_id": task["scenario_id"],
             "relation_id": task["relation_id"],
+            "data_profile_id": task["data_profile_id"],
+            "data_ref": profile["data_ref"],
             "combination_id": task["combination_id"],
-            "signature": scenario["signature"],
+            # 与在线路径同口径：排序依据是数据画像的 signature，不是场景 signature
+            "signature": profile["signature"],
             "members": [m["model_id"] for m in combination["members"]],
             "weights": [float(m["weight"]) for m in combination["members"]],
             "has_interaction": bool(task["has_interaction"]),
@@ -99,16 +102,22 @@ def _history_relations(
 
 
 def _similarity(query_signature: Mapping[str, float], relations: Sequence[Mapping[str, Any]]):
-    """用在线检索同一套 ScenarioIndex 打分，保证与生产路径口径一致。"""
+    """用在线检索同一套 ScenarioIndex 打分，且同样按**数据画像**排序。
+
+    键取 relation_id：同一个场景下可以有多条关系，用 scenario_id 当键会把它们折叠。
+    """
     index = ScenarioIndex()
     for relation in relations:
         index.add({
-            "scenario_id": relation["scenario_id"],
+            "scenario_id": str(relation["relation_id"]),
             "signature": relation["signature"],
             "business_domain": MODEL_LIBRARY_BUSINESS_DOMAIN,
         })
     ranked = index.query(signature=dict(query_signature))
-    return {row["scenario_id"]: float(row["_score"]) for row in ranked}, ranked[0]["scenario_id"]
+    return (
+        {int(row["scenario_id"]): float(row["_score"]) for row in ranked},
+        int(ranked[0]["scenario_id"]),
+    )
 
 
 def attribute_task(
@@ -158,7 +167,7 @@ def attribute_task(
         signature = history_window_signature(
             history, freq="h", base_horizon=MODEL_LIBRARY_BASE_HORIZON
         )
-        scores, selected_scenario = _similarity(signature, relations)
+        scores, selected_relation_id = _similarity(signature, relations)
 
         per_history = []
         for relation in relations:
@@ -180,16 +189,18 @@ def attribute_task(
                 "window": relation["window"],
                 "scenario_id": relation["scenario_id"],
                 "relation_id": relation["relation_id"],
+                "data_profile_id": relation["data_profile_id"],
+                "data_ref": relation["data_ref"],
                 "members": [m.split("__")[-1] for m in relation["members"]],
                 "weights": relation["weights"],
                 "has_interaction": relation["has_interaction"],
                 "validation_mae": relation["validation_mae"],
-                "similarity": scores[relation["scenario_id"]],
+                "similarity": scores[relation["relation_id"]],
                 "counterfactual_mae": mae(y, yhat),
                 "counterfactual_rmse": rmse(y, yhat),
             })
 
-        selected = next(e for e in per_history if e["scenario_id"] == selected_scenario)
+        selected = next(e for e in per_history if e["relation_id"] == selected_relation_id)
         oracle = min(per_history, key=lambda e: (e["counterfactual_mae"], e["window"]))
         # 并列时 top1 必须算命中：多条关系可能给出完全相同的轨迹（例如都被归约成
         # 同一个单模型），此时按窗口名 tie-break 选出的 oracle 只是个记号，选中另一条
@@ -217,6 +228,8 @@ def attribute_task(
             "per_history_relation": per_history,
             "selected": {
                 "window": selected["window"], "scenario_id": selected["scenario_id"],
+                "relation_id": selected["relation_id"],
+                "data_profile_id": selected["data_profile_id"],
                 "similarity": selected["similarity"],
                 "counterfactual_mae": selected["counterfactual_mae"],
             },

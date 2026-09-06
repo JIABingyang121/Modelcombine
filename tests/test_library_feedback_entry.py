@@ -155,8 +155,12 @@ def test_timestamp_misalignment_is_rejected(tmp_path):
     store.close()
 
 
-def _seed_second_relation(db, scenario_id, *, validation_mae):
-    """在同一 scenario 下追加第二个组合关系，复用已有 combination。"""
+def _seed_second_relation(db, scenario_id, *, validation_mae, signature=None):
+    """在同一 scenario 下追加第二个组合关系，复用已有 combination。
+
+    ``signature`` 默认与既有关系的数据画像**完全相同**——只有画像无法区分时，
+    反馈统计才会成为 tie-break，这正是本文件要覆盖的情形。
+    """
     store = ModelStore(str(db))
     combo_id = store.connection.execute(
         "SELECT combination_id FROM combinations LIMIT 1"
@@ -165,14 +169,23 @@ def _seed_second_relation(db, scenario_id, *, validation_mae):
         scenario_id=scenario_id, data_ref="data/alt", target_column="y",
         features=["hour", "dow", "temp"], sample_count=200,
         start_at="2024-01-01T00:00:00+00:00", end_at="2024-06-01T00:00:00+00:00",
-        signature={"y_mean": 100.0},
+        signature=signature or {
+            "y_mean": 100.0, "y_std": 15.0, "y_cv": 0.15,
+            "mean_load": 100.0, "cv_load": 0.15,
+        },
     )
     rel_id = store.add_relation(scenario_id, profile_id, combo_id, validation_mae=validation_mae)
     store.close()
     return rel_id
 
 
-def test_subsequent_match_reads_updated_actual_mae_not_counts(tmp_path):
+def test_feedback_breaks_ties_only_when_data_profiles_are_indistinguishable(tmp_path):
+    """在线匹配的第一顺位是数据画像相似度；画像完全并列时才看反馈统计。
+
+    这里两条关系的数据画像**一模一样**，用户数据对二者的相似度必然相等，因此
+    tie-break 生效：有反馈的按 mean_actual_mae 升序，use_count 不参与。反馈通过
+    run.py feedback 改善后，后续匹配随之改变。
+    """
     lib = _build_library(tmp_path)
     features = _future_features(tmp_path)
     scenario = _scenario_json(tmp_path)
@@ -214,3 +227,35 @@ def test_subsequent_match_reads_updated_actual_mae_not_counts(tmp_path):
     assert _predict(lib["db"], scenario, features, out2).returncode == 0
     t2 = json.loads((tmp_path / "p2.trace.json").read_text())
     assert t2["relation_id"] == rel_lo  # 4.75 < 8，匹配随反馈更新而改变
+
+
+def test_data_similarity_outranks_feedback_when_profiles_differ(tmp_path):
+    """数据画像能区分时，相似度说了算，反馈不得把匹配拉回另一条关系。
+
+    给第二条关系一个与用户数据明显不同量级的画像，并让它的反馈表现远好于第一条；
+    匹配仍必须落在画像更接近的第一条上。
+    """
+    lib = _build_library(tmp_path)
+    features = _future_features(tmp_path)
+    scenario = _scenario_json(tmp_path)
+
+    rel_near = lib["rel_a"]
+    rel_far = _seed_second_relation(
+        lib["db"], "pjm_h24_A", validation_mae=0.1,
+        signature={"y_mean": 5000.0, "y_std": 900.0, "y_cv": 0.18,
+                   "mean_load": 5000.0, "cv_load": 0.18},
+    )
+
+    store = ModelStore(str(lib["db"]))
+    run_near = store.record_prediction_run(rel_near, "near.csv")
+    store.record_feedback(run_near, actual_mae=50.0)     # 近的那条反馈很差
+    run_far = store.record_prediction_run(rel_far, "far.csv")
+    store.record_feedback(run_far, actual_mae=0.1)       # 远的那条反馈极好
+    store.close()
+
+    out = tmp_path / "p.csv"
+    assert _predict(lib["db"], scenario, features, out).returncode == 0
+    trace = json.loads((tmp_path / "p.trace.json").read_text())
+
+    assert trace["relation_id"] == rel_near
+    assert trace["data_similarity"] > 0.0

@@ -8,7 +8,7 @@
 - 每个预测起点之前必须有完整的 ``signature_window`` 小时真实历史（默认 720）；
 - 每条轨迹覆盖 ``forecast_steps`` 小时目标，相邻起点至少间隔 ``forecast_steps``
   小时，使目标区间互不重叠；
-- 窗口序列固定为 ``H1,H2,H3,A,Q1,Q2,Q3``（§6.2/§6.3）：H1—H3 建三条历史关系，
+- 窗口序列固定为 ``S1,S2,S3,A,Q1,Q2,Q3``（§6.2/§6.3）：S1—S3 建三条历史关系，
   A 是三条关系共用的冻结后审计窗口（不参与成员/权重/阈值/路由选择），
   Q1—Q3 是未见查询窗口；
 - 因此需要一段连续的 ``signature_window + 7 * forecast_steps`` 小时数据。
@@ -34,9 +34,9 @@ from src.storage.model_store import SUPPORTED_FORECAST_STEPS
 
 #: §6.2 的窗口序列与各自角色。顺序即时间顺序，不可重排。
 WINDOW_ROLES: tuple[tuple[str, str], ...] = (
-    ("H1", "library"),
-    ("H2", "library"),
-    ("H3", "library"),
+    ("S1", "library"),
+    ("S2", "library"),
+    ("S3", "library"),
     ("A", "audit"),
     ("Q1", "query"),
     ("Q2", "query"),
@@ -244,7 +244,7 @@ def main() -> int:
                         help="预测起点之前必须具备的真实历史小时数（§6.1）")
     parser.add_argument("--trajectories", type=int, default=len(WINDOW_ROLES),
                         help="每个数据集×预测长度需要的不重叠轨迹条数"
-                             "（§6.2：H1,H2,H3,A,Q1,Q2,Q3 共 7 条）")
+                             "（§6.2：S1,S2,S3,A,Q1,Q2,Q3 共 7 条）")
     parser.add_argument("--out", type=Path, default=Path("reports/stage0/data_inventory.json"))
     args = parser.parse_args()
 

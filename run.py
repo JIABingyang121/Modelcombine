@@ -53,8 +53,13 @@ def _predict_command(argv):
     print(f"预测长度: forecast_steps={trace['forecast_steps']}（输出 {trace['n_rows']} 行）")
     print(f"trace: {trace['trace_path']}")
     print(
-        f"匹配场景: {trace['scenario_id']} (相似度 {trace['scenario_similarity']:.4f})，"
-        f"relation_id={trace['relation_id']}, prediction_run_id={trace['prediction_run_id']}"
+        f"命中关系: relation_id={trace['relation_id']}（场景 {trace['scenario_id']}，"
+        f"数据 {trace['data_ref']} {trace['data_start_at']}~{trace['data_end_at']}，"
+        f"数据相似度 {trace['data_similarity']:.4f}）"
+    )
+    print(
+        f"组合: combination_id={trace['combination_id']}，成员 {trace['model_ids']}，"
+        f"prediction_run_id={trace['prediction_run_id']}"
     )
     return 0
 
