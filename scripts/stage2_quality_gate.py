@@ -30,6 +30,7 @@ import argparse
 import json
 import sys
 import tempfile
+from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -523,18 +524,28 @@ def evaluate_gates(tasks: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
         by_steps.setdefault(int(task["forecast_steps"]), []).append(task)
 
     # 覆盖度：任务集合必须"恰好等于"3×3。缺格子不是方案口径；多格子会混进同一长度的
-    # 等权平均，同样不是方案口径。
-    present = {(t["dataset"], int(t["forecast_steps"])) for t in tasks}
+    # 等权平均，同样不是方案口径。判据同时看**记录条数**和**去重后的格子集合**：
+    # 只比集合的话，同一个格子重复出现会被 set 折叠，10 条记录也能判成 9 格通过，
+    # 而重复记录在逐长度的 {dataset: ratio} 里会静默覆盖掉原来那条。
+    counts = Counter((t["dataset"], int(t["forecast_steps"])) for t in tasks)
+    present = set(counts)
     expected = {(d, s) for d in REQUIRED_DATASETS for s in REQUIRED_FORECAST_STEPS}
     missing = sorted(expected - present)
     extra = sorted(present - expected)
+    duplicated = sorted(cell for cell, n in counts.items() if n > 1)
     rules: List[Dict[str, Any]] = [{
         "rule": "coverage",
-        "description": "任务集合必须恰好等于 3 数据集 × 3 预测长度 = 9 个任务，不多不少",
+        "description": "任务集合必须恰好等于 3 数据集 × 3 预测长度 = 9 个任务，"
+                       "不多不少、不重复",
         "expected_tasks": len(expected), "present_tasks": len(present & expected),
+        "task_records": len(tasks),
         "missing_tasks": [{"dataset": d, "forecast_steps": s} for d, s in missing],
         "extra_tasks": [{"dataset": d, "forecast_steps": s} for d, s in extra],
-        "passed": not missing and not extra,
+        "duplicate_tasks": [
+            {"dataset": d, "forecast_steps": s, "records": counts[(d, s)]}
+            for d, s in duplicated
+        ],
+        "passed": len(tasks) == len(expected) and present == expected,
     }]
     for steps in sorted(by_steps):
         group = by_steps[steps]
@@ -542,8 +553,14 @@ def evaluate_gates(tasks: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
         bs_mean = float(np.mean(list(bs_ratios.values())))
         # 等权平均只有在"该长度的数据集恰好是这三个"时才是方案定义的口径：多一个
         # 数据集就会把它的比值一起平均进去，改掉本应由 PJM/VIC/NSW 决定的结论。
+        # group 行数也要恰好是三条：重复任务会在 {dataset: ratio} 里静默覆盖，
+        # 只看键集合看不出来。
         core_steps = steps in REQUIRED_FORECAST_STEPS
-        complete = core_steps and set(bs_ratios) == set(REQUIRED_DATASETS)
+        complete = (
+            core_steps
+            and len(group) == len(REQUIRED_DATASETS)
+            and set(bs_ratios) == set(REQUIRED_DATASETS)
+        )
         rules.append({
             "rule": "11.2.1a", "forecast_steps": steps,
             "description": "相对 Validation Best Single：三数据集等权平均 MAE 比值 < 1.00",
@@ -713,8 +730,10 @@ def main() -> int:
               + "，".join(f"{m} MAE={metrics[m]['mae']:.4f}" for m in METHODS))
     coverage = next(r for r in acceptance["rules"] if r["rule"] == "coverage")
     if not coverage["passed"]:
-        print(f"[stage2] 覆盖度不足：缺少 {coverage['missing_tasks']}；"
-              "这不是完整的 3×3 口径，所有等权平均门槛一律判不通过。")
+        print(f"[stage2] 覆盖度不符：记录 {coverage['task_records']} 条，"
+              f"缺少 {coverage['missing_tasks']}，多余 {coverage['extra_tasks']}，"
+              f"重复 {coverage['duplicate_tasks']}；"
+              "这不是恰好 3×3 的口径，所有等权平均门槛一律判不通过。")
     for rule in acceptance["rules"]:
         if rule["rule"] == "11.1.4" and not rule["passed"]:
             print(f"[stage2] {rule['dataset']} s={rule['forecast_steps']} "

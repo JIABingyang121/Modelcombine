@@ -440,6 +440,36 @@ def test_extra_forecast_steps_cannot_produce_a_pass_verdict():
     assert acceptance["passed"] is False
 
 
+def test_duplicate_core_task_cannot_produce_a_pass_verdict():
+    """正常 9 格再重复一条 PJM×24：记录 10 条、去重后仍是 9 格，必须判负。
+
+    只比"去重后的格子集合"看不出重复——set 会把它折叠；而重复记录在逐长度的
+    {dataset: ratio} 里会静默覆盖掉原来那条，等权平均用的其实是后进来的那份。
+    """
+    tasks = _full_grid(mc=100.0, best_single=100.0, seasonal=100.0, ridge=100.0)
+    # 重复的这条比值极好，若被采纳会把 24 步均值从 1.00 拉到 0.673
+    tasks.append(_task("pjm", 24, mc=2.0, best_single=100.0, seasonal=100.0, ridge=100.0))
+
+    acceptance = evaluate_gates(tasks)
+
+    coverage = _rule_by_name(acceptance, "coverage")
+    assert coverage["passed"] is False
+    assert coverage["task_records"] == 10 and coverage["expected_tasks"] == 9
+    # 缺失和多余都为空——只有"重复"这一项能解释失败
+    assert coverage["missing_tasks"] == [] and coverage["extra_tasks"] == []
+    assert coverage["duplicate_tasks"] == [
+        {"dataset": "pjm", "forecast_steps": 24, "records": 2}
+    ]
+
+    for name in ("11.2.1a", "11.2.1b", "11.2.2", "11.2.3"):
+        rule = _rule(acceptance, name, 24)
+        assert rule["datasets_complete"] is False, name
+        assert rule["passed"] is False, name
+    # 另外两个长度没被污染
+    assert _rule(acceptance, "11.2.1a", 168)["datasets_complete"] is True
+    assert acceptance["passed"] is False
+
+
 def test_full_grid_passes_coverage(stage2):
     tasks = _full_grid(mc=1.0, best_single=100.0, seasonal=100.0, ridge=100.0)
 
@@ -448,6 +478,7 @@ def test_full_grid_passes_coverage(stage2):
     coverage = _rule_by_name(acceptance, "coverage")
     assert coverage["passed"] is True
     assert coverage["missing_tasks"] == [] and coverage["extra_tasks"] == []
+    assert coverage["duplicate_tasks"] == [] and coverage["task_records"] == 9
     assert acceptance["passed"] is True
     # 真实合成装置只跑了单数据集单长度，因此它的覆盖度必然不过
     assert _rule_by_name(stage2["acceptance"], "coverage")["passed"] is False
