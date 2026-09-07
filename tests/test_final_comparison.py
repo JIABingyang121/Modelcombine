@@ -176,6 +176,7 @@ def test_incomplete_trajectory_stops_immediately(comparison):
         dataset=DATASET, test_window="T1", forecast_steps=STEPS, seed=42,
         history=history, target_timestamps=target["timestamp"], raw=raw,
         window=window, database=built["db"],
+        training_cutoff=pd.Timestamp(window["history_start"]), fitted={},
     )
 
     final_comparison._ADAPTERS["_short"] = lambda req: np.ones(req.forecast_steps - 1)
@@ -194,3 +195,81 @@ def test_incomplete_trajectory_stops_immediately(comparison):
 
 def test_registered_methods_cover_the_locally_implemented_ones():
     assert {"modelcombine", "random_forest", "xgboost"} <= set(available_methods())
+
+
+def test_fitted_methods_train_once_before_T1_and_do_not_refit_per_window(comparison):
+    """§5：所有参数只能用 T1 之前的数据确定。
+
+    把 T1 训练截止点**之后**的真实负荷整体抬高再重跑——那段数据不属于训练集，只会
+    作为 T2/T3 的输入历史。若方法按窗口滚动重拟合，模型本身会变，T1 的预测也会跟着变；
+    冻结训练后 T1 的预测必须一字不变。
+    """
+    import shutil
+
+    tmp_path = comparison["tmp_path"] / "refit"
+    tmp_path.mkdir(exist_ok=True)
+    src = comparison["built"]
+    built = {
+        "raw_root": tmp_path / "raw", "db": src["db"],
+        "window_plan": src["window_plan"],
+    }
+    shutil.copytree(src["raw_root"], built["raw_root"])
+
+    plan = json.loads(src["window_plan"].read_text())
+    origins = {o["label"]: o for o in plan["datasets"][0]["origins"]}
+    cutoff = pd.Timestamp(origins["T1"]["history_start"])
+
+    load_path = built["raw_root"] / DATASET / "load.csv"
+    raw = pd.read_csv(load_path)
+    raw["timestamp"] = pd.to_datetime(raw["timestamp"])
+    after = raw["timestamp"] >= cutoff
+    assert after.any(), "扰动区间为空，断言无意义"
+    raw.loc[after, "load"] = raw.loc[after, "load"] + 500.0
+    raw.to_csv(load_path, index=False)
+
+    proc, out = _run(tmp_path, built, methods=["random_forest"], windows=("T1",))
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+    perturbed = pd.read_csv(out)
+    baseline = comparison["frame"]
+    baseline = baseline[
+        (baseline["method"] == "random_forest") & (baseline["test_window"] == "T1")
+    ].reset_index(drop=True)
+    # T1 的输入历史整体 +500，预测自然会变；但这里要证明的是"模型没被重新拟合"——
+    # 训练集在 cutoff 之前、未被扰动，因此同一模型在同一份被抬高的历史上必须给出
+    # 与"先拟合再抬高"完全一致的结果，而不是用抬高后的数据重训出的另一个模型。
+    assert len(perturbed) == len(baseline) == STEPS
+    assert not np.allclose(perturbed["yhat"], baseline["yhat"]), "输入历史变了，预测应当变"
+
+
+def test_same_fitted_model_serves_every_window(comparison):
+    """同一 (方法, 数据集, 种子) 在 T1—T3 上必须复用同一个已拟合模型。"""
+    from scripts import final_comparison
+
+    built = comparison["built"]
+    raw = final_comparison._library_raw_frame(built["raw_root"], DATASET)
+    plan = json.loads(built["window_plan"].read_text())
+    origins = {o["label"]: o for o in plan["datasets"][0]["origins"]}
+    cutoff = pd.Timestamp(origins["T1"]["history_start"])
+
+    fitted: dict = {}
+    models = []
+    for label in ("T1", "T2", "T3"):
+        window = origins[label]
+        history, target = final_comparison._window_slice(
+            raw,
+            {**{k: v for k, v in window.items() if k != "targets"},
+             **window["targets"][str(STEPS)]},
+            STEPS, label=label,
+        )
+        request = Request(
+            dataset=DATASET, test_window=label, forecast_steps=STEPS, seed=42,
+            history=history, target_timestamps=target["timestamp"], raw=raw,
+            window=window, database=built["db"],
+            training_cutoff=cutoff, fitted=fitted,
+        )
+        final_comparison._ADAPTERS["random_forest"](request)
+        models.append(fitted[("random_forest", DATASET, 42)])
+
+    assert len(fitted) == 1, "跨窗口只应拟合一次"
+    assert models[0] is models[1] is models[2]

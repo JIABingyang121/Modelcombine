@@ -13,7 +13,12 @@ timestamp,y_true,yhat,method,dataset,test_window,forecast_steps,seed
 窗口来自 Stage 0 冻结的共享起点：同一个起点同时产生 H1=24、H2=168、H3=720，三种长度
 共享同一份 720 小时输入历史与同一个 ``forecast_origin``。
 
-本入口不训练、不选模、不读测试窗口真实值去做任何选择；真实值只用于写出 ``y_true``。
+本入口不选模、不读测试窗口真实值去做任何选择；真实值只用于写出 ``y_true``。
+
+§5 的训练口径：所有参数只能用 **T1 之前**的数据确定。因此需要拟合的方法在
+``training_cutoff``（默认取 T1 的 ``history_start``）上**只训练一次**，T1—T3 全程复用
+同一个已拟合模型——不按窗口滚动重拟合。否则 T2/T3 会用上 T1 之后的数据，与"静态组合在
+T1—T3 上保持同一个组合器"和"Modelcombine 基础模型全程冻结"都不一致。
 """
 from __future__ import annotations
 
@@ -65,6 +70,7 @@ class Request:
         self, *, dataset: str, test_window: str, forecast_steps: int, seed: int,
         history: pd.DataFrame, target_timestamps: pd.Series, raw: pd.DataFrame,
         window: Dict[str, Any], database: Path | None,
+        training_cutoff: pd.Timestamp, fitted: Dict[tuple, Any],
     ) -> None:
         self.dataset = dataset
         self.test_window = test_window
@@ -75,6 +81,10 @@ class Request:
         self.raw = raw
         self.window = window
         self.database = database
+        #: 训练数据的右边界（不含）：严格早于它的真实数据才可用于拟合
+        self.training_cutoff = pd.Timestamp(training_cutoff)
+        #: 跨窗口共享的已拟合模型缓存，保证 T1—T3 用的是同一个模型
+        self.fitted = fitted
         self.country = MODEL_LIBRARY_COUNTRY_BY_REGION[dataset]
 
 
@@ -149,21 +159,29 @@ def _recursive_single_model(request: Request, model: Any, model_type: str) -> np
     )
 
 
-def _fit_on_history_before(request: Request) -> tuple:
-    """只用该窗口输入历史之前（含）的真实数据训练，绝不触及目标区间。"""
-    cutoff = pd.Timestamp(request.window["forecast_origin"])
-    train = request.raw[request.raw["timestamp"] <= cutoff]
-    return _supervised_matrix(train)
+def _fit_once(request: Request, name: str, build: Callable[[], Any]) -> Any:
+    """在 ``training_cutoff`` 之前的数据上只训练一次，T1—T3 全程复用同一个模型。"""
+    key = (name, request.dataset, request.seed)
+    if key not in request.fitted:
+        train = request.raw[request.raw["timestamp"] < request.training_cutoff]
+        x, y = _supervised_matrix(train)
+        if x.empty:
+            raise FinalComparisonError(
+                f"{request.dataset}: training_cutoff={request.training_cutoff} 之前没有可用训练样本"
+            )
+        model = build()
+        model.fit(x, y)
+        request.fitted[key] = model
+    return request.fitted[key]
 
 
 @register("random_forest")
 def _random_forest(request: Request) -> np.ndarray:
     from sklearn.ensemble import RandomForestRegressor
 
-    x, y = _fit_on_history_before(request)
-    model = RandomForestRegressor(
+    model = _fit_once(request, "random_forest", lambda: RandomForestRegressor(
         n_estimators=300, random_state=request.seed, n_jobs=-1,
-    ).fit(x, y)
+    ))
     return _recursive_single_model(request, model, "random_forest")
 
 
@@ -171,12 +189,10 @@ def _random_forest(request: Request) -> np.ndarray:
 def _xgboost(request: Request) -> np.ndarray:
     from src.models.registry import model_registry
 
-    x, y = _fit_on_history_before(request)
-    model = model_registry.create(
+    model = _fit_once(request, "xgboost", lambda: model_registry.create(
         "xgboost_reg", n_estimators=300, max_depth=8, learning_rate=0.03,
         subsample=0.8, colsample_bytree=0.8, random_state=request.seed, n_jobs=-1,
-    )
-    model.fit(x, y)
+    ))
     return _recursive_single_model(request, model, "xgboost")
 
 
@@ -214,12 +230,17 @@ def run(
     methods: Sequence[str], datasets: Sequence[str], windows: Sequence[str],
     forecast_steps: Sequence[int], seeds: Sequence[int],
     raw_root: Path, window_plan: Path, database: Path | None,
+    training_cutoff: Dict[str, pd.Timestamp] | None = None,
 ) -> pd.DataFrame:
     rows: List[pd.DataFrame] = []
+    fitted: Dict[tuple, Any] = {}
     for dataset in datasets:
         raw = _library_raw_frame(raw_root, dataset)
         for steps in forecast_steps:
             frozen = _frozen_windows(window_plan, dataset, int(steps))
+            cutoff = (training_cutoff or {}).get(dataset) or pd.Timestamp(
+                frozen[windows[0]]["history_start"]
+            )
             for label in windows:
                 if label not in frozen:
                     raise FinalComparisonError(
@@ -237,6 +258,7 @@ def run(
                         seed=int(seed), history=history,
                         target_timestamps=target["timestamp"], raw=raw,
                         window=frozen[label], database=database,
+                        training_cutoff=cutoff, fitted=fitted,
                     )
                     for method in methods:
                         frame = run_request(method, request)
