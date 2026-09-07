@@ -62,6 +62,7 @@ def _run(tmp_path: Path, built: dict, *, methods, windows=("T1", "T2", "T3"), se
         [
             sys.executable, "scripts/final_comparison.py",
             "--methods", *methods, "--datasets", DATASET,
+            "--candidates", *FIXTURE_CANDIDATES,
             "--windows", *windows, "--forecast-steps", str(STEPS),
             "--seeds", *[str(s) for s in seeds],
             "--raw-root", str(built["raw_root"]),
@@ -273,3 +274,22 @@ def test_same_fitted_model_serves_every_window(comparison):
 
     assert len(fitted) == 1, "跨窗口只应拟合一次"
     assert models[0] is models[1] is models[2]
+
+
+def test_stack_reproduction_runs_through_the_same_entry(comparison):
+    """Multi-layer stack 复现版与其他方法共用同一个入口与同一批冻结候选。"""
+    tmp_path = comparison["tmp_path"] / "stack"
+    tmp_path.mkdir(exist_ok=True)
+    proc, out = _run(
+        tmp_path, comparison["built"],
+        methods=["stack_ensembles_reproduction"], windows=("T1",),
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+    frame = pd.read_csv(out)
+    assert list(frame.columns) == list(OUTPUT_COLUMNS)
+    assert len(frame) == STEPS
+    assert set(frame["method"]) == {"stack_ensembles_reproduction"}
+    assert np.isfinite(frame["yhat"]).all()
+    # 方法名里必须带 reproduction，产物不得被读成官方实现
+    assert "reproduction" in frame["method"].iloc[0]

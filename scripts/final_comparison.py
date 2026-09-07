@@ -39,14 +39,20 @@ if str(PROJECT_ROOT) not in sys.path:
 from scripts.stage2_quality_gate import Stage2Error, _window_slice
 from scripts.train_combinations_kg import (
     MODEL_LIBRARY_BASE_HORIZON,
+    _library_candidate_models,
     MODEL_LIBRARY_BUSINESS_DOMAIN,
     MODEL_LIBRARY_COUNTRY_BY_REGION,
     MODEL_LIBRARY_TASK_TYPE,
     _frozen_windows,
     _library_raw_frame,
 )
-from src.models.trajectory_forecast import generate_member_trajectory
-from src.storage.model_store import SUPPORTED_FORECAST_STEPS
+from src.models.stack_ensemble import K_FOLDS, MultiLayerStackEnsemble
+from src.models.trajectory_forecast import (
+    generate_member_trajectory,
+    generate_trajectory_matrix,
+)
+from src.storage.model_store import ModelStore
+from src.storage.model_store import SUPPORTED_FORECAST_STEPS  # noqa: F401
 
 #: 输出长表的列顺序，所有方法一致。
 OUTPUT_COLUMNS = (
@@ -71,6 +77,7 @@ class Request:
         history: pd.DataFrame, target_timestamps: pd.Series, raw: pd.DataFrame,
         window: Dict[str, Any], database: Path | None,
         training_cutoff: pd.Timestamp, fitted: Dict[tuple, Any],
+        candidates: Sequence[str] = (),
     ) -> None:
         self.dataset = dataset
         self.test_window = test_window
@@ -85,6 +92,8 @@ class Request:
         self.training_cutoff = pd.Timestamp(training_cutoff)
         #: 跨窗口共享的已拟合模型缓存，保证 T1—T3 用的是同一个模型
         self.fitted = fitted
+        #: 冻结候选池：Multi-layer Stack 与 Modelcombine 共用同一批基预测（§5）
+        self.candidates = list(candidates)
         self.country = MODEL_LIBRARY_COUNTRY_BY_REGION[dataset]
 
 
@@ -196,6 +205,100 @@ def _xgboost(request: Request) -> np.ndarray:
     return _recursive_single_model(request, model, "xgboost")
 
 
+@register("stack_ensembles_reproduction")
+def _stack_ensembles_reproduction(request: Request) -> np.ndarray:
+    """Multi-layer stack ensemble 的**复现版**，不是官方实现。
+
+    与 Modelcombine 共用同一批冻结候选作为 L1（§5）。两级时序交叉验证的 K 个验证窗口
+    全部取在 ``training_cutoff`` 之前，因此不触及任何测试窗口真值。
+    """
+    if request.database is None or not request.candidates:
+        raise FinalComparisonError(
+            "stack_ensembles_reproduction 需要 --database 与 --candidates"
+        )
+    key = ("stack_ensembles_reproduction", request.dataset, request.forecast_steps)
+    if key not in request.fitted:
+        members = _frozen_members(request)
+        folds, columns = _stack_validation_folds(request, members)
+        request.fitted[key] = (MultiLayerStackEnsemble().fit(folds), columns)
+    ensemble, columns = request.fitted[key]
+    base = _trajectory_matrix(request, _frozen_members(request), request.history, columns)
+    return ensemble.predict(base)
+
+
+def _frozen_members(request: Request) -> Dict[str, Dict[str, Any]]:
+    """冻结候选池，按 (数据集) 缓存一次，避免每个窗口都重新加载产物。"""
+    key = ("_members", request.dataset)
+    if key not in request.fitted:
+        store = ModelStore(str(request.database))
+        try:
+            members, _skipped = _library_candidate_models(
+                store, dataset=request.dataset,
+                base_horizon=MODEL_LIBRARY_BASE_HORIZON,
+                model_types=request.candidates,
+            )
+        finally:
+            store.close()
+        request.fitted[key] = members
+    return request.fitted[key]
+
+
+def _trajectory_matrix(
+    request: Request, members: Dict[str, Dict[str, Any]],
+    history: pd.DataFrame, columns: Sequence[str],
+) -> np.ndarray:
+    """冻结候选在给定历史上的 H 步轨迹矩阵，列顺序固定为 ``columns``。"""
+    matrix, skipped = generate_trajectory_matrix(
+        members=members, history=history,
+        forecast_steps=request.forecast_steps, country=request.country,
+    )
+    missing = [c for c in columns if c not in matrix.columns]
+    if missing:
+        reasons = {e["model_type"]: e["reason"] for e in skipped}
+        raise FinalComparisonError(
+            f"{request.dataset}: 冻结候选 {missing} 在该窗口产不出轨迹（{[reasons.get(m) for m in missing]}）"
+        )
+    return matrix[list(columns)].to_numpy(dtype=float)
+
+
+def _stack_validation_folds(
+    request: Request, members: Dict[str, Dict[str, Any]]
+) -> tuple:
+    """§3.2 的 K 折时序交叉验证窗口，全部落在 training_cutoff 之前。
+
+    第 k 折的验证窗口是倒数第 j=(K-k+1) 个长度 H 的区间。基预测器已冻结（本方案 §5），
+    因此这里只生成它们在各折上的 H 步预测，不逐折重训——见 stack_ensemble 模块文档的
+    偏差说明。合格候选由轨迹契约决定：需要未来外生变量的候选在这里就会被排除。
+    """
+    steps = request.forecast_steps
+    usable = request.raw[request.raw["timestamp"] < request.training_cutoff]
+    folds: List[tuple] = []
+    columns: List[str] | None = None
+    for j in range(K_FOLDS, 0, -1):
+        end = len(usable) - (j - 1) * steps
+        start = end - steps
+        if start <= 0:
+            raise FinalComparisonError(
+                f"{request.dataset}: training_cutoff 之前不足以容纳 {K_FOLDS} 折 × {steps} 步"
+            )
+        history = usable.iloc[:start]
+        target = usable.iloc[start:end]
+        matrix, _skipped = generate_trajectory_matrix(
+            members=members, history=history,
+            forecast_steps=steps, country=request.country,
+        )
+        available = sorted(c for c in matrix.columns if c in members)
+        if not available:
+            raise FinalComparisonError(
+                f"{request.dataset}: 没有任何冻结候选能在验证折上产出轨迹"
+            )
+        columns = available if columns is None else [c for c in columns if c in available]
+        folds.append((matrix, target["load"].to_numpy(dtype=float)))
+    if not columns:
+        raise FinalComparisonError(f"{request.dataset}: K 折之间没有共同的合格候选")
+    return [(m[list(columns)].to_numpy(dtype=float), y) for m, y in folds], columns
+
+
 # ------------------------------------------------------------------ 运行
 def run_request(method: str, request: Request) -> pd.DataFrame:
     adapter = _ADAPTERS.get(method)
@@ -231,6 +334,7 @@ def run(
     forecast_steps: Sequence[int], seeds: Sequence[int],
     raw_root: Path, window_plan: Path, database: Path | None,
     training_cutoff: Dict[str, pd.Timestamp] | None = None,
+    candidates: Sequence[str] = (),
 ) -> pd.DataFrame:
     rows: List[pd.DataFrame] = []
     fitted: Dict[tuple, Any] = {}
@@ -259,6 +363,7 @@ def run(
                         target_timestamps=target["timestamp"], raw=raw,
                         window=frozen[label], database=database,
                         training_cutoff=cutoff, fitted=fitted,
+                        candidates=candidates,
                     )
                     for method in methods:
                         frame = run_request(method, request)
@@ -282,7 +387,10 @@ def main() -> int:
     parser.add_argument("--raw-root", type=Path, required=True)
     parser.add_argument("--window-plan", type=Path, required=True)
     parser.add_argument("--database", type=Path, default=None,
-                        help="modelcombine 使用的已冻结 SQLite 模型库")
+                        help="modelcombine 与 stack 复现版使用的已冻结 SQLite 模型库")
+    parser.add_argument("--candidates", nargs="+", default=[],
+                        help="冻结候选池；stack_ensembles_reproduction 需要，"
+                             "必须与建库时声明的一致")
     parser.add_argument("--out", type=Path, required=True, help="输出长表 CSV")
     args = parser.parse_args()
 
@@ -291,6 +399,7 @@ def main() -> int:
             methods=args.methods, datasets=args.datasets, windows=args.windows,
             forecast_steps=args.forecast_steps, seeds=args.seeds,
             raw_root=args.raw_root, window_plan=args.window_plan, database=args.database,
+            candidates=args.candidates,
         )
     except FinalComparisonError as exc:
         print(f"[final] 运行不完整，立即停止: {exc}")
