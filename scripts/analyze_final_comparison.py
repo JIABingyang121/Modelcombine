@@ -32,6 +32,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.final_comparison import OUTPUT_COLUMNS
+from src.models.external_adapters import METHOD_LIMITATIONS
 
 METHOD_UNDER_TEST = "modelcombine"
 TASK_KEYS = ("dataset", "test_window", "forecast_steps")
@@ -157,6 +158,11 @@ def _conclusions(tasks: pd.DataFrame) -> Dict[str, Any]:
         })
     return {
         "rule": "27 个任务平均 MAE 更低，且至少赢得 14/27，才能表述总体更优",
+        #: 与这些方法的比较不得被读成同等条件下的比较
+        "method_limitations": {
+            method: METHOD_LIMITATIONS[method]
+            for method in sorted(set(tasks["method"])) if method in METHOD_LIMITATIONS
+        },
         "complete_grid": bool(
             tasks.groupby(list(TASK_KEYS)).ngroups == EXPECTED_TASKS
         ),
@@ -227,6 +233,8 @@ def main() -> int:
     conclusions = report["conclusions"]
     if not conclusions["complete_grid"]:
         print(f"[analyze] 任务数不是 {EXPECTED_TASKS}，不得按完整实验表述结论。")
+    for method, limitation in conclusions["method_limitations"].items():
+        print(f"[analyze] ！{method} 限制：{limitation}")
     for row in conclusions["comparisons"]:
         verdict = "可表述总体更优" if row["overall_better"] else "不得表述总体更优"
         print(f"[analyze] vs {row['versus']:<28} 平均 MAE "

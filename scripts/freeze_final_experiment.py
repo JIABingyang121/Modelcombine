@@ -21,6 +21,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.final_comparison import BASE_FEATURES, OUTPUT_COLUMNS, available_methods
+from src.models.external_adapters import METHOD_LIMITATIONS, METHOD_SEEDS
 from scripts.stage0_data_inventory import FORECAST_HORIZONS, WINDOW_ROLES
 from scripts.train_combinations_kg import _library_raw_frame
 from src.storage.model_store import SUPPORTED_FORECAST_STEPS
@@ -28,8 +29,21 @@ from src.storage.model_store import SUPPORTED_FORECAST_STEPS
 #: 深度方法固定三个种子；确定性方法只跑一次。
 DEEP_METHOD_SEEDS = (42, 43, 44)
 DETERMINISTIC_METHOD_SEEDS = (42,)
-#: 需要多种子的深度方法。其余方法给定种子后结果确定，只运行一次。
-DEEP_METHODS = ("itransformer", "mole", "time_moe")
+
+#: 需要多种子的深度方法。
+#:
+#: **iTransformer 不在其中**：服务器探针实测其官方 `run.py` 没有 CLI 种子参数，内部
+#: 硬编码 `fix_seed=2023`（见 probes/itransformer/probe_manifest.json 的
+#: `seed_argument`）。对它跑三个种子只会得到三份完全相同的结果，报告"三种子均值±标准差"
+#: 会把"标准差为 0"读成鲁棒性，实际是由构造决定的。因此它按确定性方法只跑一次，
+#: 并在定义里记下不敏感的原因。
+DEEP_METHODS = ("mole", "time_moe")
+SEED_INSENSITIVE_REASONS = {
+    "itransformer": (
+        "官方 run.py 无 CLI 种子参数，内部固定 fix_seed=2023；多种子会产出相同结果，"
+        "不构成独立样本"
+    ),
+}
 
 LIBRARY_WINDOWS = tuple(label for label, role in WINDOW_ROLES if role == "library")
 AUDIT_WINDOWS = tuple(label for label, role in WINDOW_ROLES if role == "audit")
@@ -115,6 +129,14 @@ def build_definition(
                      else DETERMINISTIC_METHOD_SEEDS)
         for method in methods
     }
+    limitations = {
+        method: METHOD_LIMITATIONS[method]
+        for method in methods if method in METHOD_LIMITATIONS
+    }
+    seed_notes = {
+        method: SEED_INSENSITIVE_REASONS[method]
+        for method in methods if method in SEED_INSENSITIVE_REASONS
+    }
     return {
         "experiment": "final_comparison",
         "window_plan": str(window_plan_path),
@@ -122,6 +144,12 @@ def build_definition(
         "database": None if database is None else str(database),
         "methods": list(methods),
         "seeds": seeds,
+        "seed_insensitive": seed_notes,
+        "official_fixed_seeds": {
+            method: METHOD_SEEDS[method] for method in methods if method in METHOD_SEEDS
+        },
+        #: 必须随结果一起报告的方法级限制（如 Time-MoE 的预训练截止不可证）
+        "method_limitations": limitations,
         "forecast_steps": [int(s) for s in forecast_steps],
         "forecast_horizons": dict(FORECAST_HORIZONS),
         "library_windows": list(LIBRARY_WINDOWS),
@@ -172,6 +200,10 @@ def main() -> int:
               f"{entry['data_end']}，训练截止 {entry['training_cutoff']}"
               f"（{entry['training_rows']} 行）")
     print(f"[freeze] 方法与种子: {definition['seeds']}")
+    for method, reason in definition["seed_insensitive"].items():
+        print(f"[freeze] {method} 对种子不敏感：{reason}")
+    for method, limitation in definition["method_limitations"].items():
+        print(f"[freeze] ！{method} 限制：{limitation}")
     print(f"[freeze] 每种方法预期结果数: {definition['expected_result_rows']}")
     return 0
 

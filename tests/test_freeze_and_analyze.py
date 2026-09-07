@@ -112,7 +112,7 @@ def test_freeze_refuses_unregistered_method(frozen_inputs):
     with pytest.raises(FreezeError, match="未在统一入口注册"):
         build_definition(
             raw_root=frozen_inputs["raw_root"], window_plan_path=frozen_inputs["plan"],
-            datasets=[DATASET], methods=["time_moe"], forecast_steps=[STEPS], database=None,
+            datasets=[DATASET], methods=["timespeaks"], forecast_steps=[STEPS], database=None,
         )
 
 
@@ -242,3 +242,34 @@ def test_incomplete_grid_and_timestamp_mismatch_block_conclusions():
     frame.loc[mask, "timestamp"] = pd.Timestamp("2030-01-01")
     with pytest.raises(AnalysisError, match="目标时间戳不一致"):
         analyse(frame)
+
+
+def test_definition_records_seed_policy_and_method_limitations(frozen_inputs):
+    """深度方法三种子；iTransformer 因官方无种子参数按一次算；Time-MoE 限制必须落盘。"""
+    definition = build_definition(
+        raw_root=frozen_inputs["raw_root"], window_plan_path=frozen_inputs["plan"],
+        datasets=[DATASET], methods=["itransformer", "mole", "time_moe"],
+        forecast_steps=[STEPS], database=None,
+    )
+
+    assert definition["seeds"]["mole"] == list(DEEP_METHOD_SEEDS)
+    assert definition["seeds"]["time_moe"] == list(DEEP_METHOD_SEEDS)
+    # 官方 run.py 固定 fix_seed=2023，多种子只会得到相同结果，不构成独立样本
+    assert definition["seeds"]["itransformer"] == list(DETERMINISTIC_METHOD_SEEDS)
+    assert "itransformer" in definition["seed_insensitive"]
+    assert definition["official_fixed_seeds"]["itransformer"] == 2023
+
+    # Time-MoE 的预训练截止不可证，必须随定义一起落盘
+    assert "time_moe" in definition["method_limitations"]
+    assert "预训练" in definition["method_limitations"]["time_moe"]
+    assert "mole" not in definition["method_limitations"]
+
+
+def test_conclusions_carry_method_limitations():
+    """结论文件必须带上限制，避免 Time-MoE 的比较被读成同等条件下的比较。"""
+    frame = _long_table({METHOD_UNDER_TEST: 1.0, "time_moe": 2.0, "mole": 3.0})
+
+    conclusions = analyse(frame)["conclusions"]
+
+    assert "time_moe" in conclusions["method_limitations"]
+    assert "mole" not in conclusions["method_limitations"]
