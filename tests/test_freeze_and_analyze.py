@@ -135,6 +135,16 @@ def test_freeze_does_not_overwrite_an_existing_definition(tmp_path, frozen_input
 
 
 # ------------------------------------------------------------------ Piece 7
+def _definition(methods, *, steps=(24, 168, 720), windows=("T1", "T2", "T3"), seeds=(42,)):
+    return {
+        "methods": list(methods),
+        "seeds": {m: list(seeds) for m in methods},
+        "test_windows": list(windows),
+        "forecast_steps": list(steps),
+        "datasets": [{"dataset": d} for d in DATASETS],
+    }
+
+
 def _long_table(mae_by_method, *, steps=(24, 168, 720), windows=("T1", "T2", "T3")):
     """构造 27 任务长表：每个方法的误差是固定偏移，便于精确断言。"""
     rows = []
@@ -155,7 +165,7 @@ def _long_table(mae_by_method, *, steps=(24, 168, 720), windows=("T1", "T2", "T3
 def test_analysis_produces_task_dataset_and_horizon_tables():
     frame = _long_table({METHOD_UNDER_TEST: 1.0, "xgboost": 2.0, "random_forest": 4.0})
 
-    report = analyse(frame)
+    report = analyse(frame, _definition(set(frame["method"])))
 
     assert report["conclusions"]["complete_grid"] is True
     assert len(report["task_metrics"]) == EXPECTED_TASKS * 3
@@ -172,7 +182,7 @@ def test_analysis_produces_task_dataset_and_horizon_tables():
 def test_wins_and_mean_rank_follow_per_task_mae():
     frame = _long_table({METHOD_UNDER_TEST: 1.0, "xgboost": 2.0, "random_forest": 4.0})
 
-    ranking = analyse(frame)["ranking"]
+    ranking = analyse(frame, _definition(set(frame["method"])))["ranking"]
 
     assert ranking["n_tasks"] == EXPECTED_TASKS
     rows = {r["method"]: r for r in ranking["methods"]}
@@ -214,7 +224,7 @@ def test_overall_superiority_needs_both_mean_mae_and_win_count():
         for index, task in enumerate(tasks)
     }
 
-    conclusions = analyse(_long_table_per_task(offsets))["conclusions"]
+    conclusions = analyse(_long_table_per_task(offsets), _definition([METHOD_UNDER_TEST, "xgboost"]))["conclusions"]
     versus = conclusions["comparisons"][0]
 
     assert versus["compared_tasks"] == EXPECTED_TASKS
@@ -229,19 +239,19 @@ def test_overall_superiority_needs_both_mean_mae_and_win_count():
                else {METHOD_UNDER_TEST: 1.0, "xgboost": 0.9})
         for index, task in enumerate(tasks)
     }
-    better = analyse(_long_table_per_task(offsets))["conclusions"]["comparisons"][0]
+    better = analyse(_long_table_per_task(offsets), _definition([METHOD_UNDER_TEST, "xgboost"]))["conclusions"]["comparisons"][0]
     assert better["wins"] == 14 and better["overall_better"] is True
 
 
 def test_incomplete_grid_and_timestamp_mismatch_block_conclusions():
     partial = _long_table({METHOD_UNDER_TEST: 1.0, "xgboost": 2.0}, windows=("T1",))
-    assert analyse(partial)["conclusions"]["complete_grid"] is False
+    assert analyse(partial, _definition(set(partial["method"])))["conclusions"]["complete_grid"] is False
 
     frame = _long_table({METHOD_UNDER_TEST: 1.0, "xgboost": 2.0})
     mask = (frame["method"] == "xgboost") & (frame["forecast_steps"] == 24)
     frame.loc[mask, "timestamp"] = pd.Timestamp("2030-01-01")
     with pytest.raises(AnalysisError, match="目标时间戳不一致"):
-        analyse(frame)
+        analyse(frame, _definition(set(frame["method"])))
 
 
 def test_definition_records_seed_policy_and_method_limitations(frozen_inputs):
@@ -252,11 +262,13 @@ def test_definition_records_seed_policy_and_method_limitations(frozen_inputs):
         forecast_steps=[STEPS], database=None,
     )
 
+    # 只有 MoLE 真正接收请求种子，三种子才有意义
     assert definition["seeds"]["mole"] == list(DEEP_METHOD_SEEDS)
-    assert definition["seeds"]["time_moe"] == list(DEEP_METHOD_SEEDS)
-    # 官方 run.py 固定 fix_seed=2023，多种子只会得到相同结果，不构成独立样本
+    # iTransformer 官方 run.py 固定 fix_seed=2023；Time-MoE 是零样本确定性贪心生成。
+    # 两者跑多种子都只会得到相同结果，不构成独立样本，因此各跑一次。
     assert definition["seeds"]["itransformer"] == list(DETERMINISTIC_METHOD_SEEDS)
-    assert "itransformer" in definition["seed_insensitive"]
+    assert definition["seeds"]["time_moe"] == list(DETERMINISTIC_METHOD_SEEDS)
+    assert set(definition["seed_insensitive"]) == {"itransformer", "time_moe"}
     assert definition["official_fixed_seeds"]["itransformer"] == 2023
 
     # Time-MoE 的预训练截止不可证，必须随定义一起落盘
@@ -269,7 +281,61 @@ def test_conclusions_carry_method_limitations():
     """结论文件必须带上限制，避免 Time-MoE 的比较被读成同等条件下的比较。"""
     frame = _long_table({METHOD_UNDER_TEST: 1.0, "time_moe": 2.0, "mole": 3.0})
 
-    conclusions = analyse(frame)["conclusions"]
+    conclusions = analyse(frame, _definition(set(frame["method"])))["conclusions"]
 
     assert "time_moe" in conclusions["method_limitations"]
     assert "mole" not in conclusions["method_limitations"]
+
+
+def test_single_method_grid_is_not_treated_as_complete():
+    """只有 Modelcombine 一个方法的 27 任务长表，不得被判成完整实验。
+
+    这是旧实现的漏洞：只统计任务键，27 个任务键凑齐就 complete_grid=true，
+    comparisons 却是空的——某个外部方法完全缺失也看不出来。
+    """
+    frame = _long_table({METHOD_UNDER_TEST: 1.0})
+    definition = _definition([METHOD_UNDER_TEST, "xgboost", "mole"])
+
+    report = analyse(frame, definition)
+
+    completeness = report["completeness"]
+    assert completeness["passed"] is False
+    assert any("方法集合不符" in p for p in completeness["problems"])
+    assert report["conclusions"]["comparisons"] == []
+
+
+def test_missing_seed_for_one_method_blocks_conclusions():
+    """某方法少跑一个种子时，即使任务齐全也不得给出总体更优结论。"""
+    frame = _long_table({METHOD_UNDER_TEST: 1.0, "mole": 5.0})
+    definition = _definition([METHOD_UNDER_TEST, "mole"])
+    definition["seeds"]["mole"] = [42, 43, 44]  # 长表里只有 42
+
+    report = analyse(frame, definition)
+
+    assert report["completeness"]["passed"] is False
+    assert any("种子集合" in p for p in report["completeness"]["problems"])
+    versus = report["conclusions"]["comparisons"][0]
+    assert versus["mean_mae_lower"] is True
+    assert versus["overall_better"] is False, "产物不完整时不得表述总体更优"
+
+
+def test_complete_run_matching_the_definition_allows_conclusions():
+    frame = _long_table({METHOD_UNDER_TEST: 1.0, "mole": 5.0})
+    definition = _definition([METHOD_UNDER_TEST, "mole"])
+
+    report = analyse(frame, definition)
+
+    assert report["completeness"]["passed"] is True
+    versus = report["conclusions"]["comparisons"][0]
+    assert versus["compared_all_tasks"] is True
+    assert versus["wins"] == EXPECTED_TASKS
+    assert versus["overall_better"] is True
+
+
+def test_analysis_without_a_definition_cannot_conclude():
+    frame = _long_table({METHOD_UNDER_TEST: 1.0, "mole": 5.0})
+
+    report = analyse(frame)
+
+    assert report["completeness"]["checked_against_definition"] is False
+    assert report["conclusions"]["comparisons"][0]["overall_better"] is False

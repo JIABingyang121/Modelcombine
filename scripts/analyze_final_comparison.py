@@ -22,7 +22,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, List, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
@@ -55,6 +55,56 @@ def _metrics(group: pd.DataFrame) -> Dict[str, float]:
         "rmse": float(np.sqrt(np.mean((yhat - y) ** 2))),
         "wape": float(np.sum(error) / np.sum(np.abs(y))),
         "n_rows": int(len(group)),
+    }
+
+
+def _check_against_definition(
+    frame: pd.DataFrame, definition: Mapping[str, Any]
+) -> Dict[str, Any]:
+    """严格核对冻结定义：方法集合、方法×任务覆盖、每方法的种子集合，都必须完全一致。
+
+    只统计任务键是不够的——只有一个方法的 27 任务长表同样能凑出 27 个任务键，
+    却根本没有可比较的对象。
+    """
+    expected_methods = set(definition["methods"])
+    expected_seeds = {m: set(seeds) for m, seeds in definition["seeds"].items()}
+    expected_tasks = {
+        (d["dataset"], window, steps)
+        for d in definition["datasets"]
+        for window in definition["test_windows"]
+        for steps in definition["forecast_steps"]
+    }
+
+    observed_methods = set(frame["method"])
+    problems: List[str] = []
+    if observed_methods != expected_methods:
+        problems.append(
+            f"方法集合不符：缺 {sorted(expected_methods - observed_methods)}，"
+            f"多 {sorted(observed_methods - expected_methods)}"
+        )
+    for method in sorted(expected_methods & observed_methods):
+        rows = frame[frame["method"] == method]
+        tasks = {
+            (d, w, int(s))
+            for d, w, s in zip(rows["dataset"], rows["test_window"], rows["forecast_steps"])
+        }
+        if tasks != expected_tasks:
+            problems.append(
+                f"{method} 的任务集合不符：缺 {sorted(expected_tasks - tasks)}，"
+                f"多 {sorted(tasks - expected_tasks)}"
+            )
+        seeds = set(int(v) for v in rows["seed"])
+        if seeds != expected_seeds.get(method, set()):
+            problems.append(
+                f"{method} 的种子集合是 {sorted(seeds)}，"
+                f"冻结定义要求 {sorted(expected_seeds.get(method, set()))}"
+            )
+    return {
+        "checked_against_definition": True,
+        "expected_methods": sorted(expected_methods),
+        "expected_tasks": len(expected_tasks),
+        "problems": problems,
+        "passed": not problems,
     }
 
 
@@ -134,7 +184,7 @@ def _ranking(tasks: pd.DataFrame) -> Dict[str, Any]:
     }
 
 
-def _conclusions(tasks: pd.DataFrame) -> Dict[str, Any]:
+def _conclusions(tasks: pd.DataFrame, complete: bool) -> Dict[str, Any]:
     """§8：27 任务平均 MAE 更低 **且** 至少赢 14/27，才能说"总体优于"。"""
     if METHOD_UNDER_TEST not in set(tasks["method"]):
         raise AnalysisError(f"长表里没有 {METHOD_UNDER_TEST}")
@@ -145,19 +195,25 @@ def _conclusions(tasks: pd.DataFrame) -> Dict[str, Any]:
         shared = mine.index.intersection(other.index)
         a, b = mine.loc[shared, "mae"], other.loc[shared, "mae"]
         wins = int((a < b).sum())
+        full = complete and len(shared) == EXPECTED_TASKS
         results.append({
             "versus": method,
             "compared_tasks": int(len(shared)),
+            "compared_all_tasks": bool(len(shared) == EXPECTED_TASKS),
             "mean_mae_modelcombine": float(a.mean()),
             "mean_mae_versus": float(b.mean()),
             "relative_mae_change_pct": float((a.mean() - b.mean()) / b.mean() * 100.0),
             "wins": wins,
             "win_threshold": WIN_RATE_MIN_TASKS,
             "mean_mae_lower": bool(a.mean() < b.mean()),
-            "overall_better": bool(a.mean() < b.mean() and wins >= WIN_RATE_MIN_TASKS),
+            # 产物与冻结定义不符、或没有覆盖全部 27 个任务时，一律不得表述总体更优
+            "overall_better": bool(
+                full and a.mean() < b.mean() and wins >= WIN_RATE_MIN_TASKS
+            ),
         })
     return {
-        "rule": "27 个任务平均 MAE 更低，且至少赢得 14/27，才能表述总体更优",
+        "rule": "产物与冻结定义完全一致、覆盖全部 27 个任务、平均 MAE 更低、"
+                "且至少赢得 14/27，四条同时成立才能表述总体更优",
         #: 与这些方法的比较不得被读成同等条件下的比较
         "method_limitations": {
             method: METHOD_LIMITATIONS[method]
@@ -170,16 +226,30 @@ def _conclusions(tasks: pd.DataFrame) -> Dict[str, Any]:
     }
 
 
-def analyse(frame: pd.DataFrame) -> Dict[str, Any]:
+def analyse(
+    frame: pd.DataFrame, definition: Mapping[str, Any] | None = None
+) -> Dict[str, Any]:
     _validate(frame)
+    completeness = (
+        _check_against_definition(frame, definition) if definition is not None
+        else {
+            "checked_against_definition": False,
+            "problems": ["未提供 experiment_definition.json，无法核对方法与种子集合"],
+            "passed": False,
+        }
+    )
     tasks = _task_table(frame)
     return {
+        "completeness": completeness,
         "task_metrics": tasks.to_dict(orient="records"),
         "main": _summarise(tasks, []),
         "by_dataset": _summarise(tasks, ["dataset"]),
         "by_forecast_steps": _summarise(tasks, ["forecast_steps"]),
         "ranking": _ranking(tasks),
-        "conclusions": _conclusions(tasks),
+        "conclusions": {
+            **_conclusions(tasks, bool(completeness["passed"])),
+            "completeness": completeness,
+        },
     }
 
 
@@ -187,14 +257,18 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Piece 7：最终对比实验结果分析")
     parser.add_argument("--predictions", type=Path, required=True,
                         help="final_comparison.py 写出的长表 CSV")
+    parser.add_argument("--definition", type=Path, required=True,
+                        help="freeze_final_experiment.py 冻结的 experiment_definition.json；"
+                             "用于严格核对方法×任务×种子集合")
     parser.add_argument("--relation-trace", type=Path, default=None,
                         help="可选：Modelcombine 逐窗口命中关系记录 JSON，原样并入产物")
     parser.add_argument("--out", type=Path, required=True, help="输出目录")
     args = parser.parse_args()
 
     frame = pd.read_csv(args.predictions)
+    definition = json.loads(args.definition.read_text(encoding="utf-8"))
     try:
-        report = analyse(frame)
+        report = analyse(frame, definition)
     except AnalysisError as exc:
         print(f"[analyze] 产物不完整，不产出结论: {exc}")
         return 1
@@ -230,6 +304,11 @@ def main() -> int:
     print(f"[analyze] 共 {ranking['n_tasks']} 个任务")
     for row in ranking["methods"]:
         print(f"[analyze] {row['method']:<28} 胜场 {row['wins']}，平均排名 {row['mean_rank']:.2f}")
+    completeness = report["completeness"]
+    if not completeness["passed"]:
+        for problem in completeness["problems"]:
+            print(f"[analyze] ！与冻结定义不符：{problem}")
+        print("[analyze] 实验产物与冻结定义不一致，不得按完整实验表述结论。")
     conclusions = report["conclusions"]
     if not conclusions["complete_grid"]:
         print(f"[analyze] 任务数不是 {EXPECTED_TASKS}，不得按完整实验表述结论。")

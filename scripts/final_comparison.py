@@ -48,8 +48,10 @@ from scripts.train_combinations_kg import (
 )
 from src.models.external_adapters import (
     MOLE_PREDICT_SNIPPET,
+    OFFICIAL_FIXED_SEED,
     TIME_MOE_PREDICT_SNIPPET,
     ExternalAdapterError,
+    hyperparameters,
     itransformer_command,
     mole_train_command,
     read_official_output,
@@ -89,6 +91,7 @@ class Request:
         training_cutoff: pd.Timestamp, fitted: Dict[tuple, Any],
         candidates: Sequence[str] = (),
         external: Mapping[str, Any] | None = None,
+        relations: List[Dict[str, Any]] | None = None,
     ) -> None:
         self.dataset = dataset
         self.test_window = test_window
@@ -107,6 +110,8 @@ class Request:
         self.candidates = list(candidates)
         #: 外部官方实现的仓库/解释器配置，按方法名索引
         self.external = dict(external or {})
+        #: Modelcombine 每个查询窗口命中的关系，跨窗口累积
+        self.relations = relations if relations is not None else []
         self.country = MODEL_LIBRARY_COUNTRY_BY_REGION[dataset]
 
 
@@ -155,6 +160,22 @@ def _modelcombine(request: Request) -> np.ndarray:
             raise FinalComparisonError(
                 f"{request.dataset} {request.test_window}: trace 的 selector_invoked 不是 false"
             )
+        # 命中的"场景—数据—组合"关系要留痕，供 §6 的动态选择记录与 Piece 7 分析使用
+        request.relations.append({
+            "dataset": request.dataset, "test_window": request.test_window,
+            "forecast_steps": request.forecast_steps,
+            "scenario_id": trace["scenario_id"],
+            "data_profile_id": trace["data_profile_id"],
+            "data_ref": trace["data_ref"],
+            "data_start_at": trace["data_start_at"],
+            "data_end_at": trace["data_end_at"],
+            "data_similarity": trace["data_similarity"],
+            "relation_id": trace["relation_id"],
+            "combination_id": trace["combination_id"],
+            "model_ids": trace["model_ids"],
+            "member_weights": trace["member_weights"],
+            "selector_invoked": trace["selector_invoked"],
+        })
         return pd.read_csv(output_path)["yhat"].to_numpy(dtype=float)
 
 
@@ -321,67 +342,119 @@ def _external_config(request: Request, method: str) -> Dict[str, Any]:
     return dict(config)
 
 
-def _external_workspace(request: Request, method: str, config: Mapping[str, Any]):
-    """把本窗口的历史写成官方要的 CSV，返回 (仓库路径, 数据文件名, 输出 npy 路径)。"""
-    repo = Path(config["repo"])
-    tag = f"{request.dataset}_{request.test_window}_h{request.forecast_steps}"
-    data_path = f"mc_{tag}.csv"
+def _write_training_file(request: Request, method: str, repo: Path, seed: int) -> str:
+    """冻结训练文件：``raw.timestamp < training_cutoff``，按 dataset×长度×种子写一份。"""
+    name = f"mc_train_{request.dataset}_h{request.forecast_steps}_s{seed}.csv"
+    path = repo / "dataset" / name
+    if not path.exists():
+        train = request.raw[request.raw["timestamp"] < request.training_cutoff]
+        if train.empty:
+            raise FinalComparisonError(
+                f"{method}: {request.dataset} 在 training_cutoff 之前没有训练数据"
+            )
+        # 训练文件的截止点就是它自己的最后一个时间戳，不再二次截断
+        write_official_input(train, path, train["timestamp"].max())
+    return name
+
+
+def _write_query_file(request: Request, method: str, repo: Path) -> str:
+    """当前窗口的查询历史：结束时间必须等于该窗口的 forecast_origin。"""
+    name = f"mc_pred_{request.dataset}_{request.test_window}_h{request.forecast_steps}.csv"
     write_official_input(
-        request.history, repo / "dataset" / data_path, request.training_cutoff
+        request.history, repo / "dataset" / name,
+        pd.Timestamp(request.window["forecast_origin"]),
     )
-    output_dir = Path(config.get("output_dir", repo / "mc_output"))
-    output_dir.mkdir(parents=True, exist_ok=True)
-    return repo, data_path, output_dir / f"real_prediction_{tag}.npy", tag
+    return name
+
+
+def _locate_checkpoint(checkpoints: Path, model_id: str) -> Path:
+    found = sorted(Path(checkpoints).glob(f"*{model_id}_*/checkpoint.pth"))
+    if not found:
+        raise FinalComparisonError(f"官方未产出 {model_id} 的 checkpoint")
+    return found[0]
+
+
+def _locate_itransformer_output(repo: Path, model_id: str) -> Path:
+    found = sorted(repo.glob(f"results/{model_id}_*/real_prediction.npy"))
+    if not found:
+        raise FinalComparisonError(f"官方未在 results/{model_id}_* 下产出预测")
+    return found[0]
 
 
 @register("itransformer")
 def _itransformer(request: Request) -> np.ndarray:
-    """官方 iTransformer（thuml）。训练截止通过物理截断输入 CSV 传递。
+    """官方 iTransformer（thuml）。训练一次、T1—T3 复用同一个 checkpoint。
 
-    官方 run.py 没有 CLI 种子参数，内部固定 fix_seed=2023；因此本方法对 --seeds 不敏感，
-    输出里的 seed 只用于记账。
+    官方 run.py 无 CLI 种子参数、内部固定 fix_seed=2023，因此本方法对请求种子不敏感；
+    结果表里记的是官方真实种子 2023。
+
+    **注意**：``--is_training 0`` 的推理组合尚未经服务器探针验证，必须先按方案第 8 步
+    用旧窗口冒烟通过后才能进正式实验。
     """
     method = "itransformer"
     config = _external_config(request, method)
-    repo, data_path, output, tag = _external_workspace(request, method, config)
+    repo = Path(config["repo"])
+    seed = OFFICIAL_FIXED_SEED[method]
+    model_id = f"{request.dataset}_h{request.forecast_steps}_s{seed}"
     try:
+        if ("_trained", method, model_id) not in request.fitted:
+            train_file = _write_training_file(request, method, repo, seed)
+            run_official(
+                itransformer_command(
+                    config, model_id=model_id, data_path=train_file,
+                    forecast_steps=request.forecast_steps, is_training=True,
+                ),
+                cwd=repo, method=method,
+            )
+            request.fitted[("_trained", method, model_id)] = True
+        query_file = _write_query_file(request, method, repo)
         run_official(
             itransformer_command(
-                config, model_id=tag, data_path=data_path,
-                forecast_steps=request.forecast_steps,
+                config, model_id=model_id, data_path=query_file,
+                forecast_steps=request.forecast_steps, is_training=False,
             ),
             cwd=repo, method=method,
         )
-        produced = sorted(repo.glob(f"results/{tag}_*/real_prediction.npy"))
-        if not produced:
-            raise ExternalAdapterError(f"{method}: 官方未在 results/{tag}_* 下产出预测")
-        return read_official_output(produced[0], method, request.forecast_steps)
+        return read_official_output(
+            _locate_itransformer_output(repo, model_id), method, request.forecast_steps
+        )
     except ExternalAdapterError as exc:
         raise FinalComparisonError(str(exc)) from exc
 
 
 @register("mole")
 def _mole(request: Request) -> np.ndarray:
-    """官方 MoLE（rogerni）。官方 --do_predict 有真实缺陷，预测走官方 Python API。"""
+    """官方 MoLE（rogerni）。训练一次、T1—T3 复用同一个 checkpoint。
+
+    官方 `--do_predict` 有真实缺陷，预测按探针实测方式调用官方模型与数据类；请求的种子
+    同时传给训练命令与预测调用。
+    """
     method = "mole"
     config = _external_config(request, method)
-    repo, data_path, output, tag = _external_workspace(request, method, config)
+    repo = Path(config["repo"])
+    seed = request.seed
+    model_id = f"{request.dataset}_h{request.forecast_steps}_s{seed}"
     try:
-        run_official(
-            mole_train_command(
-                config, model_id=tag, data_path=data_path,
-                forecast_steps=request.forecast_steps,
-            ),
-            cwd=repo, method=method,
-        )
-        checkpoints = sorted(Path(config["checkpoints"]).glob(f"*{tag}_*/checkpoint.pth"))
-        if not checkpoints:
-            raise ExternalAdapterError(f"{method}: 官方未产出 {tag} 的 checkpoint")
+        hp = hyperparameters(config, method)
+        if ("_trained", method, model_id) not in request.fitted:
+            train_file = _write_training_file(request, method, repo, seed)
+            run_official(
+                mole_train_command(
+                    config, model_id=model_id, data_path=train_file,
+                    forecast_steps=request.forecast_steps, seed=seed,
+                ),
+                cwd=repo, method=method,
+            )
+            request.fitted[("_trained", method, model_id)] = True
+        query_file = _write_query_file(request, method, repo)
+        output = _external_output_path(config, repo, request, seed)
         run_official(
             [
                 str(config["python"]), "-c", MOLE_PREDICT_SNIPPET,
-                str(request.forecast_steps), str(checkpoints[0]), str(output),
-                data_path, str(config.get("gpu", 0)),
+                str(request.forecast_steps),
+                str(_locate_checkpoint(Path(config["checkpoints"]), model_id)),
+                str(output), query_file, str(config.get("gpu", 0)),
+                str(seed), str(hp["seq_len"]), str(hp["t_dim"]),
             ],
             cwd=repo, method=method,
         )
@@ -392,28 +465,41 @@ def _mole(request: Request) -> np.ndarray:
 
 @register("time_moe")
 def _time_moe(request: Request) -> np.ndarray:
-    """官方 Time-MoE 零样本推理。
+    """官方 Time-MoE 零样本推理：不做任务训练，直接用当前窗口的历史作上下文。
 
-    **限制**：只能证明任务输入上下文截止于 training_cutoff；公开预训练 checkpoint
-    无法证明其预训练数据早于该 cutoff。该限制由 external_adapters.METHOD_LIMITATIONS
-    带进实验定义与结论文件，不得被读成满足严格训练截止约束。
+    **限制**：只能证明任务输入上下文截止于该窗口的预测起点；公开预训练 checkpoint
+    无法证明其预训练数据早于本实验的 training_cutoff。该限制由
+    ``external_adapters.METHOD_LIMITATIONS`` 带进实验定义与结论文件。
     """
     method = "time_moe"
     config = _external_config(request, method)
-    repo, data_path, output, _tag = _external_workspace(request, method, config)
+    repo = Path(config["repo"])
     try:
+        query_file = _write_query_file(request, method, repo)
+        output = _external_output_path(config, repo, request, request.seed)
         run_official(
             [
                 str(config["python"]), "-c", TIME_MOE_PREDICT_SNIPPET,
-                str(repo / "dataset" / data_path), str(request.training_cutoff),
+                str(repo / "dataset" / query_file),
+                str(pd.Timestamp(request.window["forecast_origin"])),
                 str(request.forecast_steps), str(output), str(config["snapshot"]),
                 str(config.get("device", "cuda:0")), str(config.get("context_length", 720)),
+                str(request.seed),
             ],
             cwd=repo, method=method,
         )
         return read_official_output(output, method, request.forecast_steps)
     except ExternalAdapterError as exc:
         raise FinalComparisonError(str(exc)) from exc
+
+
+def _external_output_path(
+    config: Mapping[str, Any], repo: Path, request: Request, seed: int
+) -> Path:
+    output_dir = Path(config.get("output_dir", repo / "mc_output"))
+    output_dir.mkdir(parents=True, exist_ok=True)
+    tag = f"{request.dataset}_{request.test_window}_h{request.forecast_steps}_s{seed}"
+    return output_dir / f"real_prediction_{tag}.npy"
 
 
 # ------------------------------------------------------------------ 运行
@@ -433,6 +519,8 @@ def run_request(method: str, request: Request) -> pd.DataFrame:
         raise FinalComparisonError(
             f"{method} 在 {request.dataset} {request.test_window} 上产生非有限值"
         )
+    # iTransformer 官方无 CLI 种子、内部固定 2023：结果表记官方真实值，不记请求值
+    effective_seed = OFFICIAL_FIXED_SEED.get(method, request.seed)
     return pd.DataFrame({
         "timestamp": request.target_timestamps.to_numpy(),
         "y_true": np.nan,
@@ -441,7 +529,7 @@ def run_request(method: str, request: Request) -> pd.DataFrame:
         "dataset": request.dataset,
         "test_window": request.test_window,
         "forecast_steps": request.forecast_steps,
-        "seed": request.seed,
+        "seed": effective_seed,
     })
 
 
@@ -453,9 +541,11 @@ def run(
     training_cutoff: Dict[str, pd.Timestamp] | None = None,
     candidates: Sequence[str] = (),
     external: Mapping[str, Any] | None = None,
+    relations: List[Dict[str, Any]] | None = None,
 ) -> pd.DataFrame:
     rows: List[pd.DataFrame] = []
     fitted: Dict[tuple, Any] = {}
+    relations = relations if relations is not None else []
     for dataset in datasets:
         raw = _library_raw_frame(raw_root, dataset)
         for steps in forecast_steps:
@@ -482,6 +572,7 @@ def run(
                         window=frozen[label], database=database,
                         training_cutoff=cutoff, fitted=fitted,
                         candidates=candidates, external=external,
+                        relations=relations,
                     )
                     for method in methods:
                         frame = run_request(method, request)
@@ -515,8 +606,10 @@ def main() -> int:
     parser.add_argument("--out", type=Path, required=True, help="输出长表 CSV")
     args = parser.parse_args()
 
+    relations: List[Dict[str, Any]] = []
     try:
         frame = run(
+            relations=relations,
             methods=args.methods, datasets=args.datasets, windows=args.windows,
             forecast_steps=args.forecast_steps, seeds=args.seeds,
             raw_root=args.raw_root, window_plan=args.window_plan, database=args.database,
@@ -533,6 +626,13 @@ def main() -> int:
     out = args.out if args.out.is_absolute() else PROJECT_ROOT / args.out
     out.parent.mkdir(parents=True, exist_ok=True)
     frame.to_csv(out, index=False)
+    if relations:
+        relation_path = out.with_name(f"{out.stem}_modelcombine_relations.json")
+        relation_path.write_text(
+            json.dumps(relations, indent=2, ensure_ascii=False, default=str),
+            encoding="utf-8",
+        )
+        print(f"[final] Modelcombine 命中关系已写出: {relation_path}")
     print(f"[final] {len(frame)} 行已写出: {out}")
     for (method, steps), group in frame.groupby(["method", "forecast_steps"]):
         mae = float(np.mean(np.abs(group["yhat"] - group["y_true"])))

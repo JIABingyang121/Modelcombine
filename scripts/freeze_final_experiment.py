@@ -21,7 +21,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.final_comparison import BASE_FEATURES, OUTPUT_COLUMNS, available_methods
-from src.models.external_adapters import METHOD_LIMITATIONS, METHOD_SEEDS
+from src.models.external_adapters import METHOD_LIMITATIONS, OFFICIAL_FIXED_SEED
 from scripts.stage0_data_inventory import FORECAST_HORIZONS, WINDOW_ROLES
 from scripts.train_combinations_kg import _library_raw_frame
 from src.storage.model_store import SUPPORTED_FORECAST_STEPS
@@ -37,11 +37,15 @@ DETERMINISTIC_METHOD_SEEDS = (42,)
 #: `seed_argument`）。对它跑三个种子只会得到三份完全相同的结果，报告"三种子均值±标准差"
 #: 会把"标准差为 0"读成鲁棒性，实际是由构造决定的。因此它按确定性方法只跑一次，
 #: 并在定义里记下不敏感的原因。
-DEEP_METHODS = ("mole", "time_moe")
+DEEP_METHODS = ("mole",)
 SEED_INSENSITIVE_REASONS = {
     "itransformer": (
         "官方 run.py 无 CLI 种子参数，内部固定 fix_seed=2023；多种子会产出相同结果，"
         "不构成独立样本"
+    ),
+    "time_moe": (
+        "零样本推理 + 确定性贪心生成，无任务训练；多种子会产出相同结果，"
+        "不得包装成三个独立样本"
     ),
 }
 
@@ -146,7 +150,8 @@ def build_definition(
         "seeds": seeds,
         "seed_insensitive": seed_notes,
         "official_fixed_seeds": {
-            method: METHOD_SEEDS[method] for method in methods if method in METHOD_SEEDS
+            method: OFFICIAL_FIXED_SEED[method]
+            for method in methods if method in OFFICIAL_FIXED_SEED
         },
         #: 必须随结果一起报告的方法级限制（如 Time-MoE 的预训练截止不可证）
         "method_limitations": limitations,

@@ -29,8 +29,45 @@ OUTPUT_SHAPES: Dict[str, str] = {
     "time_moe": "(1, H)",
 }
 
-#: 探针实测的固定种子。iTransformer 官方 run.py 无 CLI 种子参数，硬编码 2023。
-METHOD_SEEDS: Dict[str, int] = {"itransformer": 2023, "mole": 42, "time_moe": 42}
+#: 探针实测的固定种子。iTransformer 官方 run.py 无 CLI 种子参数，硬编码 2023；
+#: 因此结果表里 iTransformer 的 seed 必须记官方真实值 2023，而不是请求值。
+OFFICIAL_FIXED_SEED: Dict[str, int] = {"itransformer": 2023}
+
+#: 探针用的超参数：1 epoch、缩小模型、des=probe。**只用于接口验证**，
+#: 正式对比必须由 --external-config 显式给出，否则比较的是"缩小版外部模型"。
+PROBE_HYPERPARAMETERS: Dict[str, Any] = {
+    "seq_len": 96, "label_len": 48, "d_model": 32, "n_heads": 4,
+    "e_layers": 1, "d_layers": 1, "d_ff": 64, "factor": 1, "dropout": 0.1,
+    "train_epochs": 1, "batch_size": 64, "patience": 1, "learning_rate": 0.0001,
+    "t_dim": 4, "des": "probe",
+}
+
+#: 正式命令必须齐备的超参数键。缺任何一个都直接失败，不用探针值兜底。
+REQUIRED_HYPERPARAMETERS: Dict[str, tuple] = {
+    "itransformer": (
+        "seq_len", "label_len", "d_model", "n_heads", "e_layers", "d_layers",
+        "d_ff", "factor", "dropout", "train_epochs", "batch_size", "patience",
+        "learning_rate", "des",
+    ),
+    "mole": (
+        "seq_len", "t_dim", "train_epochs", "batch_size", "patience",
+        "learning_rate", "des",
+    ),
+}
+
+
+def hyperparameters(config: Mapping[str, Any], method: str) -> Dict[str, Any]:
+    """取正式超参数；缺失即失败，绝不回落到 PROBE_HYPERPARAMETERS。"""
+    values = config.get("hyperparameters")
+    if not values:
+        raise ExternalAdapterError(
+            f"{method}: --external-config 必须提供 hyperparameters（正式对比配置）；"
+            "探针的 1 epoch 缩小配置只用于接口验证，不能作为正式默认值"
+        )
+    missing = [k for k in REQUIRED_HYPERPARAMETERS[method] if k not in values]
+    if missing:
+        raise ExternalAdapterError(f"{method}: hyperparameters 缺少 {missing}")
+    return dict(values)
 
 #: 必须随结果一起报告的方法级限制。Time-MoE 只能证明**任务输入上下文**的截止时间，
 #: 公开预训练 checkpoint 无法证明其预训练数据早于该 cutoff。
@@ -89,43 +126,57 @@ def read_official_output(path: Path, method: str, forecast_steps: int) -> np.nda
 
 
 def itransformer_command(
-    config: Mapping[str, Any], *, model_id: str, data_path: str, forecast_steps: int
+    config: Mapping[str, Any], *, model_id: str, data_path: str, forecast_steps: int,
+    is_training: bool,
 ) -> List[str]:
-    """探针实测通过的官方入口（`run.py ... --pred_len H --do_predict --inverse`）。"""
+    """官方 iTransformer 入口。
+
+    ``is_training=True`` 是探针实测通过的组合（`--is_training 1 … --do_predict --inverse`）。
+    ``is_training=False`` 用于"训练一次、多窗口推理"：**该组合尚未经服务器探针验证**，
+    必须先按方案第 8 步用旧窗口做冒烟，通过后才能进正式实验。
+    """
     repo = Path(config["repo"])
+    hp = hyperparameters(config, "itransformer")
     return [
         str(config["python"]), "-u", "run.py",
-        "--is_training", "1", "--model_id", model_id, "--model", "iTransformer",
+        "--is_training", "1" if is_training else "0",
+        "--model_id", model_id, "--model", "iTransformer",
         "--data", "custom", "--root_path", f"{repo}/dataset/", "--data_path", data_path,
         "--features", "S", "--target", "load", "--freq", "h",
         "--checkpoints", str(config["checkpoints"]),
-        "--seq_len", "96", "--label_len", "48", "--pred_len", str(forecast_steps),
+        "--seq_len", str(hp["seq_len"]), "--label_len", str(hp["label_len"]),
+        "--pred_len", str(forecast_steps),
         "--enc_in", "1", "--dec_in", "1", "--c_out", "1",
-        "--d_model", "32", "--n_heads", "4", "--e_layers", "1", "--d_layers", "1",
-        "--d_ff", "64", "--factor", "1", "--dropout", "0.1", "--embed", "timeF",
-        "--train_epochs", "1", "--batch_size", "64", "--patience", "1",
-        "--learning_rate", "0.0001", "--num_workers", "0", "--itr", "1",
-        "--des", "probe", "--inverse", "--do_predict", "--gpu", str(config.get("gpu", 0)),
+        "--d_model", str(hp["d_model"]), "--n_heads", str(hp["n_heads"]),
+        "--e_layers", str(hp["e_layers"]), "--d_layers", str(hp["d_layers"]),
+        "--d_ff", str(hp["d_ff"]), "--factor", str(hp["factor"]),
+        "--dropout", str(hp["dropout"]), "--embed", "timeF",
+        "--train_epochs", str(hp["train_epochs"]), "--batch_size", str(hp["batch_size"]),
+        "--patience", str(hp["patience"]), "--learning_rate", str(hp["learning_rate"]),
+        "--num_workers", "0", "--itr", "1", "--des", str(hp["des"]),
+        "--inverse", "--do_predict", "--gpu", str(config.get("gpu", 0)),
     ]
 
 
 def mole_train_command(
-    config: Mapping[str, Any], *, model_id: str, data_path: str, forecast_steps: int
+    config: Mapping[str, Any], *, model_id: str, data_path: str, forecast_steps: int,
+    seed: int,
 ) -> List[str]:
     """官方 `run_longExp.py` 训练。其 `--do_predict` 有真实缺陷，预测另走官方 Python API。"""
     repo = Path(config["repo"])
+    hp = hyperparameters(config, "mole")
     return [
         str(config["python"]), "-u", "run_longExp.py",
         "--is_training", "1", "--model_id", model_id, "--model", "MoLE_DLinear",
         "--data", "custom", "--root_path", f"{repo}/dataset/", "--data_path", data_path,
         "--features", "S", "--target", "load", "--freq", "h",
         "--checkpoints", str(config["checkpoints"]),
-        "--seq_len", "96", "--pred_len", str(forecast_steps),
-        "--enc_in", "1", "--dec_in", "1", "--c_out", "1", "--t_dim", "4",
-        "--train_epochs", "1", "--batch_size", "64", "--patience", "1",
-        "--learning_rate", "0.0001", "--num_workers", "0", "--itr", "1",
-        "--des", "probe", "--seed", str(METHOD_SEEDS["mole"]),
-        "--gpu", str(config.get("gpu", 0)),
+        "--seq_len", str(hp["seq_len"]), "--pred_len", str(forecast_steps),
+        "--enc_in", "1", "--dec_in", "1", "--c_out", "1", "--t_dim", str(hp["t_dim"]),
+        "--train_epochs", str(hp["train_epochs"]), "--batch_size", str(hp["batch_size"]),
+        "--patience", str(hp["patience"]), "--learning_rate", str(hp["learning_rate"]),
+        "--num_workers", "0", "--itr", "1", "--des", str(hp["des"]),
+        "--seed", str(seed), "--gpu", str(config.get("gpu", 0)),
     ]
 
 
@@ -136,9 +187,10 @@ MOLE_PREDICT_SNIPPET = (
     'import random,sys; import numpy as np, torch; from types import SimpleNamespace; '
     'from data_provider.data_loader import Dataset_Pred; from models.MoLE_DLinear import Model; '
     'h=int(sys.argv[1]); ckpt=sys.argv[2]; out=sys.argv[3]; data_path=sys.argv[4]; gpu=int(sys.argv[5]); '
-    'random.seed(42); np.random.seed(42); torch.manual_seed(42); torch.cuda.manual_seed_all(42); '
-    'cfg=SimpleNamespace(t_dim=4,seq_len=96,pred_len=h,individual=0,enc_in=1,freq="h",head_dropout=0.0); '
-    'ds=Dataset_Pred(cfg,root_path="./dataset/",data_path=data_path,size=[96,96,h],'
+    'seed=int(sys.argv[6]); seq=int(sys.argv[7]); t_dim=int(sys.argv[8]); '
+    'random.seed(seed); np.random.seed(seed); torch.manual_seed(seed); torch.cuda.manual_seed_all(seed); '
+    'cfg=SimpleNamespace(t_dim=t_dim,seq_len=seq,pred_len=h,individual=0,enc_in=1,freq="h",head_dropout=0.0); '
+    'ds=Dataset_Pred(cfg,root_path="./dataset/",data_path=data_path,size=[seq,seq,h],'
     'features="S",target="load",timeenc=1,freq="h"); x,_,xmark,_=ds[0]; '
     'model=Model(cfg).cuda(gpu); model.load_state_dict(torch.load(ckpt)); model.eval(); '
     'pred=model(torch.tensor(x).float().unsqueeze(0).cuda(gpu),'
@@ -154,14 +206,14 @@ TIME_MOE_PREDICT_SNIPPET = (
     'from time_moe.models.modeling_time_moe import TimeMoeForPrediction; '
     'from time_moe.runner import setup_seed; '
     'csv_path=sys.argv[1]; cutoff=sys.argv[2]; h=int(sys.argv[3]); out=sys.argv[4]; '
-    'snapshot=sys.argv[5]; device=sys.argv[6]; context=int(sys.argv[7]); '
+    'snapshot=sys.argv[5]; device=sys.argv[6]; context=int(sys.argv[7]); seed=int(sys.argv[8]); '
     'frame=pd.read_csv(csv_path); frame["date"]=pd.to_datetime(frame["date"]); '
     'assert frame["date"].max()==pd.Timestamp(cutoff); '
     'values=torch.tensor(frame["load"].tail(context).to_numpy(),dtype=torch.float32).unsqueeze(0).to(device); '
     'mean=values.mean(dim=-1,keepdim=True); std=values.std(dim=-1,keepdim=True); '
-    'normed=(values-mean)/std; setup_seed(42); '
+    'normed=(values-mean)/std; setup_seed(seed); '
     'model=TimeMoeForPrediction.from_pretrained(snapshot,device_map=device,torch_dtype="auto"); '
-    'model.eval(); setup_seed(42); '
+    'model.eval(); setup_seed(seed); '
     'generated=model.generate(normed.to(model.dtype),max_new_tokens=h); '
     'pred=generated[:,-h:].float().cpu().numpy()*float(std.cpu())+float(mean.cpu()); '
     'assert pred.shape==(1,h) and np.isfinite(pred).all(); np.save(out,pred)'

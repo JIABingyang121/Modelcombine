@@ -17,7 +17,7 @@ import pytest
 
 from src.models.external_adapters import (
     METHOD_LIMITATIONS,
-    METHOD_SEEDS,
+    OFFICIAL_FIXED_SEED,
     ExternalAdapterError,
     itransformer_command,
     mole_train_command,
@@ -115,8 +115,15 @@ def test_commands_match_the_probed_official_entries(tmp_path):
         "repo": tmp_path / "iTransformer", "python": tmp_path / "py",
         "checkpoints": tmp_path / "ckpt", "gpu": 0,
     }
+    config["hyperparameters"] = {
+        "seq_len": 96, "label_len": 48, "d_model": 512, "n_heads": 8, "e_layers": 3,
+        "d_layers": 1, "d_ff": 512, "factor": 1, "dropout": 0.1, "train_epochs": 10,
+        "batch_size": 32, "patience": 3, "learning_rate": 0.0001, "t_dim": 4,
+        "des": "final",
+    }
     command = itransformer_command(
-        config, model_id="pjm_T1_h720", data_path="mc.csv", forecast_steps=720
+        config, model_id="pjm_T1_h720", data_path="mc.csv", forecast_steps=720,
+        is_training=True,
     )
     assert command[2] == "run.py"
     for flag in ("--is_training", "--do_predict", "--inverse", "--pred_len"):
@@ -125,15 +132,15 @@ def test_commands_match_the_probed_official_entries(tmp_path):
     assert command[command.index("--model") + 1] == "iTransformer"
     # 官方 run.py 没有种子参数，探针记录内部固定 2023
     assert "--seed" not in command
-    assert METHOD_SEEDS["itransformer"] == 2023
+    assert OFFICIAL_FIXED_SEED["itransformer"] == 2023
 
     mole = mole_train_command(
         {**config, "repo": tmp_path / "mole"},
-        model_id="pjm_T1_h24", data_path="mc.csv", forecast_steps=24,
+        model_id="pjm_T1_h24", data_path="mc.csv", forecast_steps=24, seed=43,
     )
     assert mole[2] == "run_longExp.py"
     assert mole[mole.index("--model") + 1] == "MoLE_DLinear"
-    assert mole[mole.index("--seed") + 1] == "42"
+    assert mole[mole.index("--seed") + 1] == "43", "请求的种子必须真的传下去"
     # 官方 --do_predict 有真实缺陷，训练命令里不得带它
     assert "--do_predict" not in mole
 
@@ -146,3 +153,23 @@ def test_time_moe_pretraining_limitation_is_recorded():
     # 只有 Time-MoE 有这条限制；另外两个是本地训练的，训练截止可证
     assert "itransformer" not in METHOD_LIMITATIONS
     assert "mole" not in METHOD_LIMITATIONS
+
+
+def test_formal_hyperparameters_are_required_and_probe_values_are_separate(tmp_path):
+    """探针的 1 epoch 缩小配置不得作为正式默认值：缺 hyperparameters 直接失败。"""
+    from src.models.external_adapters import (
+        PROBE_HYPERPARAMETERS,
+        hyperparameters,
+    )
+
+    bare = {"repo": tmp_path, "python": "py", "checkpoints": tmp_path}
+    with pytest.raises(ExternalAdapterError, match="hyperparameters"):
+        itransformer_command(
+            bare, model_id="m", data_path="d.csv", forecast_steps=24, is_training=True
+        )
+    with pytest.raises(ExternalAdapterError, match="缺少"):
+        hyperparameters({"hyperparameters": {"seq_len": 96}}, "itransformer")
+
+    # 探针配置仍然可查，但必须显式传入才生效
+    assert PROBE_HYPERPARAMETERS["train_epochs"] == 1
+    assert PROBE_HYPERPARAMETERS["des"] == "probe"
