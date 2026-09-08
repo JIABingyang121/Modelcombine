@@ -123,11 +123,12 @@ def test_commands_match_the_probed_official_entries(tmp_path):
     }
     command = itransformer_command(
         config, model_id="pjm_T1_h720", data_path="mc.csv", forecast_steps=720,
-        is_training=True,
     )
     assert command[2] == "run.py"
-    for flag in ("--is_training", "--do_predict", "--inverse", "--pred_len"):
+    for flag in ("--is_training", "--inverse", "--pred_len"):
         assert flag in command
+    # 训练阶段不带 --do_predict：它产出的 real_prediction.npy 与任何查询窗口都无关
+    assert "--do_predict" not in command
     assert command[command.index("--pred_len") + 1] == "720"
     assert command[command.index("--model") + 1] == "iTransformer"
     # 官方 run.py 没有种子参数，探针记录内部固定 2023
@@ -164,12 +165,129 @@ def test_formal_hyperparameters_are_required_and_probe_values_are_separate(tmp_p
 
     bare = {"repo": tmp_path, "python": "py", "checkpoints": tmp_path}
     with pytest.raises(ExternalAdapterError, match="hyperparameters"):
-        itransformer_command(
-            bare, model_id="m", data_path="d.csv", forecast_steps=24, is_training=True
-        )
+        itransformer_command(bare, model_id="m", data_path="d.csv", forecast_steps=24)
     with pytest.raises(ExternalAdapterError, match="缺少"):
         hyperparameters({"hyperparameters": {"seq_len": 96}}, "itransformer")
 
     # 探针配置仍然可查，但必须显式传入才生效
     assert PROBE_HYPERPARAMETERS["train_epochs"] == 1
     assert PROBE_HYPERPARAMETERS["des"] == "probe"
+
+
+def test_itransformer_query_command_carries_do_predict_and_the_same_setting(tmp_path):
+    """查询命令：``python -c <片段> <产物路径>`` + 与训练完全相同的 setting 参数。"""
+    from src.models.external_adapters import (
+        ITRANSFORMER_PREDICT_SNIPPET,
+        itransformer_predict_command,
+    )
+
+    config = {
+        "repo": tmp_path / "iTransformer", "python": tmp_path / "py",
+        "checkpoints": tmp_path / "ckpt", "gpu": 0,
+        "hyperparameters": {
+            "seq_len": 96, "label_len": 48, "d_model": 512, "n_heads": 8, "e_layers": 3,
+            "d_layers": 1, "d_ff": 512, "factor": 1, "dropout": 0.1, "train_epochs": 10,
+            "batch_size": 32, "patience": 3, "learning_rate": 0.0001, "des": "final",
+        },
+    }
+    train = itransformer_command(
+        config, model_id="pjm_h24", data_path="mc_train.csv", forecast_steps=24
+    )
+    query = itransformer_predict_command(
+        config, model_id="pjm_h24", data_path="mc_pred_T1.csv", forecast_steps=24,
+        output=tmp_path / "out.npy",
+    )
+
+    assert query[1] == "-c" and query[2] == ITRANSFORMER_PREDICT_SNIPPET
+    assert query[3] == str(tmp_path / "out.npy")
+    assert "--do_predict" in query
+    # 官方 setting 不含 data_path：训练与查询只有 --data_path 不同，才会落在同一个
+    # checkpoint 上；--is_training 必须仍是 1（0 分支只调 exp.test，不产 predict 结果）
+    assert query[query.index("--is_training") + 1] == "1"
+    def _without_data_path(command, start):
+        rest = command[start:]
+        index = rest.index("--data_path")
+        return rest[:index] + rest[index + 2:]
+    assert _without_data_path(query, 4) == (
+        _without_data_path(train, 3) + ["--do_predict"]
+    )
+
+
+# 桩官方仓库：复刻 run.py 的控制流（argparse -> setting -> train/test/predict），
+# 用来验证**我们的查询片段**本身——它必须跳过训练、只调 predict(load=True)，并把官方
+# 产物另存到指定路径。桩里不含任何官方源码，也不冒充官方结果。
+_STUB_EXP = '''
+import os
+import numpy as np
+
+
+class Exp_Long_Term_Forecast:
+    def __init__(self, args):
+        self.args = args
+        self.model = "model"
+
+    def train(self, setting):
+        open("train_ran", "a").close()
+        return self.model
+
+    def test(self, setting, test=0):
+        open("test_ran", "a").close()
+
+    def predict(self, setting, load=False):
+        open("predict_ran", "a").write(f"{setting}|{load}\\n")
+        folder = "./results/" + setting + "/"
+        os.makedirs(folder, exist_ok=True)
+        np.save(folder + "real_prediction.npy", np.arange(3.0).reshape(1, 3, 1))
+'''
+
+_STUB_RUN = '''
+if __name__ == "__main__":
+    import argparse
+    from experiments.exp_long_term_forecasting import Exp_Long_Term_Forecast
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--is_training", type=int, required=True)
+    parser.add_argument("--model_id", type=str, required=True)
+    parser.add_argument("--do_predict", action="store_true")
+    args, _rest = parser.parse_known_args()
+    setting = args.model_id + "_iTransformer_custom_ftS_0"
+    if args.is_training:
+        exp = Exp_Long_Term_Forecast(args)
+        exp.train(setting)
+        exp.test(setting)
+        if args.do_predict:
+            exp.predict(setting, True)
+    else:
+        exp = Exp_Long_Term_Forecast(args)
+        exp.test(setting, test=1)
+'''
+
+
+def test_predict_snippet_skips_training_and_saves_to_the_given_path(tmp_path):
+    """真跑查询片段：不得触发 train/test，必须 predict(load=True) 并另存到指定路径。"""
+    import subprocess
+    import sys
+
+    import numpy as np
+
+    from src.models.external_adapters import ITRANSFORMER_PREDICT_SNIPPET
+
+    repo = tmp_path / "repo"
+    (repo / "experiments").mkdir(parents=True)
+    (repo / "experiments" / "__init__.py").write_text("", encoding="utf-8")
+    (repo / "experiments" / "exp_long_term_forecasting.py").write_text(
+        _STUB_EXP, encoding="utf-8"
+    )
+    (repo / "run.py").write_text(_STUB_RUN, encoding="utf-8")
+    out = tmp_path / "real_prediction_T1.npy"
+
+    completed = subprocess.run(
+        [sys.executable, "-c", ITRANSFORMER_PREDICT_SNIPPET, str(out),
+         "--is_training", "1", "--model_id", "pjm_h24", "--do_predict"],
+        cwd=repo, capture_output=True, text=True,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert not (repo / "train_ran").exists(), "查询不得重新训练"
+    assert not (repo / "test_ran").exists(), "查询不得跑官方 test 流程"
+    assert (repo / "predict_ran").read_text().strip() == "pjm_h24_iTransformer_custom_ftS_0|True"
+    assert np.load(out).shape == (1, 3, 1)

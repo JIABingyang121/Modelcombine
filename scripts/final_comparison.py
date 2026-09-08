@@ -47,12 +47,15 @@ from scripts.train_combinations_kg import (
     _library_raw_frame,
 )
 from src.models.external_adapters import (
+    EXTERNAL_METHODS,
+    ITRANSFORMER_PREDICT_SNIPPET,
     MOLE_PREDICT_SNIPPET,
     OFFICIAL_FIXED_SEED,
     TIME_MOE_PREDICT_SNIPPET,
     ExternalAdapterError,
     hyperparameters,
     itransformer_command,
+    itransformer_predict_command,
     mole_train_command,
     read_official_output,
     run_official,
@@ -335,7 +338,9 @@ def _stack_validation_folds(
 
 def _external_config(request: Request, method: str) -> Dict[str, Any]:
     config = request.external.get(method)
-    if not config:
+    # 冻结定义只带口径（超参数/commit），机器本地路径只能来自 --external-config；
+    # 两者合并后 config 可能非空却没有 repo，这里一并挡掉。
+    if not config or "repo" not in config:
         raise FinalComparisonError(
             f"{method} 需要 --external-config 提供 repo/python 等路径（官方实现在仓库之外）"
         )
@@ -343,17 +348,22 @@ def _external_config(request: Request, method: str) -> Dict[str, Any]:
 
 
 def _write_training_file(request: Request, method: str, repo: Path, seed: int) -> str:
-    """冻结训练文件：``raw.timestamp < training_cutoff``，按 dataset×长度×种子写一份。"""
+    """冻结训练文件：``raw.timestamp < training_cutoff``，按 dataset×长度×种子写一份。
+
+    **每次调用都按当前 raw 与 cutoff 覆盖重写**，不因同名文件已存在就复用：官方仓库在
+    实验之间是持久目录，冒烟阶段留下的同名文件会被正式实验直接拿去训练。本函数只在
+    ``request.fitted`` 判定"本进程尚未训练过该 model_id"时被调用，因此一个进程内仍然
+    只写一次、只训练一次。
+    """
     name = f"mc_train_{request.dataset}_h{request.forecast_steps}_s{seed}.csv"
     path = repo / "dataset" / name
-    if not path.exists():
-        train = request.raw[request.raw["timestamp"] < request.training_cutoff]
-        if train.empty:
-            raise FinalComparisonError(
-                f"{method}: {request.dataset} 在 training_cutoff 之前没有训练数据"
-            )
-        # 训练文件的截止点就是它自己的最后一个时间戳，不再二次截断
-        write_official_input(train, path, train["timestamp"].max())
+    train = request.raw[request.raw["timestamp"] < request.training_cutoff]
+    if train.empty:
+        raise FinalComparisonError(
+            f"{method}: {request.dataset} 在 training_cutoff 之前没有训练数据"
+        )
+    # 训练文件的截止点就是它自己的最后一个时间戳，不再二次截断
+    write_official_input(train, path, train["timestamp"].max())
     return name
 
 
@@ -374,22 +384,16 @@ def _locate_checkpoint(checkpoints: Path, model_id: str) -> Path:
     return found[0]
 
 
-def _locate_itransformer_output(repo: Path, model_id: str) -> Path:
-    found = sorted(repo.glob(f"results/{model_id}_*/real_prediction.npy"))
-    if not found:
-        raise FinalComparisonError(f"官方未在 results/{model_id}_* 下产出预测")
-    return found[0]
-
-
 @register("itransformer")
 def _itransformer(request: Request) -> np.ndarray:
-    """官方 iTransformer（thuml）。训练一次、T1—T3 复用同一个 checkpoint。
+    """官方 iTransformer（thuml）。训练一次、T1—T3 各自走一次官方 ``Exp.predict``。
 
     官方 run.py 无 CLI 种子参数、内部固定 fix_seed=2023，因此本方法对请求种子不敏感；
     结果表里记的是官方真实种子 2023。
 
-    **注意**：``--is_training 0`` 的推理组合尚未经服务器探针验证，必须先按方案第 8 步
-    用旧窗口冒烟通过后才能进正式实验。
+    查询不走 ``--is_training 0``：官方该分支只调 ``exp.test()`` 并忽略 ``--do_predict``，
+    不会为查询窗口产出 ``real_prediction.npy``。详见
+    ``external_adapters.ITRANSFORMER_PREDICT_SNIPPET``。
     """
     method = "itransformer"
     config = _external_config(request, method)
@@ -402,22 +406,21 @@ def _itransformer(request: Request) -> np.ndarray:
             run_official(
                 itransformer_command(
                     config, model_id=model_id, data_path=train_file,
-                    forecast_steps=request.forecast_steps, is_training=True,
+                    forecast_steps=request.forecast_steps,
                 ),
                 cwd=repo, method=method,
             )
             request.fitted[("_trained", method, model_id)] = True
         query_file = _write_query_file(request, method, repo)
+        output = _external_output_path(config, repo, request, seed)
         run_official(
-            itransformer_command(
+            itransformer_predict_command(
                 config, model_id=model_id, data_path=query_file,
-                forecast_steps=request.forecast_steps, is_training=False,
+                forecast_steps=request.forecast_steps, output=output,
             ),
             cwd=repo, method=method,
         )
-        return read_official_output(
-            _locate_itransformer_output(repo, model_id), method, request.forecast_steps
-        )
+        return read_official_output(output, method, request.forecast_steps)
     except ExternalAdapterError as exc:
         raise FinalComparisonError(str(exc)) from exc
 
@@ -499,7 +502,34 @@ def _external_output_path(
     output_dir = Path(config.get("output_dir", repo / "mc_output"))
     output_dir.mkdir(parents=True, exist_ok=True)
     tag = f"{request.dataset}_{request.test_window}_h{request.forecast_steps}_s{seed}"
-    return output_dir / f"real_prediction_{tag}.npy"
+    path = output_dir / f"real_prediction_{tag}.npy"
+    # 官方仓库是跨批次持久目录。先删掉同名旧产物：官方这次若没写出新文件，
+    # read_official_output 必须失败，而不是把上一批的结果当成这次的预测读回来。
+    if path.exists():
+        path.unlink()
+    return path
+
+
+def apply_frozen_external(
+    external: Mapping[str, Any] | None, frozen: Mapping[str, Any]
+) -> Dict[str, Any]:
+    """把冻结定义里的外部方法口径合并进运行时配置。
+
+    ``--external-config`` 只提供机器本地路径（repo/python/checkpoints/snapshot/gpu）；
+    超参数、官方代码版本、Time-MoE 权重标识一律以 ``experiment_definition.json`` 为准。
+    配置里若同时写了这些字段且与冻结值不同，直接失败——定义冻结之后不允许改口径重跑。
+    """
+    merged = {method: dict(config) for method, config in (external or {}).items()}
+    for method, values in frozen.items():
+        target = merged.setdefault(method, {})
+        for key, frozen_value in values.items():
+            if key in target and target[key] != frozen_value:
+                raise FinalComparisonError(
+                    f"{method}.{key} 与冻结定义不一致：配置是 {target[key]}，"
+                    f"冻结值是 {frozen_value}；定义冻结后不得改口径重跑"
+                )
+            target[key] = frozen_value
+    return merged
 
 
 # ------------------------------------------------------------------ 运行
@@ -598,26 +628,41 @@ def main() -> int:
     parser.add_argument("--database", type=Path, default=None,
                         help="modelcombine 与 stack 复现版使用的已冻结 SQLite 模型库")
     parser.add_argument("--external-config", type=Path, default=None,
-                        help="外部官方实现的 repo/python/checkpoints 路径 JSON；"
+                        help="外部官方实现的 repo/python/checkpoints 等机器本地路径 JSON；"
                              "itransformer/mole/time_moe 需要")
+    parser.add_argument("--definition", type=Path, default=None,
+                        help="freeze_final_experiment.py 冻结的 experiment_definition.json；"
+                             "跑外部方法时必需，超参数与官方版本以它为准")
     parser.add_argument("--candidates", nargs="+", default=[],
                         help="冻结候选池；stack_ensembles_reproduction 需要，"
                              "必须与建库时声明的一致")
     parser.add_argument("--out", type=Path, required=True, help="输出长表 CSV")
     args = parser.parse_args()
 
+    external = (
+        json.loads(args.external_config.read_text(encoding="utf-8"))
+        if args.external_config else None
+    )
+    requested_external = [m for m in args.methods if m in EXTERNAL_METHODS]
+    if requested_external and args.definition is None:
+        print(
+            f"[final] {requested_external} 走官方外部实现，必须用 --definition 指定已冻结的 "
+            "experiment_definition.json：超参数与官方版本只能取冻结值。"
+        )
+        return 1
+
     relations: List[Dict[str, Any]] = []
     try:
+        if args.definition is not None:
+            definition = json.loads(args.definition.read_text(encoding="utf-8"))
+            external = apply_frozen_external(external, definition.get("external", {}))
         frame = run(
             relations=relations,
             methods=args.methods, datasets=args.datasets, windows=args.windows,
             forecast_steps=args.forecast_steps, seeds=args.seeds,
             raw_root=args.raw_root, window_plan=args.window_plan, database=args.database,
             candidates=args.candidates,
-            external=(
-                json.loads(args.external_config.read_text(encoding="utf-8"))
-                if args.external_config else None
-            ),
+            external=external,
         )
     except FinalComparisonError as exc:
         print(f"[final] 运行不完整，立即停止: {exc}")

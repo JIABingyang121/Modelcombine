@@ -56,6 +56,19 @@ REQUIRED_HYPERPARAMETERS: Dict[str, tuple] = {
 }
 
 
+#: 走官方外部实现的方法。它们的正式口径必须先进冻结定义，运行时只能用冻结值。
+EXTERNAL_METHODS = ("itransformer", "mole", "time_moe")
+
+#: 每个外部方法必须写进冻结定义的口径字段。``commit`` 是官方代码版本（由配置声明，
+#: 本项目不代为核验）；``checkpoint_id`` 是 Time-MoE 的预训练权重标识。
+#: repo/python/checkpoints/snapshot 这些是机器本地路径，不属于口径，不进定义。
+FROZEN_EXTERNAL_KEYS: Dict[str, tuple] = {
+    "itransformer": ("commit", "hyperparameters"),
+    "mole": ("commit", "hyperparameters"),
+    "time_moe": ("commit", "checkpoint_id", "context_length"),
+}
+
+
 def hyperparameters(config: Mapping[str, Any], method: str) -> Dict[str, Any]:
     """取正式超参数；缺失即失败，绝不回落到 PROBE_HYPERPARAMETERS。"""
     values = config.get("hyperparameters")
@@ -125,21 +138,20 @@ def read_official_output(path: Path, method: str, forecast_steps: int) -> np.nda
     return values
 
 
-def itransformer_command(
+def itransformer_flags(
     config: Mapping[str, Any], *, model_id: str, data_path: str, forecast_steps: int,
-    is_training: bool,
+    do_predict: bool,
 ) -> List[str]:
-    """官方 iTransformer 入口。
+    """官方 ``run.py`` 的参数（不含解释器与脚本名）。
 
-    ``is_training=True`` 是探针实测通过的组合（`--is_training 1 … --do_predict --inverse`）。
-    ``is_training=False`` 用于"训练一次、多窗口推理"：**该组合尚未经服务器探针验证**，
-    必须先按方案第 8 步用旧窗口做冒烟，通过后才能进正式实验。
+    官方的 ``setting``（也就是 checkpoint 目录名）由 model_id/model/data/features/三段
+    长度/模型尺寸/des 拼成，**不含 data_path**。因此训练与查询用同一份参数、只换
+    ``--data_path``，就落在同一个 checkpoint 上。
     """
     repo = Path(config["repo"])
     hp = hyperparameters(config, "itransformer")
     return [
-        str(config["python"]), "-u", "run.py",
-        "--is_training", "1" if is_training else "0",
+        "--is_training", "1",
         "--model_id", model_id, "--model", "iTransformer",
         "--data", "custom", "--root_path", f"{repo}/dataset/", "--data_path", data_path,
         "--features", "S", "--target", "load", "--freq", "h",
@@ -154,8 +166,60 @@ def itransformer_command(
         "--train_epochs", str(hp["train_epochs"]), "--batch_size", str(hp["batch_size"]),
         "--patience", str(hp["patience"]), "--learning_rate", str(hp["learning_rate"]),
         "--num_workers", "0", "--itr", "1", "--des", str(hp["des"]),
-        "--inverse", "--do_predict", "--gpu", str(config.get("gpu", 0)),
-    ]
+        "--inverse", "--gpu", str(config.get("gpu", 0)),
+    ] + (["--do_predict"] if do_predict else [])
+
+
+def itransformer_command(
+    config: Mapping[str, Any], *, model_id: str, data_path: str, forecast_steps: int,
+) -> List[str]:
+    """官方训练入口（探针实测通过的 ``--is_training 1`` 分支）。
+
+    这里**不带** ``--do_predict``：带上它，官方会用训练文件再跑一次 predict 并写下
+    ``results/<setting>/real_prediction.npy``；那份文件与任何查询窗口都无关，正是旧接线
+    误当成查询结果读回的东西。训练阶段干脆不产生它。
+    """
+    return [str(config["python"]), "-u", "run.py"] + itransformer_flags(
+        config, model_id=model_id, data_path=data_path,
+        forecast_steps=forecast_steps, do_predict=False,
+    )
+
+
+#: iTransformer 查询：以官方 ``Exp.predict`` 加载已训练 checkpoint 预测当前窗口。
+#:
+#: **不能用** ``--is_training 0``：官方 ``run.py`` 的该分支只调 ``exp.test()``，根本不读
+#: ``--do_predict``；而只有 ``exp.predict()`` 写 ``real_prediction.npy``（``test()`` 写的是
+#: ``pred.npy``）。所以那条命令不会为查询窗口产出任何新文件。
+#:
+#: 这里用 runpy 执行官方 ``run.py`` 自己的 ``--is_training 1 --do_predict`` 分支，只把
+#: ``train``/``test`` 置空，使它只做 ``predict(setting, load=True)``——权重全部来自训练阶段
+#: 的官方 checkpoint，预测由官方 ``predict()`` 与官方 ``Dataset_Pred`` 完成，不改官方源码。
+#: 最后把官方产物另存到调用方指定的窗口专属路径，不再用 glob 去找。
+ITRANSFORMER_PREDICT_SNIPPET = (
+    'import sys, runpy; import numpy as np; '
+    'out=sys.argv.pop(1); '
+    'import experiments.exp_long_term_forecasting as M; Base=M.Exp_Long_Term_Forecast; '
+    'M.Exp_Long_Term_Forecast=type("Exp_Query",(Base,),{'
+    '"train":(lambda self, setting: self.model),'
+    '"test":(lambda self, *a, **k: None),'
+    '"predict":(lambda self, setting, load=False, _o=out: ('
+    'Base.predict(self, setting, True),'
+    'np.save(_o, np.load("./results/"+setting+"/real_prediction.npy")))[0])}); '
+    'runpy.run_path("run.py", run_name="__main__")'
+)
+
+
+def itransformer_predict_command(
+    config: Mapping[str, Any], *, model_id: str, data_path: str, forecast_steps: int,
+    output: Path,
+) -> List[str]:
+    """官方查询入口：加载训练 checkpoint，对当前窗口 CSV 预测，写到 ``output``。"""
+    return [
+        str(config["python"]), "-c", ITRANSFORMER_PREDICT_SNIPPET, str(output),
+    ] + itransformer_flags(
+        config, model_id=model_id, data_path=data_path,
+        forecast_steps=forecast_steps, do_predict=True,
+    )
 
 
 def mole_train_command(

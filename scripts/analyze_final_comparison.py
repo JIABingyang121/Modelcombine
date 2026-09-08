@@ -93,11 +93,19 @@ def _check_against_definition(
                 f"{method} 的任务集合不符：缺 {sorted(expected_tasks - tasks)}，"
                 f"多 {sorted(tasks - expected_tasks)}"
             )
-        seeds = set(int(v) for v in rows["seed"])
-        if seeds != expected_seeds.get(method, set()):
+        # 种子必须在**每个任务**上都齐全：只看全局并集时，个别任务少跑一个种子会漏掉
+        want = expected_seeds.get(method, set())
+        seeds_by_task: Dict[tuple, set] = {}
+        for d, w, st, seed in zip(
+            rows["dataset"], rows["test_window"], rows["forecast_steps"], rows["seed"]
+        ):
+            seeds_by_task.setdefault((d, w, int(st)), set()).add(int(seed))
+        bad = {task: got for task, got in seeds_by_task.items() if got != want}
+        if bad:
+            example = sorted(bad)[0]
             problems.append(
-                f"{method} 的种子集合是 {sorted(seeds)}，"
-                f"冻结定义要求 {sorted(expected_seeds.get(method, set()))}"
+                f"{method} 有 {len(bad)}/{len(seeds_by_task)} 个任务的种子集合与冻结定义 "
+                f"{sorted(want)} 不符，例如 {example} 只有 {sorted(bad[example])}"
             )
     return {
         "checked_against_definition": True,
@@ -115,20 +123,30 @@ def _validate(frame: pd.DataFrame) -> None:
     if not np.isfinite(frame["yhat"]).all() or not np.isfinite(frame["y_true"]).all():
         raise AnalysisError("预测长表含非有限值")
 
-    # 所有方法必须落在完全相同的目标时间戳上，否则不是同口径比较
-    per_task = frame.groupby(list(TASK_KEYS))
-    for task, group in per_task:
-        stamps = {
-            method: tuple(sorted(rows["timestamp"]))
-            for method, rows in group.groupby("method")
-        }
-        if len(set(stamps.values())) != 1:
-            raise AnalysisError(f"任务 {task} 的方法之间目标时间戳不一致")
-        for method, rows in group.groupby("method"):
-            if len(rows) != int(task[2]) * rows["seed"].nunique():
+    # 同口径比较的判据落在 **(方法, 种子)** 这一层：每一组都必须恰好覆盖同样的 H 个
+    # 唯一时间戳。不能把一个方法所有种子的时间戳拼起来比——MoLE 三种子有 3H 行、
+    # 确定性方法只有 H 行，正确的结果也会被判成"目标时间戳不一致"。
+    for task, group in frame.groupby(list(TASK_KEYS)):
+        steps = int(task[2])
+        reference: tuple | None = None
+        for (method, seed), rows in group.groupby(["method", "seed"]):
+            stamps = tuple(sorted(rows["timestamp"]))
+            if len(stamps) != steps:
                 raise AnalysisError(
-                    f"任务 {task} 方法 {method} 行数 {len(rows)} 与 forecast_steps 不符"
+                    f"任务 {task} 方法 {method} 种子 {seed} 有 {len(stamps)} 行，"
+                    f"与 forecast_steps={steps} 不符"
                 )
+            if len(set(stamps)) != steps:
+                raise AnalysisError(
+                    f"任务 {task} 方法 {method} 种子 {seed} 的目标时间戳有重复"
+                )
+            if reference is None:
+                reference = stamps
+            elif stamps != reference:
+                raise AnalysisError(f"任务 {task} 的方法之间目标时间戳不一致")
+        # 同一个目标时刻只能有一个真值，否则各方法比的不是同一个窗口
+        if int(group.groupby("timestamp")["y_true"].nunique().max()) != 1:
+            raise AnalysisError(f"任务 {task} 的同一时间戳出现了不同的 y_true")
 
 
 def _task_table(frame: pd.DataFrame) -> pd.DataFrame:

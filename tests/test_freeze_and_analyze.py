@@ -249,7 +249,7 @@ def test_incomplete_grid_and_timestamp_mismatch_block_conclusions():
 
     frame = _long_table({METHOD_UNDER_TEST: 1.0, "xgboost": 2.0})
     mask = (frame["method"] == "xgboost") & (frame["forecast_steps"] == 24)
-    frame.loc[mask, "timestamp"] = pd.Timestamp("2030-01-01")
+    frame.loc[mask, "timestamp"] = frame.loc[mask, "timestamp"] + pd.Timedelta(days=365)
     with pytest.raises(AnalysisError, match="目标时间戳不一致"):
         analyse(frame, _definition(set(frame["method"])))
 
@@ -259,6 +259,7 @@ def test_definition_records_seed_policy_and_method_limitations(frozen_inputs):
     definition = build_definition(
         raw_root=frozen_inputs["raw_root"], window_plan_path=frozen_inputs["plan"],
         datasets=[DATASET], methods=["itransformer", "mole", "time_moe"],
+        external_config=EXTERNAL_CONFIG,
         forecast_steps=[STEPS], database=None,
     )
 
@@ -266,7 +267,8 @@ def test_definition_records_seed_policy_and_method_limitations(frozen_inputs):
     assert definition["seeds"]["mole"] == list(DEEP_METHOD_SEEDS)
     # iTransformer 官方 run.py 固定 fix_seed=2023；Time-MoE 是零样本确定性贪心生成。
     # 两者跑多种子都只会得到相同结果，不构成独立样本，因此各跑一次。
-    assert definition["seeds"]["itransformer"] == list(DETERMINISTIC_METHOD_SEEDS)
+    # 结果表记的是官方硬编码的 2023，冻结定义必须记同一个值，否则完整性核对必然失败
+    assert definition["seeds"]["itransformer"] == [2023]
     assert definition["seeds"]["time_moe"] == list(DETERMINISTIC_METHOD_SEEDS)
     assert set(definition["seed_insensitive"]) == {"itransformer", "time_moe"}
     assert definition["official_fixed_seeds"]["itransformer"] == 2023
@@ -339,3 +341,139 @@ def test_analysis_without_a_definition_cannot_conclude():
 
     assert report["completeness"]["checked_against_definition"] is False
     assert report["conclusions"]["comparisons"][0]["overall_better"] is False
+
+
+# --------------------------------------------- 多种子方法不得被读成"重复时间戳"
+def _with_three_seeds(frame, method):
+    rows = frame[frame["method"] == method]
+    return pd.concat(
+        [frame[frame["method"] != method]]
+        + [rows.assign(seed=seed) for seed in (42, 43, 44)],
+        ignore_index=True,
+    )
+
+
+def test_multi_seed_method_is_not_read_as_inconsistent_timestamps():
+    """MoLE 三种子共 3H 行、H 个唯一时间戳；确定性方法只有 H 行。
+
+    按方法把全部行的时间戳拼成元组来比较，会把这个正确结构判成"目标时间戳不一致"。
+    """
+    frame = _with_three_seeds(
+        _long_table({METHOD_UNDER_TEST: 1.0, "mole": 2.0}), "mole"
+    )
+    definition = _definition([METHOD_UNDER_TEST, "mole"])
+    definition["seeds"]["mole"] = [42, 43, 44]
+
+    report = analyse(frame, definition)
+
+    assert report["completeness"]["passed"] is True, report["completeness"]["problems"]
+    assert report["conclusions"]["complete_grid"] is True
+
+
+def test_seed_must_be_complete_in_every_task_not_only_globally():
+    """某一个任务缺了 seed=44，但全局种子并集仍是 {42,43,44}——必须被查出来。"""
+    frame = _with_three_seeds(
+        _long_table({METHOD_UNDER_TEST: 1.0, "mole": 2.0}), "mole"
+    )
+    drop = (
+        (frame["method"] == "mole") & (frame["seed"] == 44)
+        & (frame["dataset"] == DATASETS[0]) & (frame["test_window"] == "T1")
+        & (frame["forecast_steps"] == 24)
+    )
+    assert drop.any()
+    frame = frame[~drop].reset_index(drop=True)
+    definition = _definition([METHOD_UNDER_TEST, "mole"])
+    definition["seeds"]["mole"] = [42, 43, 44]
+
+    report = analyse(frame, definition)
+
+    assert report["completeness"]["passed"] is False
+    assert any("44" in p for p in report["completeness"]["problems"])
+    assert all(
+        c["overall_better"] is False for c in report["conclusions"]["comparisons"]
+    )
+
+
+def test_duplicate_timestamps_within_one_seed_are_rejected():
+    """同一个 (方法, 种子) 内出现重复时间戳必须报错，行数对上也不行。"""
+    frame = _long_table({METHOD_UNDER_TEST: 1.0, "mole": 2.0})
+    task = (
+        (frame["method"] == "mole") & (frame["dataset"] == DATASETS[0])
+        & (frame["test_window"] == "T1") & (frame["forecast_steps"] == 24)
+    )
+    index = frame.index[task]
+    frame.loc[index[-1], "timestamp"] = frame.loc[index[0], "timestamp"]
+
+    with pytest.raises(AnalysisError, match="重复"):
+        analyse(frame, _definition([METHOD_UNDER_TEST, "mole"]))
+
+
+# ------------------------------------------- 外部方法的正式口径必须进入冻结定义
+EXTERNAL_CONFIG = {
+    "itransformer": {
+        "repo": "/srv/iTransformer", "python": "/srv/venv/bin/python",
+        "checkpoints": "/srv/ckpt",
+        "commit": "c2426e68ca13f74aaec08045c5c724d8ad328124",
+        "hyperparameters": {
+            "seq_len": 96, "label_len": 48, "d_model": 512, "n_heads": 8,
+            "e_layers": 3, "d_layers": 1, "d_ff": 512, "factor": 1, "dropout": 0.1,
+            "train_epochs": 10, "batch_size": 32, "patience": 3,
+            "learning_rate": 0.0001, "des": "final",
+        },
+    },
+    "mole": {
+        "repo": "/srv/MoLE", "python": "/srv/venv/bin/python", "checkpoints": "/srv/ckpt",
+        "commit": "0123456789abcdef0123456789abcdef01234567",
+        "hyperparameters": {
+            "seq_len": 336, "t_dim": 4, "train_epochs": 10, "batch_size": 32,
+            "patience": 3, "learning_rate": 0.0001, "des": "final",
+        },
+    },
+    "time_moe": {
+        "repo": "/srv/Time-MoE", "python": "/srv/venv2/bin/python",
+        "snapshot": "/srv/hf/models--Maple728--TimeMoE-50M/snapshots/abc",
+        "commit": "89abcdef0123456789abcdef0123456789abcdef",
+        "checkpoint_id": "Maple728/TimeMoE-50M@main",
+        "context_length": 720,
+    },
+}
+
+
+def test_definition_freezes_external_hyperparameters_code_version_and_checkpoint(
+    frozen_inputs,
+):
+    definition = build_definition(
+        raw_root=frozen_inputs["raw_root"], window_plan_path=frozen_inputs["plan"],
+        datasets=[DATASET], methods=["itransformer", "mole", "time_moe"],
+        forecast_steps=[STEPS], database=None, external_config=EXTERNAL_CONFIG,
+    )
+
+    external = definition["external"]
+    assert external["itransformer"]["hyperparameters"]["d_model"] == 512
+    assert external["itransformer"]["commit"] == EXTERNAL_CONFIG["itransformer"]["commit"]
+    assert external["mole"]["hyperparameters"]["seq_len"] == 336
+    assert external["time_moe"]["checkpoint_id"] == "Maple728/TimeMoE-50M@main"
+    assert external["time_moe"]["context_length"] == 720
+    # 机器本地路径不属于口径，不得写进定义
+    for method, frozen in external.items():
+        assert "repo" not in frozen and "python" not in frozen, method
+
+
+def test_freeze_refuses_external_method_without_config(frozen_inputs):
+    with pytest.raises(FreezeError, match="external-config"):
+        build_definition(
+            raw_root=frozen_inputs["raw_root"], window_plan_path=frozen_inputs["plan"],
+            datasets=[DATASET], methods=["itransformer"], forecast_steps=[STEPS],
+            database=None, external_config=None,
+        )
+
+
+def test_freeze_refuses_external_config_missing_commit(frozen_inputs):
+    config = {"itransformer": dict(EXTERNAL_CONFIG["itransformer"])}
+    config["itransformer"].pop("commit")
+    with pytest.raises(FreezeError, match="commit"):
+        build_definition(
+            raw_root=frozen_inputs["raw_root"], window_plan_path=frozen_inputs["plan"],
+            datasets=[DATASET], methods=["itransformer"], forecast_steps=[STEPS],
+            database=None, external_config=config,
+        )

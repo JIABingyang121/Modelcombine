@@ -57,7 +57,10 @@ def wiring(tmp_path, monkeypatch):
     def _record(command, *, cwd, method):
         calls.append({"method": method, "command": [str(c) for c in command]})
 
+    reads = []
+
     def _fake_output(path, method, forecast_steps):
+        reads.append(str(path))
         return np.full(forecast_steps, 1000.0)
 
     monkeypatch.setattr(final_comparison, "run_official", _record)
@@ -65,12 +68,9 @@ def wiring(tmp_path, monkeypatch):
     monkeypatch.setattr(
         final_comparison, "_locate_checkpoint", lambda *a, **k: Path("ckpt.pth")
     )
-    monkeypatch.setattr(
-        final_comparison, "_locate_itransformer_output", lambda *a, **k: Path("p.npy")
-    )
     return {
         "raw_root": raw_root, "plan": plan, "external": external,
-        "calls": calls, "repo": repo,
+        "calls": calls, "reads": reads, "repo": repo,
     }
 
 
@@ -187,3 +187,66 @@ def test_configured_hyperparameters_are_passed_through(wiring):
     assert command[command.index("--d_model") + 1] == "512"
     assert command[command.index("--e_layers") + 1] == "3"
     assert command[command.index("--des") + 1] == "final"
+
+
+# ------------------------------------------- iTransformer 查询必须真的执行 predict
+def test_itransformer_query_runs_official_predict_per_window(wiring):
+    """官方 run.py 的 ``--is_training 0`` 分支只调 ``exp.test()``，且忽略 ``--do_predict``。
+
+    只有 ``exp.predict()`` 写 ``real_prediction.npy``。旧接线因此在 T1—T3 都读到训练阶段
+    留下的同一份旧文件。查询必须走官方 ``Exp.predict``，并写到窗口专属产物路径。
+    """
+    _run(wiring, "itransformer")
+
+    trains = [c for c in wiring["calls"] if "run.py" in c["command"]]
+    queries = [c for c in wiring["calls"] if "run.py" not in c["command"]]
+    assert len(trains) == 1, f"应只训练一次，实际 {len(trains)} 次"
+    train = trains[0]["command"]
+    assert train[train.index("--is_training") + 1] == "1"
+    # 训练阶段不再产出 real_prediction.npy——它正是被误读成查询结果的那份旧文件
+    assert "--do_predict" not in train
+
+    assert len(queries) == len(WINDOWS)
+    outputs = []
+    for call in queries:
+        command = call["command"]
+        assert command[1] == "-c"
+        assert command[2] == final_comparison.ITRANSFORMER_PREDICT_SNIPPET
+        outputs.append(command[3])
+        # 查询命令必须带 --do_predict，并复用训练时的 model_id（即同一个 checkpoint）
+        assert "--do_predict" in command
+        assert command[command.index("--model_id") + 1] == train[train.index("--model_id") + 1]
+    assert len(set(outputs)) == len(WINDOWS), f"三个窗口写到了同一路径: {outputs}"
+    assert wiring["reads"] == outputs, "读回的必须正是本窗口刚写出的产物，不能靠 glob 捡旧文件"
+
+
+def test_stale_training_file_from_a_smoke_run_is_not_reused(wiring):
+    """冒烟阶段留下的同名训练文件，正式实验必须覆盖重写而不是直接复用。"""
+    stale = wiring["repo"] / "dataset" / f"mc_train_{DATASET}_h{STEPS}_s42.csv"
+    stale.write_text("date,load\n2000-01-01 00:00:00,1.0\n", encoding="utf-8")
+
+    _run(wiring, "mole", windows=("T1",))
+
+    train = pd.read_csv(stale)
+    assert len(train) > 100, "训练文件必须按当前 raw 与 training_cutoff 重写"
+    assert pd.to_datetime(train["date"]).min().year > 2000
+
+
+# ------------------------------------------------- 冻结定义是外部方法的唯一口径
+def test_frozen_external_values_are_used_and_conflicts_fail():
+    frozen = {
+        "itransformer": {
+            "commit": "c2426e68ca13f74aaec08045c5c724d8ad328124",
+            "hyperparameters": {"d_model": 512, "seq_len": 96},
+        }
+    }
+    config = {"itransformer": {"repo": "/r", "python": "/p", "checkpoints": "/c"}}
+
+    merged = final_comparison.apply_frozen_external(config, frozen)
+    assert merged["itransformer"]["hyperparameters"] == {"d_model": 512, "seq_len": 96}
+    assert merged["itransformer"]["commit"] == frozen["itransformer"]["commit"]
+    assert merged["itransformer"]["repo"] == "/r"
+
+    config["itransformer"]["hyperparameters"] = {"d_model": 64, "seq_len": 96}
+    with pytest.raises(FinalComparisonError, match="冻结"):
+        final_comparison.apply_frozen_external(config, frozen)

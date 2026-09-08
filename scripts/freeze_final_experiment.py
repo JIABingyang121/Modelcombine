@@ -12,7 +12,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, List, Mapping, Sequence
 
 import pandas as pd
 
@@ -21,7 +21,13 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.final_comparison import BASE_FEATURES, OUTPUT_COLUMNS, available_methods
-from src.models.external_adapters import METHOD_LIMITATIONS, OFFICIAL_FIXED_SEED
+from src.models.external_adapters import (
+    EXTERNAL_METHODS,
+    FROZEN_EXTERNAL_KEYS,
+    METHOD_LIMITATIONS,
+    OFFICIAL_FIXED_SEED,
+    REQUIRED_HYPERPARAMETERS,
+)
 from scripts.stage0_data_inventory import FORECAST_HORIZONS, WINDOW_ROLES
 from scripts.train_combinations_kg import _library_raw_frame
 from src.storage.model_store import SUPPORTED_FORECAST_STEPS
@@ -114,23 +120,65 @@ def _dataset_definition(
     }
 
 
+def _frozen_external(
+    methods: Sequence[str], external_config: Mapping[str, Any] | None
+) -> Dict[str, Dict[str, Any]]:
+    """把外部方法的正式口径固定进定义：超参数、官方代码版本、Time-MoE 权重标识。
+
+    机器本地路径（repo/python/checkpoints/snapshot）不是口径，不写进定义——换台机器
+    路径就变了，但超参数和官方版本不能变。
+    """
+    requested = [m for m in methods if m in EXTERNAL_METHODS]
+    if not requested:
+        return {}
+    if not external_config:
+        raise FreezeError(
+            f"{requested} 走官方外部实现，必须用 --external-config 提供正式超参数、"
+            "官方代码版本（commit）与 Time-MoE 权重标识，否则定义冻结后仍能改口径重跑"
+        )
+    frozen: Dict[str, Dict[str, Any]] = {}
+    for method in requested:
+        config = external_config.get(method)
+        if not config:
+            raise FreezeError(f"--external-config 里没有 {method} 的配置")
+        missing = [k for k in FROZEN_EXTERNAL_KEYS[method] if k not in config]
+        if missing:
+            raise FreezeError(f"{method} 的 external-config 缺少 {missing}")
+        if method in REQUIRED_HYPERPARAMETERS:
+            absent = [
+                k for k in REQUIRED_HYPERPARAMETERS[method]
+                if k not in config["hyperparameters"]
+            ]
+            if absent:
+                raise FreezeError(f"{method} 的 hyperparameters 缺少 {absent}")
+        frozen[method] = {k: config[k] for k in FROZEN_EXTERNAL_KEYS[method]}
+    return frozen
+
+
 def build_definition(
     *,
     raw_root: Path, window_plan_path: Path, datasets: Sequence[str],
     methods: Sequence[str], forecast_steps: Sequence[int], database: Path | None,
+    external_config: Mapping[str, Any] | None = None,
 ) -> Dict[str, Any]:
     unknown = [m for m in methods if m not in available_methods()]
     if unknown:
         raise FreezeError(
             f"方法未在统一入口注册: {unknown}；已注册 {available_methods()}"
         )
+    external = _frozen_external(methods, external_config)
     plan = json.loads(window_plan_path.read_text(encoding="utf-8"))
     definitions = [
         _dataset_definition(raw_root, plan, dataset) for dataset in datasets
     ]
+    # 官方内部硬编码种子的方法（iTransformer 的 fix_seed=2023），结果表记的就是那个值，
+    # 定义里必须记同一个值，否则完整性核对必然判"种子集合不符"。
     seeds = {
-        method: list(DEEP_METHOD_SEEDS if method in DEEP_METHODS
-                     else DETERMINISTIC_METHOD_SEEDS)
+        method: (
+            [OFFICIAL_FIXED_SEED[method]] if method in OFFICIAL_FIXED_SEED
+            else list(DEEP_METHOD_SEEDS if method in DEEP_METHODS
+                      else DETERMINISTIC_METHOD_SEEDS)
+        )
         for method in methods
     }
     limitations = {
@@ -155,6 +203,8 @@ def build_definition(
         },
         #: 必须随结果一起报告的方法级限制（如 Time-MoE 的预训练截止不可证）
         "method_limitations": limitations,
+        #: 外部官方实现的正式口径。运行时由 final_comparison.py --definition 强制使用。
+        "external": external,
         "forecast_steps": [int(s) for s in forecast_steps],
         "forecast_horizons": dict(FORECAST_HORIZONS),
         "library_windows": list(LIBRARY_WINDOWS),
@@ -178,6 +228,9 @@ def main() -> int:
     parser.add_argument("--forecast-steps", nargs="+", type=int,
                         default=list(SUPPORTED_FORECAST_STEPS))
     parser.add_argument("--database", type=Path, default=None)
+    parser.add_argument("--external-config", type=Path, default=None,
+                        help="外部官方实现的配置 JSON；跑 itransformer/mole/time_moe 时必需，"
+                             "其中的超参数、commit 与 checkpoint_id 会被写进定义")
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
 
@@ -190,6 +243,10 @@ def main() -> int:
             raw_root=args.raw_root, window_plan_path=args.window_plan,
             datasets=args.datasets, methods=args.methods,
             forecast_steps=args.forecast_steps, database=args.database,
+            external_config=(
+                json.loads(args.external_config.read_text(encoding="utf-8"))
+                if args.external_config else None
+            ),
         )
     except FreezeError as exc:
         print(f"[freeze] 无法冻结: {exc}")
