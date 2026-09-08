@@ -10,6 +10,8 @@ subprocess 调用本身仍不在本机测（没有官方仓库也没有 GPU）�
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 from pathlib import Path
 
 import numpy as np
@@ -54,8 +56,22 @@ def wiring(tmp_path, monkeypatch):
 
     calls = []
 
+    ckpt_root = tmp_path / "ckpt"
+
     def _record(command, *, cwd, method):
-        calls.append({"method": method, "command": [str(c) for c in command]})
+        command = [str(c) for c in command]
+        calls.append({"method": method, "command": command})
+        if any(c.endswith("run_longExp.py") for c in command):
+            # 官方训练写出 checkpoint。目录名由官方 setting 决定，含 seq_len 与 des——
+            # 这正是 model_id 区分不开冒烟与正式两套产物的原因。
+            folder = ckpt_root / "_".join([
+                command[command.index("--model_id") + 1], "MoLE_DLinear", "custom", "ftS",
+                "sl" + command[command.index("--seq_len") + 1],
+                "pl" + command[command.index("--pred_len") + 1],
+                command[command.index("--des") + 1], "0",
+            ])
+            folder.mkdir(parents=True, exist_ok=True)
+            (folder / "checkpoint.pth").write_text("checkpoint", encoding="utf-8")
 
     reads = []
 
@@ -65,12 +81,10 @@ def wiring(tmp_path, monkeypatch):
 
     monkeypatch.setattr(final_comparison, "run_official", _record)
     monkeypatch.setattr(final_comparison, "read_official_output", _fake_output)
-    monkeypatch.setattr(
-        final_comparison, "_locate_checkpoint", lambda *a, **k: Path("ckpt.pth")
-    )
     return {
         "raw_root": raw_root, "plan": plan, "external": external,
-        "calls": calls, "reads": reads, "repo": repo,
+        "calls": calls, "reads": reads, "repo": repo, "ckpt_root": ckpt_root,
+        "record": _record,
     }
 
 
@@ -250,3 +264,211 @@ def test_frozen_external_values_are_used_and_conflicts_fail():
     config["itransformer"]["hyperparameters"] = {"d_model": 64, "seq_len": 96}
     with pytest.raises(FinalComparisonError, match="冻结"):
         final_comparison.apply_frozen_external(config, frozen)
+
+
+# ------------------------------------- MoLE 必须加载本次训练产出的那个 checkpoint
+def test_mole_loads_the_checkpoint_this_run_trained_not_a_smoke_leftover(wiring):
+    """官方 checkpoint 目录名含 seq_len 与 des，model_id 区分不开冒烟与正式两套产物。
+
+    这里冒烟留下 ``sl336…probe``、正式训练产出 ``sl96…final``；按名字排序 ``sl336`` 在前，
+    旧实现会静默加载探针小模型，正式结果被污染却不会报错。
+    """
+    stale = wiring["ckpt_root"] / (
+        f"{DATASET}_h{STEPS}_s42_MoLE_DLinear_custom_ftS_sl336_pl{STEPS}_probe_0"
+    )
+    stale.mkdir(parents=True)
+    (stale / "checkpoint.pth").write_text("probe", encoding="utf-8")
+    os.utime(stale / "checkpoint.pth", (0, 0))
+
+    _run(wiring, "mole", windows=WINDOWS)
+
+    fresh = wiring["ckpt_root"] / (
+        f"{DATASET}_h{STEPS}_s42_MoLE_DLinear_custom_ftS_sl96_pl{STEPS}_final_0"
+    )
+    predicts = [c for c in wiring["calls"] if "run_longExp.py" not in c["command"]]
+    assert len(predicts) == len(WINDOWS)
+    for call in predicts:
+        assert str(fresh / "checkpoint.pth") in call["command"]
+        assert str(stale / "checkpoint.pth") not in call["command"]
+
+
+def test_mole_detects_an_overwritten_checkpoint_at_the_same_path(wiring):
+    """同一套超参数重跑时官方会原地覆盖 checkpoint.pth，也必须认定为本次产物。
+
+    判据不能是"晚于训练开始时刻"：文件 mtime 用内核粗粒度时钟，time.time() 用细粒度时钟，
+    刚写出的文件可能显示得比训练开始还早。
+    """
+    same = wiring["ckpt_root"] / (
+        f"{DATASET}_h{STEPS}_s42_MoLE_DLinear_custom_ftS_sl96_pl{STEPS}_final_0"
+    )
+    same.mkdir(parents=True)
+    (same / "checkpoint.pth").write_text("previous", encoding="utf-8")
+    os.utime(same / "checkpoint.pth", (0, 0))
+
+    _run(wiring, "mole", windows=("T1",))
+
+    predict = next(c for c in wiring["calls"] if "run_longExp.py" not in c["command"])
+    assert str(same / "checkpoint.pth") in predict["command"]
+    assert (same / "checkpoint.pth").read_text() == "checkpoint"
+
+
+def test_mole_fails_loudly_when_training_produces_no_checkpoint(wiring, monkeypatch):
+    """官方训练没留下新 checkpoint 时必须报错，不能回头去捡任何旧文件。"""
+    stale = wiring["ckpt_root"] / (
+        f"{DATASET}_h{STEPS}_s42_MoLE_DLinear_custom_ftS_sl96_pl{STEPS}_probe_0"
+    )
+    stale.mkdir(parents=True)
+    (stale / "checkpoint.pth").write_text("probe", encoding="utf-8")
+    os.utime(stale / "checkpoint.pth", (0, 0))
+    monkeypatch.setattr(
+        final_comparison, "run_official",
+        lambda command, *, cwd, method: wiring["calls"].append(
+            {"method": method, "command": [str(c) for c in command]}
+        ),
+    )
+
+    with pytest.raises(FinalComparisonError, match="checkpoint"):
+        _run(wiring, "mole", windows=("T1",))
+
+
+# ----------------------------------------------- 种子网格必须在训练开始前就被拦住
+def test_incompatible_seed_grids_are_rejected_before_any_training():
+    definition = {"seeds": {
+        "itransformer": [2023], "modelcombine": [42], "mole": [42, 43, 44],
+    }}
+
+    # 一种子方法可以同批：iTransformer 冻结 2023、Modelcombine 冻结 42，数量相同
+    final_comparison.assert_seed_grid(["itransformer", "modelcombine"], [42], definition)
+
+    # MoLE 要三种子，混进来必须直接报错，而不是让确定性方法白跑三遍
+    with pytest.raises(FinalComparisonError, match="分批"):
+        final_comparison.assert_seed_grid(
+            ["itransformer", "mole"], [42, 43, 44], definition
+        )
+    with pytest.raises(FinalComparisonError, match="种子"):
+        final_comparison.assert_seed_grid(["mole"], [42], definition)
+    with pytest.raises(FinalComparisonError, match="种子"):
+        final_comparison.assert_seed_grid(["modelcombine"], [43], definition)
+    with pytest.raises(FinalComparisonError, match="冻结定义"):
+        final_comparison.assert_seed_grid(["stack_ensembles"], [42], definition)
+
+
+# ------------------------------------------- 冻结的官方版本必须与实际代码/权重对上
+def _git_repo(path: Path) -> str:
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "a.txt").write_text("x", encoding="utf-8")
+    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+    subprocess.run(["git", "init", "-q"], cwd=path, check=True, env=env)
+    subprocess.run(["git", "add", "a.txt"], cwd=path, check=True, env=env)
+    subprocess.run(["git", "commit", "-q", "-m", "x"], cwd=path, check=True, env=env)
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=path, capture_output=True, text=True, check=True
+    ).stdout.strip()
+
+
+def test_external_versions_are_checked_against_the_actual_repo_and_snapshot(tmp_path):
+    head = _git_repo(tmp_path / "mole_repo")
+    revision = "3f2c1ab9de4057118cbb2d5f8a6e0c4d91b7a2e0"
+    snapshot = tmp_path / "hf" / "models--Maple728--TimeMoE-50M" / "snapshots" / revision
+    snapshot.mkdir(parents=True)
+    external = {
+        "mole": {
+            "repo": str(tmp_path / "mole_repo"), "python": "/p",
+            "checkpoints": "/c", "commit": head,
+        },
+        "time_moe": {
+            "repo": str(tmp_path / "mole_repo"), "python": "/p", "commit": head,
+            "snapshot": str(snapshot),
+            "checkpoint_id": f"Maple728/TimeMoE-50M@{revision}",
+        },
+    }
+
+    observed = final_comparison.verify_external_versions(external, ["mole", "time_moe"])
+    assert observed["mole"]["repo_head"] == head
+    assert observed["time_moe"]["snapshot_revision"] == revision
+
+    # 仓库实际处在另一个版本
+    wrong = {**external, "mole": {**external["mole"], "commit": "0" * 40}}
+    with pytest.raises(FinalComparisonError, match="HEAD"):
+        final_comparison.verify_external_versions(wrong, ["mole"])
+
+    # 声称一个 checkpoint_id，实际加载另一个 snapshot
+    other = {**external, "time_moe": {
+        **external["time_moe"],
+        "checkpoint_id": "Maple728/TimeMoE-50M@" + "1" * 40,
+    }}
+    with pytest.raises(FinalComparisonError, match="snapshot"):
+        final_comparison.verify_external_versions(other, ["time_moe"])
+
+    # checkpoint_id 必须带不可变版本号，不能只写 repo id 或分支名
+    bare = {**external, "time_moe": {
+        **external["time_moe"], "checkpoint_id": "Maple728/TimeMoE-50M",
+    }}
+    with pytest.raises(FinalComparisonError, match="不可变"):
+        final_comparison.verify_external_versions(bare, ["time_moe"])
+
+
+def test_branch_name_is_not_an_immutable_revision(tmp_path):
+    """``@main`` 加一个叫 main 的目录不算版本固定，即使路径根本不存在也会被放行。"""
+    head = _git_repo(tmp_path / "repo")
+    external = {"time_moe": {
+        "repo": str(tmp_path / "repo"), "python": "/p", "commit": head,
+        "snapshot": "/fake/snapshots/main",
+        "checkpoint_id": "Maple728/TimeMoE-50M@main",
+    }}
+
+    with pytest.raises(FinalComparisonError, match="不可变"):
+        final_comparison.verify_external_versions(external, ["time_moe"])
+
+
+def test_missing_snapshot_directory_is_rejected(tmp_path):
+    """revision 格式对但目录不存在时也必须拒绝：核对的是实际权重，不是字符串。"""
+    head = _git_repo(tmp_path / "repo")
+    revision = "b" * 40
+    external = {"time_moe": {
+        "repo": str(tmp_path / "repo"), "python": "/p", "commit": head,
+        "snapshot": str(tmp_path / "missing" / "snapshots" / revision),
+        "checkpoint_id": f"Maple728/TimeMoE-50M@{revision}",
+    }}
+
+    with pytest.raises(FinalComparisonError, match="不存在"):
+        final_comparison.verify_external_versions(external, ["time_moe"])
+
+
+def test_uncommitted_changes_to_tracked_sources_are_rejected(tmp_path):
+    """HEAD 相等不代表跑的是那份代码：受跟踪源码被改过就必须拒绝。
+
+    实验产物是未跟踪文件（训练/查询 CSV、mc_output 下的 npy），不应该因此失败。
+    """
+    repo = tmp_path / "repo"
+    head = _git_repo(repo)
+    external = {"mole": {
+        "repo": str(repo), "python": "/p", "checkpoints": "/c", "commit": head,
+    }}
+
+    # 未跟踪的实验产物不影响核对
+    (repo / "mc_output").mkdir()
+    (repo / "mc_output" / "real_prediction_pjm_T1_h24_s42.npy").write_text("x", encoding="utf-8")
+    assert final_comparison.verify_external_versions(external, ["mole"])["mole"]["repo_head"] == head
+
+    # 受跟踪源码被改过
+    (repo / "a.txt").write_text("modified", encoding="utf-8")
+    with pytest.raises(FinalComparisonError, match="未提交"):
+        final_comparison.verify_external_versions(external, ["mole"])
+
+
+def test_missing_local_paths_raise_a_handled_error_not_keyerror(tmp_path):
+    """只有冻结定义、忘了传 --external-config 时，必须是可处理的错误而不是 KeyError。"""
+    frozen = {"mole": {"commit": "0" * 40, "hyperparameters": {"seq_len": 96}}}
+    merged = final_comparison.apply_frozen_external(None, frozen)
+
+    with pytest.raises(FinalComparisonError, match="external-config"):
+        final_comparison.verify_external_versions(merged, ["mole"])
+
+    with pytest.raises(FinalComparisonError, match="snapshot"):
+        final_comparison.verify_external_versions(
+            {"time_moe": {"repo": str(tmp_path), "python": "/p", "commit": "0" * 40,
+                          "checkpoint_id": "x@" + "c" * 40}},
+            ["time_moe"],
+        )

@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -48,6 +50,7 @@ from scripts.train_combinations_kg import (
 )
 from src.models.external_adapters import (
     EXTERNAL_METHODS,
+    REQUIRED_LOCAL_FIELDS,
     ITRANSFORMER_PREDICT_SNIPPET,
     MOLE_PREDICT_SNIPPET,
     OFFICIAL_FIXED_SEED,
@@ -377,10 +380,41 @@ def _write_query_file(request: Request, method: str, repo: Path) -> str:
     return name
 
 
-def _locate_checkpoint(checkpoints: Path, model_id: str) -> Path:
-    found = sorted(Path(checkpoints).glob(f"*{model_id}_*/checkpoint.pth"))
+def _checkpoint_snapshot(checkpoints: Path, model_id: str) -> Dict[Path, float]:
+    """训练前记下该 model_id 名下已有的 checkpoint 及其 mtime。"""
+    return {
+        path: path.stat().st_mtime
+        for path in Path(checkpoints).glob(f"*{model_id}_*/checkpoint.pth")
+    }
+
+
+def _locate_trained_checkpoint(
+    checkpoints: Path, model_id: str, before: Mapping[Path, float]
+) -> Path:
+    """定位**本次训练刚产出**的 checkpoint。
+
+    不能只按 model_id 匹配：官方 setting（= checkpoint 目录名）还含 seq_len、模型尺寸与
+    des，冒烟的探针小模型和正式模型会同时命中同一个 model_id，排序取第一个可能静默加载
+    探针模型。官方 setting 的确切格式串在本机拿不到（MoLE 源码在服务器仓库外），因此这里
+    不去拼那个字符串，而是直接问一个更强的问题：**哪个 checkpoint 是刚才那条训练命令写的**。
+
+    判据是与训练前的快照逐条比对（新出现，或 mtime 变了），不是"晚于某个时刻"：文件 mtime
+    来自内核的粗粒度时钟，而 ``time.time()`` 用细粒度时钟，刚写出的文件的 mtime 可能比训练
+    前取的时刻还早几毫秒。命中不唯一或一个都没有时报错，绝不回头捡旧文件。
+    """
+    found = [
+        path for path in sorted(Path(checkpoints).glob(f"*{model_id}_*/checkpoint.pth"))
+        if path not in before or path.stat().st_mtime != before[path]
+    ]
     if not found:
-        raise FinalComparisonError(f"官方未产出 {model_id} 的 checkpoint")
+        raise FinalComparisonError(
+            f"官方训练没有为 {model_id} 写出新的 checkpoint；"
+            f"{checkpoints} 下的旧产物一律不采用"
+        )
+    if len(found) > 1:
+        raise FinalComparisonError(
+            f"{model_id} 匹配到多个本次训练的 checkpoint: {[str(p) for p in found]}"
+        )
     return found[0]
 
 
@@ -439,8 +473,10 @@ def _mole(request: Request) -> np.ndarray:
     model_id = f"{request.dataset}_h{request.forecast_steps}_s{seed}"
     try:
         hp = hyperparameters(config, method)
-        if ("_trained", method, model_id) not in request.fitted:
+        trained = ("_trained", method, model_id)
+        if trained not in request.fitted:
             train_file = _write_training_file(request, method, repo, seed)
+            before = _checkpoint_snapshot(Path(config["checkpoints"]), model_id)
             run_official(
                 mole_train_command(
                     config, model_id=model_id, data_path=train_file,
@@ -448,14 +484,16 @@ def _mole(request: Request) -> np.ndarray:
                 ),
                 cwd=repo, method=method,
             )
-            request.fitted[("_trained", method, model_id)] = True
+            # 解析一次并记住：T1—T3 复用的必须是同一个 checkpoint，不再逐窗口重新查找
+            request.fitted[trained] = _locate_trained_checkpoint(
+                Path(config["checkpoints"]), model_id, before
+            )
         query_file = _write_query_file(request, method, repo)
         output = _external_output_path(config, repo, request, seed)
         run_official(
             [
                 str(config["python"]), "-c", MOLE_PREDICT_SNIPPET,
-                str(request.forecast_steps),
-                str(_locate_checkpoint(Path(config["checkpoints"]), model_id)),
+                str(request.forecast_steps), str(request.fitted[trained]),
                 str(output), query_file, str(config.get("gpu", 0)),
                 str(seed), str(hp["seq_len"]), str(hp["t_dim"]),
             ],
@@ -530,6 +568,106 @@ def apply_frozen_external(
                 )
             target[key] = frozen_value
     return merged
+
+
+def assert_seed_grid(
+    methods: Sequence[str], seeds: Sequence[int], definition: Mapping[str, Any]
+) -> None:
+    """种子网格必须与冻结定义一致，且一次运行只能包含种子数相同的方法。
+
+    ``run()`` 把同一组 ``--seeds`` 用于全部方法。把 MoLE（三种子）和确定性方法混在一次里
+    跑，确定性方法会被重复执行三次、产出三组重复行——要到分析阶段才失败，GPU 时间已经烧完。
+    所以在任何训练开始之前就拦住。
+    """
+    frozen = definition.get("seeds", {})
+    missing = [m for m in methods if m not in frozen]
+    if missing:
+        raise FinalComparisonError(f"冻结定义里没有这些方法的种子: {missing}")
+    counts = {m: len(frozen[m]) for m in methods}
+    if len(set(counts.values())) != 1:
+        raise FinalComparisonError(
+            f"这些方法要求的种子数量不同 {counts}；一次运行只能用同一组 --seeds，请分批执行"
+        )
+    expected = next(iter(counts.values()))
+    if len(set(seeds)) != len(seeds) or len(seeds) != expected:
+        raise FinalComparisonError(
+            f"--seeds {list(seeds)} 与冻结定义要求的 {expected} 个种子不符"
+        )
+    for method in methods:
+        # 官方内部固定种子的方法，结果表记官方值，请求值只决定跑几次，不必相等
+        if method in OFFICIAL_FIXED_SEED:
+            continue
+        if {int(s) for s in seeds} != {int(s) for s in frozen[method]}:
+            raise FinalComparisonError(
+                f"{method} 的冻结种子是 {sorted(frozen[method])}，"
+                f"--seeds 是 {sorted(seeds)}"
+            )
+
+
+def verify_external_versions(
+    external: Mapping[str, Any], methods: Sequence[str]
+) -> Dict[str, Dict[str, str]]:
+    """核对冻结的官方版本与**实际**代码/权重一致。启动时做一次，不按窗口重复。
+
+    冻结定义里的 ``commit`` / ``checkpoint_id`` 本身只是声明；不核对的话，配置可以声称用
+    的是冻结版本，实际仓库却在另一个 commit 上、实际加载的是另一个 snapshot。
+    """
+    observed: Dict[str, Dict[str, str]] = {}
+    for method in [m for m in methods if m in EXTERNAL_METHODS]:
+        config = external.get(method) or {}
+        missing = [k for k in REQUIRED_LOCAL_FIELDS[method] if k not in config]
+        if missing:
+            raise FinalComparisonError(
+                f"{method}: --external-config 缺少本机字段 {missing}；"
+                "冻结定义只存实验口径，不存 repo/python 这些路径"
+            )
+        repo = Path(config["repo"])
+        completed = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            capture_output=True, text=True,
+        )
+        if completed.returncode != 0:
+            raise FinalComparisonError(
+                f"{method}: 读不到 {repo} 的 git HEAD，无法核对冻结 commit\n"
+                f"{completed.stderr.strip()}"
+            )
+        head = completed.stdout.strip()
+        if head != config["commit"]:
+            raise FinalComparisonError(
+                f"{method}: 仓库 {repo} 当前 HEAD 是 {head}，"
+                f"冻结定义要求 {config['commit']}"
+            )
+        # HEAD 相等不等于跑的是那份代码：受跟踪源码被改过就不是冻结的那个版本。
+        # 未跟踪文件是实验产物（训练/查询 CSV、mc_output 下的 npy），不参与判定。
+        dirty = subprocess.run(
+            ["git", "-C", str(repo), "status", "--porcelain", "--untracked-files=no"],
+            capture_output=True, text=True,
+        )
+        if dirty.stdout.strip():
+            raise FinalComparisonError(
+                f"{method}: 仓库 {repo} 的受跟踪文件有未提交修改，实际运行的代码不是 "
+                f"{head}\n{dirty.stdout.strip()[:2000]}"
+            )
+        observed[method] = {"repo_head": head}
+        if method == "time_moe":
+            revision = str(config["checkpoint_id"]).partition("@")[2]
+            # HuggingFace 快照目录名就是该版本的 40 位提交号；分支名（main）会随时间指向
+            # 不同权重，不构成可复现的版本标识
+            if not re.fullmatch(r"[0-9a-f]{40}", revision):
+                raise FinalComparisonError(
+                    f"time_moe: checkpoint_id 必须写成 <repo_id>@<40 位提交号>，"
+                    f"当前是 {config['checkpoint_id']!r}；分支名或标签不是不可变版本"
+                )
+            snapshot = Path(config["snapshot"])
+            if not snapshot.is_dir():
+                raise FinalComparisonError(f"time_moe: snapshot 目录不存在: {snapshot}")
+            if snapshot.name != revision:
+                raise FinalComparisonError(
+                    f"time_moe: 实际 snapshot 是 {snapshot.name}，"
+                    f"冻结 checkpoint_id 要求 {revision}"
+                )
+            observed[method]["snapshot_revision"] = snapshot.name
+    return observed
 
 
 # ------------------------------------------------------------------ 运行
@@ -655,7 +793,11 @@ def main() -> int:
     try:
         if args.definition is not None:
             definition = json.loads(args.definition.read_text(encoding="utf-8"))
+            assert_seed_grid(args.methods, args.seeds, definition)
             external = apply_frozen_external(external, definition.get("external", {}))
+            versions = verify_external_versions(external, args.methods)
+            for method, record in versions.items():
+                print(f"[final] {method} 版本已核对: {record}")
         frame = run(
             relations=relations,
             methods=args.methods, datasets=args.datasets, windows=args.windows,

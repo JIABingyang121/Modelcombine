@@ -69,6 +69,15 @@ FROZEN_EXTERNAL_KEYS: Dict[str, tuple] = {
 }
 
 
+#: 每个外部方法必须由 --external-config 提供的机器本地字段。冻结定义只存口径，不存路径，
+#: 所以只有冻结定义而没有配置时，这些字段一个都拿不到。
+REQUIRED_LOCAL_FIELDS: Dict[str, tuple] = {
+    "itransformer": ("repo", "python", "checkpoints"),
+    "mole": ("repo", "python", "checkpoints"),
+    "time_moe": ("repo", "python", "snapshot"),
+}
+
+
 def hyperparameters(config: Mapping[str, Any], method: str) -> Dict[str, Any]:
     """取正式超参数；缺失即失败，绝不回落到 PROBE_HYPERPARAMETERS。"""
     values = config.get("hyperparameters")
