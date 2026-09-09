@@ -5,15 +5,21 @@
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 import pandas as pd
 import pytest
 
+from scripts import final_comparison
+from scripts.train_combinations_kg import TIMESTAMP_POLICY
 from scripts.final_comparison import (
     OUTPUT_COLUMNS,
     FinalComparisonError,
@@ -53,25 +59,78 @@ def _build(tmp_path: Path) -> dict:
         cwd=REPO_ROOT, capture_output=True, text=True,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    return {"raw_root": raw_root, "db": db, "window_plan": window_plan}
+    return {"raw_root": raw_root, "db": db, "window_plan": window_plan,
+            "library_report": tmp_path / "library" / "model_library_report.json"}
 
 
-def _run(tmp_path: Path, built: dict, *, methods, windows=("T1", "T2", "T3"), seeds=(42,)):
+def _definition(tmp_path: Path, built: dict, *, methods, windows, seeds,
+                name="definition.json", **override) -> Path:
+    """与运行参数一致的冻结定义。正式入口必需，且会逐项比对。"""
+    commit = subprocess.run(
+        ["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"],
+        capture_output=True, text=True,
+    ).stdout.strip()
+    plan = json.loads(Path(built["window_plan"]).read_text(encoding="utf-8"))
+    origins = plan["datasets"][0]["origins"]
+    payload = {
+        "experiment": "final_comparison",
+        "repo_commit": commit,
+        "datasets": [{"dataset": DATASET, "windows": [
+            {k: o[k] for k in ("label", "history_start", "history_end",
+                               "forecast_origin", "targets")}
+            for o in origins
+        ]}],
+        "library_report": str(Path(built["library_report"]).resolve()),
+        "timestamp_policy": TIMESTAMP_POLICY,
+        "test_windows": list(windows),
+        "forecast_steps": [STEPS],
+        "raw_root": str(Path(built["raw_root"]).resolve()),
+        "window_plan": str(Path(built["window_plan"]).resolve()),
+        "database": str(Path(built["db"]).resolve()),
+        "candidates": list(FIXTURE_CANDIDATES),
+        "seeds": {m: [int(s) for s in seeds] for m in methods},
+        "external": {},
+    }
+    payload.update(override)
+    path = tmp_path / name
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+def _run(tmp_path: Path, built: dict, *, methods, windows=("T1", "T2", "T3"), seeds=(42,),
+         definition: Path | None = None):
+    """在进程内跑真实 `main()`：真实参数解析、正式预检、执行调度全部经过。
+
+    不用 subprocess 跑成功路径，是因为正式运行要求"主仓库受跟踪文件干净"，而开发中的
+    工作树必然是脏的。这条闸门没有、也不该有绕过开关，所以这里只把 `repo_state()` 打成
+    干净状态——脏状态的拒绝行为由独立单元测试覆盖。
+    """
     out = tmp_path / "final.csv"
-    proc = subprocess.run(
-        [
-            sys.executable, "scripts/final_comparison.py",
-            "--methods", *methods, "--datasets", DATASET,
-            "--candidates", *FIXTURE_CANDIDATES,
-            "--windows", *windows, "--forecast-steps", str(STEPS),
-            "--seeds", *[str(s) for s in seeds],
-            "--raw-root", str(built["raw_root"]),
-            "--window-plan", str(built["window_plan"]),
-            "--database", str(built["db"]), "--out", str(out),
-        ],
-        cwd=REPO_ROOT, capture_output=True, text=True,
-    )
-    return proc, out
+    if definition is None:
+        definition = _definition(tmp_path, built, methods=methods,
+                                 windows=windows, seeds=seeds)
+    argv = [
+        "final_comparison.py",
+        "--methods", *methods, "--datasets", DATASET,
+        "--candidates", *FIXTURE_CANDIDATES,
+        "--windows", *windows, "--forecast-steps", str(STEPS),
+        "--seeds", *[str(s) for s in seeds],
+        "--raw-root", str(built["raw_root"]),
+        "--window-plan", str(built["window_plan"]),
+        "--database", str(built["db"]), "--out", str(out),
+        "--definition", str(definition),
+    ]
+    commit = subprocess.run(["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"],
+                            capture_output=True, text=True).stdout.strip()
+    buffer = io.StringIO()
+    with mock.patch.object(final_comparison, "repo_state", return_value=(commit, [])), \
+            mock.patch.object(sys, "argv", argv), \
+            contextlib.redirect_stdout(buffer):
+        try:
+            code = final_comparison.main()
+        except SystemExit as exc:               # argparse 走的是 SystemExit
+            code = int(exc.code or 0)
+    return SimpleNamespace(returncode=code, stdout=buffer.getvalue(), stderr=""), out
 
 
 @pytest.fixture(scope="module")
@@ -213,6 +272,7 @@ def test_fitted_methods_train_once_before_T1_and_do_not_refit_per_window(compari
     built = {
         "raw_root": tmp_path / "raw", "db": src["db"],
         "window_plan": src["window_plan"],
+        "library_report": src["library_report"],
     }
     shutil.copytree(src["raw_root"], built["raw_root"])
 
@@ -293,3 +353,38 @@ def test_stack_reproduction_runs_through_the_same_entry(comparison):
     assert np.isfinite(frame["yhat"]).all()
     # 方法名里必须带 reproduction，产物不得被读成官方实现
     assert "reproduction" in frame["method"].iloc[0]
+
+
+def test_formal_entry_refuses_to_run_without_a_definition(tmp_path):
+    built = _build(tmp_path)
+    """正式入口必须带冻结定义——没有定义就没有可比对的口径。"""
+    proc = subprocess.run(
+        [
+            sys.executable, "scripts/final_comparison.py",
+            "--methods", "modelcombine", "--datasets", DATASET,
+            "--candidates", *FIXTURE_CANDIDATES,
+            "--windows", "T1", "--forecast-steps", str(STEPS),
+            "--raw-root", str(built["raw_root"]),
+            "--window-plan", str(built["window_plan"]),
+            "--database", str(built["db"]), "--out", str(tmp_path / "x.csv"),
+        ],
+        cwd=REPO_ROOT, capture_output=True, text=True,
+    )
+    assert proc.returncode != 0
+    assert "--definition" in (proc.stdout + proc.stderr)
+    assert not (tmp_path / "x.csv").exists()
+
+
+def test_definition_mismatch_stops_before_touching_test_windows(tmp_path):
+    built = _build(tmp_path)
+    """口径不符时必须在 run() 之前失败，不产出任何长表。"""
+    definition = _definition(
+        tmp_path, built, methods=["modelcombine"], windows=("T1",), seeds=(42,),
+        candidates=["lgbm_reg"],          # 与 --candidates 不符
+    )
+    proc, out = _run(tmp_path, built, methods=["modelcombine"],
+                     windows=("T1",), definition=definition)
+
+    assert proc.returncode != 0
+    assert "--candidates" in (proc.stdout + proc.stderr)
+    assert not out.exists()

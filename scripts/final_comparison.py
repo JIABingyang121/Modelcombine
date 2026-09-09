@@ -45,6 +45,7 @@ from scripts.train_combinations_kg import (
     MODEL_LIBRARY_BUSINESS_DOMAIN,
     MODEL_LIBRARY_COUNTRY_BY_REGION,
     MODEL_LIBRARY_TASK_TYPE,
+    TIMESTAMP_POLICY,
     _frozen_windows,
     _library_raw_frame,
 )
@@ -63,6 +64,11 @@ from src.models.external_adapters import (
     read_official_output,
     run_official,
     write_official_input,
+)
+from scripts.library_preflight import (
+    LibraryIncomplete,
+    assert_library_complete,
+    assert_window_plan_unchanged,
 )
 from src.models.stack_ensemble import K_FOLDS, MultiLayerStackEnsemble
 from src.models.trajectory_forecast import (
@@ -604,6 +610,95 @@ def assert_seed_grid(
             )
 
 
+def repo_state() -> tuple:
+    """主仓库的 (HEAD, 受跟踪文件改动行)。
+
+    HEAD 相同不等于跑的是那份代码——受跟踪源码被改过就不是冻结的那个版本。未跟踪文件是
+    运行产物，不参与判定，与外部仓库用的是同一套判据。
+    """
+    head = subprocess.run(
+        ["git", "-C", str(PROJECT_ROOT), "rev-parse", "HEAD"],
+        capture_output=True, text=True,
+    )
+    if head.returncode != 0:
+        raise FinalComparisonError(f"读不到主仓库 HEAD：{head.stderr.strip()}")
+    dirty = subprocess.run(
+        ["git", "-C", str(PROJECT_ROOT), "status", "--porcelain", "--untracked-files=no"],
+        capture_output=True, text=True,
+    )
+    return head.stdout.strip(), dirty.stdout.strip().splitlines()
+
+
+#: 冻结定义与运行参数必须逐项一致的字段。定义是这一批实验的唯一口径，运行时不得偏离。
+def assert_matches_definition(args, definition: Mapping[str, Any]) -> None:
+    """在 run() 之前把运行参数与冻结定义逐项比对。
+
+    这一步必须在 run() 之前完成：run() 的第一个动作就是按窗口切出 T1—T3 的真值
+    （`_window_slice`）。任何"跑起来才发现口径不对、改完再跑一遍"的流程，等于对着测试
+    窗口迭代。定义里记了什么就比什么——只记录不比对的字段等于没冻结。
+    """
+    problems: List[str] = []
+
+    def _same(name: str, got: Any, want: Any) -> None:
+        if got != want:
+            problems.append(f"{name}: 运行用 {got!r}，冻结定义是 {want!r}")
+
+    _same("--datasets", list(args.datasets),
+          [d["dataset"] for d in definition["datasets"]])
+    _same("--windows", list(args.windows), list(definition["test_windows"]))
+    _same("--forecast-steps", [int(s) for s in args.forecast_steps],
+          [int(s) for s in definition["forecast_steps"]])
+    _same("--raw-root", str(Path(args.raw_root).resolve()), definition["raw_root"])
+    plan_path_matches = str(Path(args.window_plan).resolve()) == definition["window_plan"]
+    _same("--window-plan", str(Path(args.window_plan).resolve()), definition["window_plan"])
+    _same("--database",
+          None if args.database is None else str(Path(args.database).resolve()),
+          definition["database"])
+    _same("--candidates", sorted(args.candidates), sorted(definition.get("candidates", [])))
+    # 重复时刻的处理方式必须与建库/冻结完全一致，否则同一段历史会切出不同的序列
+    _same("时间戳策略", TIMESTAMP_POLICY, definition.get("timestamp_policy"))
+
+    commit, dirty = repo_state()
+    _same("主仓库版本", commit, definition["repo_commit"])
+    if dirty:
+        problems.append(
+            "主仓库受跟踪文件有未提交修改，实际运行的代码不是冻结的那个提交：\n    "
+            + "\n    ".join(dirty[:20])
+        )
+
+    # 窗口计划只比路径不够：同一路径被覆盖后路径仍相同，run() 却会读到新窗口。
+    # 路径本身已经不符时不必再比内容，上面那条问题已经说明了。
+    if plan_path_matches:
+        try:
+            assert_window_plan_unchanged(args.window_plan, definition)
+        except LibraryIncomplete as exc:
+            problems.append(str(exc))
+
+    # 模型库完整性必须在 run() 之前查完——run() 第一步就会切出 T1—T3 的真值
+    if args.database is not None:
+        try:
+            record = assert_library_complete(
+                args.database,
+                datasets=[d["dataset"] for d in definition["datasets"]],
+                forecast_steps=[int(s) for s in definition["forecast_steps"]],
+                candidates=list(definition["candidates"]),
+                base_horizon=MODEL_LIBRARY_BASE_HORIZON,
+                timestamp_policy=TIMESTAMP_POLICY,
+                library_report=(
+                    Path(definition["library_report"])
+                    if definition.get("library_report") else None
+                ),
+            )
+            print(f"[final] 模型库预检通过: {record}")
+        except LibraryIncomplete as exc:
+            problems.append(str(exc))
+
+    if problems:
+        raise FinalComparisonError(
+            "运行参数与冻结定义不一致，拒绝在 T1—T3 上运行：\n  " + "\n  ".join(problems)
+        )
+
+
 def verify_external_versions(
     external: Mapping[str, Any], methods: Sequence[str]
 ) -> Dict[str, Dict[str, str]]:
@@ -768,9 +863,9 @@ def main() -> int:
     parser.add_argument("--external-config", type=Path, default=None,
                         help="外部官方实现的 repo/python/checkpoints 等机器本地路径 JSON；"
                              "itransformer/mole/time_moe 需要")
-    parser.add_argument("--definition", type=Path, default=None,
-                        help="freeze_final_experiment.py 冻结的 experiment_definition.json；"
-                             "跑外部方法时必需，超参数与官方版本以它为准")
+    parser.add_argument("--definition", type=Path, required=True,
+                        help="freeze_final_experiment.py 冻结的 experiment_definition.json。"
+                             "正式运行必需：运行参数、主仓库版本与外部实现版本都以它为准")
     parser.add_argument("--candidates", nargs="+", default=[],
                         help="冻结候选池；stack_ensembles_reproduction 需要，"
                              "必须与建库时声明的一致")
@@ -781,23 +876,16 @@ def main() -> int:
         json.loads(args.external_config.read_text(encoding="utf-8"))
         if args.external_config else None
     )
-    requested_external = [m for m in args.methods if m in EXTERNAL_METHODS]
-    if requested_external and args.definition is None:
-        print(
-            f"[final] {requested_external} 走官方外部实现，必须用 --definition 指定已冻结的 "
-            "experiment_definition.json：超参数与官方版本只能取冻结值。"
-        )
-        return 1
-
     relations: List[Dict[str, Any]] = []
     try:
-        if args.definition is not None:
-            definition = json.loads(args.definition.read_text(encoding="utf-8"))
-            assert_seed_grid(args.methods, args.seeds, definition)
-            external = apply_frozen_external(external, definition.get("external", {}))
-            versions = verify_external_versions(external, args.methods)
-            for method, record in versions.items():
-                print(f"[final] {method} 版本已核对: {record}")
+        definition = json.loads(args.definition.read_text(encoding="utf-8"))
+        # 顺序刻意：全部口径校验都在 run() 之前，run() 第一步就会取出 T1—T3 真值
+        assert_matches_definition(args, definition)
+        assert_seed_grid(args.methods, args.seeds, definition)
+        external = apply_frozen_external(external, definition.get("external", {}))
+        versions = verify_external_versions(external, args.methods)
+        for method, record in versions.items():
+            print(f"[final] {method} 版本已核对: {record}")
         frame = run(
             relations=relations,
             methods=args.methods, datasets=args.datasets, windows=args.windows,

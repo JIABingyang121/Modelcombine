@@ -116,6 +116,42 @@ def _check_against_definition(
     }
 
 
+#: 一行预测的身份。同一身份出现两次说明产物被重复合并或同一任务跑了两遍。
+ROW_IDENTITY = ("method", "dataset", "test_window", "forecast_steps", "seed", "timestamp")
+
+
+def load_predictions(paths: Sequence[Path]) -> pd.DataFrame:
+    """合并多份预测长表。
+
+    正式实验按种子分组分批运行（确定性方法一批、MoLE 三种子一批），产物天然是多份。
+    合并时必须拒绝重复行：把同一份 CSV 传两次、或某个任务跑了两遍都会让该任务在
+    逐任务指标里被算重，而按方法×种子的行数校验未必抓得住。
+    """
+    frames = []
+    for path in paths:
+        frame = pd.read_csv(path)
+        missing = [c for c in OUTPUT_COLUMNS if c not in frame.columns]
+        if missing:
+            raise AnalysisError(f"{path} 缺少列: {missing}")
+        frames.append(frame)
+    if not frames:
+        raise AnalysisError("没有提供任何预测长表")
+    merged = pd.concat(frames, ignore_index=True)
+    duplicated = merged.duplicated(subset=list(ROW_IDENTITY), keep=False)
+    if bool(duplicated.any()):
+        sample = (
+            merged.loc[duplicated, list(ROW_IDENTITY)]
+            .drop_duplicates()
+            .head(5)
+            .to_dict(orient="records")
+        )
+        raise AnalysisError(
+            f"合并后有 {int(duplicated.sum())} 行重复（按 {list(ROW_IDENTITY)} 判定），"
+            f"例如 {sample}；不去重、不覆盖，请检查是否重复传入同一份产物或重复跑了任务"
+        )
+    return merged
+
+
 def _validate(frame: pd.DataFrame) -> None:
     missing = [c for c in OUTPUT_COLUMNS if c not in frame.columns]
     if missing:
@@ -273,8 +309,8 @@ def analyse(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Piece 7：最终对比实验结果分析")
-    parser.add_argument("--predictions", type=Path, required=True,
-                        help="final_comparison.py 写出的长表 CSV")
+    parser.add_argument("--predictions", type=Path, nargs="+", required=True,
+                        help="final_comparison.py 写出的长表 CSV，可给多份（按种子分批运行的产物）")
     parser.add_argument("--definition", type=Path, required=True,
                         help="freeze_final_experiment.py 冻结的 experiment_definition.json；"
                              "用于严格核对方法×任务×种子集合")
@@ -283,9 +319,9 @@ def main() -> int:
     parser.add_argument("--out", type=Path, required=True, help="输出目录")
     args = parser.parse_args()
 
-    frame = pd.read_csv(args.predictions)
     definition = json.loads(args.definition.read_text(encoding="utf-8"))
     try:
+        frame = load_predictions(args.predictions)
         report = analyse(frame, definition)
     except AnalysisError as exc:
         print(f"[analyze] 产物不完整，不产出结论: {exc}")

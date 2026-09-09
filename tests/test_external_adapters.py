@@ -221,9 +221,14 @@ import os
 import numpy as np
 
 
-class Exp_Long_Term_Forecast:
+class Parent:
     def __init__(self, args):
         self.args = args
+
+
+class Exp_Long_Term_Forecast(Parent):
+    def __init__(self, args):
+        super(Exp_Long_Term_Forecast, self).__init__(args)
         self.model = "model"
 
     def train(self, setting):
@@ -291,3 +296,27 @@ def test_predict_snippet_skips_training_and_saves_to_the_given_path(tmp_path):
     assert not (repo / "test_ran").exists(), "查询不得跑官方 test 流程"
     assert (repo / "predict_ran").read_text().strip() == "pjm_h24_iTransformer_custom_ftS_0|True"
     assert np.load(out).shape == (1, 3, 1)
+
+
+@pytest.mark.parametrize("method", ["itransformer", "mole"])
+def test_run_official_sets_cuda_visibility_before_external_training_starts(
+    tmp_path, monkeypatch, method,
+):
+    """官方 ECL 脚本在启动 Python 前 export GPU，避免 torch 导入后再缩减可见设备。"""
+    import subprocess
+
+    from src.models.external_adapters import run_official
+
+    observed = {}
+
+    def fake_run(command, *, cwd, capture_output, text, env):
+        observed.update({"command": command, "cwd": cwd, "env": env})
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("src.models.external_adapters.subprocess.run", fake_run)
+    run_official(
+        ["python", "run.py", "--gpu", "2"], cwd=tmp_path,
+        method=method,
+    )
+
+    assert observed["env"]["CUDA_VISIBLE_DEVICES"] == "2"

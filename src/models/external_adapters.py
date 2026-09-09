@@ -12,6 +12,7 @@ import。本模块不含任何第三方源码，只负责三件事：
 """
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Sequence
@@ -203,17 +204,19 @@ def itransformer_command(
 #: 这里用 runpy 执行官方 ``run.py`` 自己的 ``--is_training 1 --do_predict`` 分支，只把
 #: ``train``/``test`` 置空，使它只做 ``predict(setting, load=True)``——权重全部来自训练阶段
 #: 的官方 checkpoint，预测由官方 ``predict()`` 与官方 ``Dataset_Pred`` 完成，不改官方源码。
+#: 必须原地替换方法，不能把模块全局的官方类名换成子类：官方 ``__init__``
+#: 使用 ``super(Exp_Long_Term_Forecast, self)``，类名被换后会递归调用自己。
 #: 最后把官方产物另存到调用方指定的窗口专属路径，不再用 glob 去找。
 ITRANSFORMER_PREDICT_SNIPPET = (
     'import sys, runpy; import numpy as np; '
     'out=sys.argv.pop(1); '
     'import experiments.exp_long_term_forecasting as M; Base=M.Exp_Long_Term_Forecast; '
-    'M.Exp_Long_Term_Forecast=type("Exp_Query",(Base,),{'
-    '"train":(lambda self, setting: self.model),'
-    '"test":(lambda self, *a, **k: None),'
-    '"predict":(lambda self, setting, load=False, _o=out: ('
-    'Base.predict(self, setting, True),'
-    'np.save(_o, np.load("./results/"+setting+"/real_prediction.npy")))[0])}); '
+    'official_predict=Base.predict; '
+    'Base.train=lambda self, setting: self.model; '
+    'Base.test=lambda self, *a, **k: None; '
+    'Base.predict=lambda self, setting, load=False, _o=out: ('
+    'official_predict(self, setting, True),'
+    'np.save(_o, np.load("./results/"+setting+"/real_prediction.npy")))[0]; '
     'runpy.run_path("run.py", run_name="__main__")'
 )
 
@@ -295,8 +298,13 @@ TIME_MOE_PREDICT_SNIPPET = (
 
 def run_official(command: Sequence[str], *, cwd: Path, method: str) -> None:
     """在官方仓库目录里执行官方命令；失败即抛，不吞错也不改用其他算法。"""
+    argv = list(command)
+    environment = None
+    if method in ("itransformer", "mole") and "--gpu" in argv:
+        environment = os.environ.copy()
+        environment["CUDA_VISIBLE_DEVICES"] = str(argv[argv.index("--gpu") + 1])
     completed = subprocess.run(
-        list(command), cwd=str(cwd), capture_output=True, text=True
+        argv, cwd=str(cwd), capture_output=True, text=True, env=environment
     )
     if completed.returncode != 0:
         raise ExternalAdapterError(

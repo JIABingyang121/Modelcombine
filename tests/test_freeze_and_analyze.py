@@ -23,12 +23,14 @@ from scripts.analyze_final_comparison import (
     AnalysisError,
     analyse,
 )
+from scripts.train_combinations_kg import TIMESTAMP_POLICY
 from scripts.freeze_final_experiment import (
     DEEP_METHOD_SEEDS,
     DETERMINISTIC_METHOD_SEEDS,
     FreezeError,
     build_definition,
 )
+from tests.library_fixtures import make_complete_library
 from tests.forecast_steps_fixtures import (
     DATASET,
     REPO_ROOT,
@@ -43,22 +45,46 @@ METHODS = ("modelcombine", "random_forest", "xgboost")
 
 
 # ------------------------------------------------------------------ Piece 5
+FIXTURE_CANDIDATES = ("lgbm_reg", "seasonal_naive")
+
+
 @pytest.fixture
 def frozen_inputs(tmp_path):
+    """窗口计划 + 一个内部完整的模型库（DATASET 一个数据集、STEPS 一个长度）。
+
+    正式冻结的"恰好 7 方法 / 3 数据集 / 3 长度"由 CLI 的 assert_formal_scope 强制；
+    build_definition 本身只要求库完整、候选与 pipeline 一致，因此可以用小装置测。
+    """
     raw_root = tmp_path / "raw"
     frames = write_dataset(tmp_path / "splits", rows=ROWS)
     plan_path = write_frozen_window_plan(raw_root, frames, forecast_steps=STEPS)
     plan = json.loads(plan_path.read_text())
     plan["datasets"][0]["fits"] = True
     plan_path.write_text(json.dumps(plan), encoding="utf-8")
-    return {"raw_root": raw_root, "plan": plan_path}
+    library = make_complete_library(
+        tmp_path / "library", datasets=[DATASET], forecast_steps=[STEPS],
+        candidates=list(FIXTURE_CANDIDATES),
+    )
+    return {"raw_root": raw_root, "plan": plan_path, "library": library}
+
+
+def _freeze(frozen_inputs, **over):
+    """带上库、候选与 pipeline 的 build_definition 调用。"""
+    kwargs = dict(
+        raw_root=frozen_inputs["raw_root"], window_plan_path=frozen_inputs["plan"],
+        datasets=[DATASET], methods=list(METHODS), forecast_steps=[STEPS],
+        database=frozen_inputs["library"]["database"],
+        candidates=list(FIXTURE_CANDIDATES),
+        pipeline_config=frozen_inputs["library"]["pipeline"],
+        library_report=frozen_inputs["library"]["report"],
+    )
+    kwargs.update(over)
+    return build_definition(**kwargs)
 
 
 def test_definition_records_dates_cutoff_windows_methods_seeds_and_columns(frozen_inputs):
-    definition = build_definition(
-        raw_root=frozen_inputs["raw_root"], window_plan_path=frozen_inputs["plan"],
-        datasets=[DATASET], methods=list(METHODS), forecast_steps=[STEPS], database=None,
-    )
+    definition = _freeze(frozen_inputs,
+        )
 
     assert definition["methods"] == list(METHODS)
     assert definition["forecast_horizons"] == {"H1": 24, "H2": 168, "H3": 720}
@@ -70,10 +96,9 @@ def test_definition_records_dates_cutoff_windows_methods_seeds_and_columns(froze
     # 确定性方法一次，深度方法三个种子
     for method in METHODS:
         assert definition["seeds"][method] == list(DETERMINISTIC_METHOD_SEEDS)
-    deep = build_definition(
-        raw_root=frozen_inputs["raw_root"], window_plan_path=frozen_inputs["plan"],
-        datasets=[DATASET], methods=["modelcombine"], forecast_steps=[STEPS], database=None,
-    )
+    deep = _freeze(frozen_inputs,
+        methods=["modelcombine"],
+        )
     assert deep["seeds"]["modelcombine"] == list(DETERMINISTIC_METHOD_SEEDS)
     assert list(DEEP_METHOD_SEEDS) == [42, 43, 44]
 
@@ -91,9 +116,7 @@ def test_freeze_refuses_when_capacity_or_windows_are_missing(frozen_inputs):
     plan["datasets"][0]["fits"] = False
     frozen_inputs["plan"].write_text(json.dumps(plan), encoding="utf-8")
     with pytest.raises(FreezeError, match="容量不足"):
-        build_definition(
-            raw_root=frozen_inputs["raw_root"], window_plan_path=frozen_inputs["plan"],
-            datasets=[DATASET], methods=list(METHODS), forecast_steps=[STEPS], database=None,
+        _freeze(frozen_inputs,
         )
 
     plan["datasets"][0]["fits"] = True
@@ -102,17 +125,14 @@ def test_freeze_refuses_when_capacity_or_windows_are_missing(frozen_inputs):
     ]
     frozen_inputs["plan"].write_text(json.dumps(plan), encoding="utf-8")
     with pytest.raises(FreezeError, match="缺少"):
-        build_definition(
-            raw_root=frozen_inputs["raw_root"], window_plan_path=frozen_inputs["plan"],
-            datasets=[DATASET], methods=list(METHODS), forecast_steps=[STEPS], database=None,
+        _freeze(frozen_inputs,
         )
 
 
 def test_freeze_refuses_unregistered_method(frozen_inputs):
     with pytest.raises(FreezeError, match="未在统一入口注册"):
-        build_definition(
-            raw_root=frozen_inputs["raw_root"], window_plan_path=frozen_inputs["plan"],
-            datasets=[DATASET], methods=["timespeaks"], forecast_steps=[STEPS], database=None,
+        _freeze(frozen_inputs,
+            methods=["timespeaks"],
         )
 
 
@@ -126,6 +146,9 @@ def test_freeze_does_not_overwrite_an_existing_definition(tmp_path, frozen_input
             "--window-plan", str(frozen_inputs["plan"]),
             "--datasets", DATASET, "--methods", *METHODS,
             "--forecast-steps", str(STEPS), "--out", str(out),
+            "--database", str(frozen_inputs["library"]["database"]),
+            "--library-report", str(frozen_inputs["library"]["report"]),
+            "--candidates", *FIXTURE_CANDIDATES,
         ],
         cwd=REPO_ROOT, capture_output=True, text=True,
     )
@@ -256,12 +279,9 @@ def test_incomplete_grid_and_timestamp_mismatch_block_conclusions():
 
 def test_definition_records_seed_policy_and_method_limitations(frozen_inputs):
     """深度方法三种子；iTransformer 因官方无种子参数按一次算；Time-MoE 限制必须落盘。"""
-    definition = build_definition(
-        raw_root=frozen_inputs["raw_root"], window_plan_path=frozen_inputs["plan"],
-        datasets=[DATASET], methods=["itransformer", "mole", "time_moe"],
-        external_config=EXTERNAL_CONFIG,
-        forecast_steps=[STEPS], database=None,
-    )
+    definition = _freeze(frozen_inputs,
+        methods=["itransformer", "mole", "time_moe"], external_config=EXTERNAL_CONFIG,
+        )
 
     # 只有 MoLE 真正接收请求种子，三种子才有意义
     assert definition["seeds"]["mole"] == list(DEEP_METHOD_SEEDS)
@@ -442,11 +462,9 @@ EXTERNAL_CONFIG = {
 def test_definition_freezes_external_hyperparameters_code_version_and_checkpoint(
     frozen_inputs,
 ):
-    definition = build_definition(
-        raw_root=frozen_inputs["raw_root"], window_plan_path=frozen_inputs["plan"],
-        datasets=[DATASET], methods=["itransformer", "mole", "time_moe"],
-        forecast_steps=[STEPS], database=None, external_config=EXTERNAL_CONFIG,
-    )
+    definition = _freeze(frozen_inputs,
+        methods=["itransformer", "mole", "time_moe"], external_config=EXTERNAL_CONFIG,
+        )
 
     external = definition["external"]
     assert external["itransformer"]["hyperparameters"]["d_model"] == 512
@@ -461,10 +479,8 @@ def test_definition_freezes_external_hyperparameters_code_version_and_checkpoint
 
 def test_freeze_refuses_external_method_without_config(frozen_inputs):
     with pytest.raises(FreezeError, match="external-config"):
-        build_definition(
-            raw_root=frozen_inputs["raw_root"], window_plan_path=frozen_inputs["plan"],
-            datasets=[DATASET], methods=["itransformer"], forecast_steps=[STEPS],
-            database=None, external_config=None,
+        _freeze(frozen_inputs,
+            methods=["itransformer"], external_config=None,
         )
 
 
@@ -472,8 +488,215 @@ def test_freeze_refuses_external_config_missing_commit(frozen_inputs):
     config = {"itransformer": dict(EXTERNAL_CONFIG["itransformer"])}
     config["itransformer"].pop("commit")
     with pytest.raises(FreezeError, match="commit"):
-        build_definition(
-            raw_root=frozen_inputs["raw_root"], window_plan_path=frozen_inputs["plan"],
-            datasets=[DATASET], methods=["itransformer"], forecast_steps=[STEPS],
-            database=None, external_config=config,
+        _freeze(frozen_inputs,
+            methods=["itransformer"], external_config=config,
         )
+
+
+# ------------------------------- 冻结定义必须真正约束正式运行（不只是被记录）
+def _windows(dataset: str):
+    return [
+        {"label": label, "role": role,
+         "history_start": f"2026-0{i+1}-01 00:00:00",
+         "history_end": f"2026-0{i+1}-02 00:00:00",
+         "forecast_origin": f"2026-0{i+1}-02 00:00:00",
+         "targets": {"24": {"forecast_steps": 24,
+                            "first_target": f"2026-0{i+1}-02 01:00:00",
+                            "last_target": f"2026-0{i+1}-03 00:00:00"}}}
+        for i, (label, role) in enumerate(
+            [("S1", "library"), ("S2", "library"), ("S3", "library"), ("A", "audit"),
+             ("T1", "test"), ("T2", "test"), ("T3", "test")])
+    ]
+
+
+def _run_definition(tmp_path, **over):
+    """构造一份与运行参数一致的定义（含真实窗口计划文件），再逐项破坏它。"""
+    import subprocess as _sp
+    commit = _sp.run(["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"],
+                     capture_output=True, text=True).stdout.strip()
+    plan = {"datasets": [
+        {"dataset": d, "fits": True,
+         "origins": [{k: v for k, v in w.items() if k != "role"} | {"label": w["label"]}
+                     for w in _windows(d)]}
+        for d in DATASETS
+    ]}
+    (tmp_path / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
+    library = make_complete_library(
+        tmp_path, datasets=DATASETS, forecast_steps=[24, 168, 720],
+        candidates=["lgbm_reg", "seasonal_naive"],
+    )
+    base = {
+        "repo_commit": commit,
+        "datasets": [{"dataset": d, "windows": _windows(d)} for d in DATASETS],
+        "test_windows": ["T1", "T2", "T3"],
+        "forecast_steps": [24, 168, 720],
+        "raw_root": str((tmp_path / "raw").resolve()),
+        "window_plan": str((tmp_path / "plan.json").resolve()),
+        "database": str(library["database"].resolve()),
+        "candidates": ["lgbm_reg", "seasonal_naive"],
+        "library_report": str(library["report"].resolve()),
+        "timestamp_policy": TIMESTAMP_POLICY,
+        "seeds": {"modelcombine": [42]},
+    }
+    base.update(over)
+    return base
+
+
+class _Args:
+    def __init__(self, tmp_path, **over):
+        self.datasets = list(DATASETS)
+        self.windows = ["T1", "T2", "T3"]
+        self.forecast_steps = [24, 168, 720]
+        self.raw_root = tmp_path / "raw"
+        self.window_plan = tmp_path / "plan.json"
+        self.database = tmp_path / "lib.sqlite3"
+        self.candidates = ["lgbm_reg", "seasonal_naive"]
+        for k, v in over.items():
+            setattr(self, k, v)
+
+
+@pytest.fixture
+def clean_repo(monkeypatch):
+    """把主仓库状态打成"干净且正好是冻结的那个提交"。
+
+    本机开发时工作树必然是脏的，正例断言无法依赖真实仓库状态；脏/干净判定本身由
+    test_dirty_worktree_blocks_the_run 单独覆盖。
+    """
+    import scripts.final_comparison as fc
+    commit = "a" * 40
+    monkeypatch.setattr(fc, "repo_state", lambda: (commit, []))
+    return commit
+
+
+def test_run_parameters_must_match_the_frozen_definition(tmp_path, clean_repo):
+    from scripts.final_comparison import FinalComparisonError, assert_matches_definition
+
+    definition = _run_definition(tmp_path, repo_commit=clean_repo)
+    assert assert_matches_definition(_Args(tmp_path), definition) is None
+
+    for field, value, needle in [
+        ("datasets", ["pjm"], "--datasets"),
+        ("windows", ["T1"], "--windows"),
+        ("forecast_steps", [24], "--forecast-steps"),
+        ("raw_root", tmp_path / "other_raw", "--raw-root"),
+        ("window_plan", tmp_path / "other_plan.json", "--window-plan"),
+        ("database", tmp_path / "other.sqlite3", "--database"),
+        ("candidates", ["lgbm_reg"], "--candidates"),
+    ]:
+        with pytest.raises(FinalComparisonError, match=needle):
+            assert_matches_definition(_Args(tmp_path, **{field: value}), definition)
+
+
+def test_repo_commit_mismatch_blocks_the_run(tmp_path, clean_repo):
+    """冻结定义记的主仓库版本与当前不符时，不得在 T1—T3 上运行。"""
+    from scripts.final_comparison import FinalComparisonError, assert_matches_definition
+
+    definition = _run_definition(tmp_path, repo_commit="0" * 40)
+    with pytest.raises(FinalComparisonError, match="主仓库版本"):
+        assert_matches_definition(_Args(tmp_path), definition)
+
+
+def test_dirty_worktree_blocks_the_run(tmp_path, monkeypatch):
+    """HEAD 相同但受跟踪源码被改过，跑的就不是冻结的那份代码。"""
+    import scripts.final_comparison as fc
+    from scripts.final_comparison import FinalComparisonError, assert_matches_definition
+
+    commit = "b" * 40
+    monkeypatch.setattr(fc, "repo_state", lambda: (commit, [" M scripts/final_comparison.py"]))
+    definition = _run_definition(tmp_path, repo_commit=commit)
+    with pytest.raises(FinalComparisonError, match="未提交修改"):
+        assert_matches_definition(_Args(tmp_path), definition)
+
+
+def test_window_plan_overwritten_at_the_same_path_is_caught(tmp_path, clean_repo):
+    """同一路径覆盖窗口计划：路径不变，内容变了，必须被抓住。"""
+    from scripts.final_comparison import FinalComparisonError, assert_matches_definition
+
+    definition = _run_definition(tmp_path, repo_commit=clean_repo)
+    plan = json.loads((tmp_path / "plan.json").read_text())
+    plan["datasets"][0]["origins"][4]["forecast_origin"] = "2099-01-01 00:00:00"
+    (tmp_path / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
+
+    with pytest.raises(FinalComparisonError, match="窗口计划的内容与冻结定义不一致"):
+        assert_matches_definition(_Args(tmp_path), definition)
+
+
+# ------------------------------------------ 多份预测长表合并，且拒绝重复行
+def test_multiple_prediction_files_are_merged(tmp_path):
+    from scripts.analyze_final_comparison import load_predictions
+
+    frame = _long_table({METHOD_UNDER_TEST: 1.0, "mole": 2.0})
+    a = frame[frame["method"] == METHOD_UNDER_TEST]
+    b = frame[frame["method"] == "mole"]
+    pa, pb = tmp_path / "a.csv", tmp_path / "b.csv"
+    a.to_csv(pa, index=False)
+    b.to_csv(pb, index=False)
+
+    merged = load_predictions([pa, pb])
+
+    assert len(merged) == len(frame)
+    assert set(merged["method"]) == {METHOD_UNDER_TEST, "mole"}
+    report = analyse(merged, _definition([METHOD_UNDER_TEST, "mole"]))
+    assert report["conclusions"]["complete_grid"] is True
+
+
+def test_duplicate_rows_across_files_are_refused(tmp_path):
+    """同一份产物传两次会让该任务被算重，必须报错而不是去重。"""
+    from scripts.analyze_final_comparison import AnalysisError, load_predictions
+
+    frame = _long_table({METHOD_UNDER_TEST: 1.0, "mole": 2.0})
+    path = tmp_path / "all.csv"
+    frame.to_csv(path, index=False)
+
+    load_predictions([path])
+    with pytest.raises(AnalysisError, match="重复"):
+        load_predictions([path, path])
+
+
+def test_duplicate_rows_within_one_file_are_refused(tmp_path):
+    from scripts.analyze_final_comparison import AnalysisError, load_predictions
+
+    frame = _long_table({METHOD_UNDER_TEST: 1.0, "mole": 2.0})
+    doubled = pd.concat([frame, frame.head(3)], ignore_index=True)
+    path = tmp_path / "dup.csv"
+    doubled.to_csv(path, index=False)
+
+    with pytest.raises(AnalysisError, match="重复"):
+        load_predictions([path])
+
+
+# ----------------------------- 实验定义的时间戳策略必须在访问 T 之前形成闸门
+@pytest.mark.parametrize("policy, needle", [
+    (None, "时间戳策略"),
+    ("raw_rows_as_is", "时间戳策略"),
+])
+def test_definition_timestamp_policy_must_match_before_run(tmp_path, clean_repo,
+                                                           policy, needle):
+    """缺失或被篡改都必须拒绝——不给默认值、不做迁移。
+
+    旧定义因此全部失效，这是预期行为：同一段历史在两种策略下切出的序列不同。
+    """
+    from scripts.final_comparison import FinalComparisonError, assert_matches_definition
+
+    definition = _run_definition(tmp_path, repo_commit=clean_repo)
+    if policy is None:
+        definition.pop("timestamp_policy")
+    else:
+        definition["timestamp_policy"] = policy
+
+    with pytest.raises(FinalComparisonError, match=needle):
+        assert_matches_definition(_Args(tmp_path), definition)
+
+
+def test_definition_with_a_stale_library_report_policy_is_refused(tmp_path, clean_repo):
+    """定义里策略对，但它指向的建库报告是旧策略建的——同样必须在读 T 之前拒绝。"""
+    from scripts.final_comparison import FinalComparisonError, assert_matches_definition
+
+    definition = _run_definition(tmp_path, repo_commit=clean_repo)
+    report_path = Path(definition["library_report"])
+    report = json.loads(report_path.read_text())
+    report["timestamp_policy"] = "raw_rows_as_is"
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+
+    with pytest.raises(FinalComparisonError, match="不是用当前策略建的"):
+        assert_matches_definition(_Args(tmp_path), definition)

@@ -1369,17 +1369,64 @@ def _library_split_frame(raw_root: Path, dataset: str, split: str) -> pd.DataFra
     return frame.sort_values("timestamp").reset_index(drop=True)
 
 
-def _library_raw_frame(raw_root: Path, dataset: str) -> pd.DataFrame:
+def _library_raw_path(raw_root: Path, dataset: str) -> Path:
     path = raw_root / dataset / "load.csv"
     if not path.exists():
         raise RuntimeError(f"model library build needs {path}")
-    frame = pd.read_csv(path)
+    return path
+
+
+#: 原始序列里同一时刻出现多行时的统一处理策略。
+#:
+#: PJM 秋令时回拨会产生真实的重复小时（服务器盘点实测 2 个）。重复行会让窗口切片多出一
+#: 行——目标区间变成 steps+1 个点、lag/rolling 特征错位——而建库、冻结、正式运行三处如果
+#: 各按各的方式处理，口径就对不上。因此统一为：同一 timestamp 的负荷取算术平均，形成唯一
+#: 小时序列。**原始 CSV 不修改**，规范化只发生在读取时。
+TIMESTAMP_POLICY = "mean_load_by_timestamp"
+
+
+def _library_raw_timestamps(raw_root: Path, dataset: str) -> pd.Series:
+    """只读时间列，返回排序后的**唯一**时间戳（按 TIMESTAMP_POLICY 去重）。
+
+    冻结阶段只需要数据覆盖范围，不需要、也不应该读负荷值。
+    """
+    path = _library_raw_path(raw_root, dataset)
+    head = pd.read_csv(path, nrows=1)
+    if "timestamp" not in head.columns:
+        raise RuntimeError(f"{path} 缺少必填列: ['timestamp']")
+    stamps = pd.to_datetime(pd.read_csv(path, usecols=["timestamp"])["timestamp"])
+    return stamps.drop_duplicates().sort_values().reset_index(drop=True)
+
+
+def _library_raw_frame(
+    raw_root: Path, dataset: str, *, max_timestamp: Any = None
+) -> pd.DataFrame:
+    """读原始序列。``max_timestamp`` 给定时**只把该时刻及之前的行读进内存**。
+
+    建库与审计（S1—S3、A）只应看到自己窗口内的负荷值；整表读进来会把 T1—T3 的真值也
+    一并载入。这里先只读时间列定位切断位置，再用 ``nrows`` 二次读取，使 T1—T3 的负荷值
+    在 S/A 阶段根本不会被materialize。
+    """
+    path = _library_raw_path(raw_root, dataset)
+    read_kwargs: Dict[str, Any] = {}
+    if max_timestamp is not None:
+        bound = pd.Timestamp(max_timestamp)
+        stamps = pd.to_datetime(pd.read_csv(path, usecols=["timestamp"])["timestamp"])
+        within = stamps.index[stamps <= bound]
+        if len(within) == 0:
+            raise RuntimeError(f"{path}: {bound} 之前没有任何数据")
+        read_kwargs["nrows"] = int(within.max()) + 1
+    frame = pd.read_csv(path, **read_kwargs)
     missing = [column for column in ("timestamp", TARGET) if column not in frame.columns]
     if missing:
         raise RuntimeError(f"{path} 缺少必填列: {missing}")
     frame = frame[["timestamp", TARGET]].rename(columns={TARGET: "load"})
     frame["timestamp"] = pd.to_datetime(frame["timestamp"])
     frame["load"] = pd.to_numeric(frame["load"])
+    if max_timestamp is not None:
+        frame = frame[frame["timestamp"] <= pd.Timestamp(max_timestamp)]
+    # TIMESTAMP_POLICY：同一时刻的负荷取算术平均，得到唯一小时序列
+    frame = frame.groupby("timestamp", as_index=False)["load"].mean()
     return frame.sort_values("timestamp").reset_index(drop=True)
 
 
@@ -1407,10 +1454,13 @@ def _scenario_sample_frame(
     dataset: str,
     window: Mapping[str, Any],
 ) -> pd.DataFrame:
-    """取一个冻结窗口的 720 小时历史和其完整目标轨迹。"""
-    frame = _library_raw_frame(raw_root, dataset)
-    start = pd.Timestamp(window["history_start"])
+    """取一个冻结窗口的 720 小时历史和其完整目标轨迹。
+
+    读取上界就是这个窗口自己的 ``last_target``——S/A 阶段因此看不到 T1—T3 的负荷值。
+    """
     end = pd.Timestamp(window["last_target"])
+    frame = _library_raw_frame(raw_root, dataset, max_timestamp=end)
+    start = pd.Timestamp(window["history_start"])
     return frame[(frame["timestamp"] >= start) & (frame["timestamp"] <= end)].reset_index(drop=True)
 
 
@@ -1751,6 +1801,45 @@ def _build_library_task(
     }
 
 
+#: 正式建库前目标库里必须为空的表——只有基础模型可以预先存在。
+LIBRARY_RELATION_TABLES = (
+    "scenarios",
+    "data_profiles",
+    "combinations",
+    "combination_members",
+    "scenario_data_combinations",
+    "prediction_runs",
+)
+
+
+def _assert_clean_library(
+    store: ModelStore, datasets: Sequence[str], model_types: Sequence[str]
+) -> None:
+    """正式建库的前置：models 恰好是声明的那一批，关系相关表全部为空。"""
+    expected = {
+        f"{dataset}__h{MODEL_LIBRARY_BASE_HORIZON}__{model_type}"
+        for dataset in datasets
+        for model_type in model_types
+    }
+    observed = {
+        row[0] for row in store.connection.execute("SELECT model_id FROM models")
+    }
+    if observed != expected:
+        raise RuntimeError(
+            f"model library build refused: models 与声明的候选不符——"
+            f"缺 {sorted(expected - observed)}，多 {sorted(observed - expected)}"
+        )
+    for table in LIBRARY_RELATION_TABLES:
+        count = int(store.connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+        if count:
+            raise RuntimeError(
+                f"model library build refused: {table} 已有 {count} 行。"
+                "正式建库只能在干净的新库上进行——旧关系不会被覆盖，只会被追加，"
+                "并在在线匹配时与新关系一起参与排序。请用 scripts/import_base_models.py "
+                "把基础模型导入一个全新的空库"
+            )
+
+
 def build_model_library(
     *,
     datasets: Optional[Sequence[str]],
@@ -1771,10 +1860,17 @@ def build_model_library(
         for s in (selected_forecast_steps or SUPPORTED_FORECAST_STEPS)
     ]
     dataset_filter = list(datasets) if datasets else list(DATASET_HORIZONS)
+    if window_plan is not None:
+        # 正式建库：库必须是"只有基础模型的干净新库"。
+        # 往已有关系的库里再建一次不会报错——add_data_profile 每次自增主键，
+        # UNIQUE(scenario_id, data_profile_id, combination_id) 因此永不触发，
+        # 旧关系会和新关系并存并一起参与在线匹配。所以在这里挡住。
+        _assert_clean_library(store, dataset_filter, model_types)
 
     report: Dict[str, Any] = {
         "base_horizon": MODEL_LIBRARY_BASE_HORIZON,
         "signature_window": SIGNATURE_WINDOW,
+        "timestamp_policy": TIMESTAMP_POLICY,
         "candidate_model_types": list(model_types),
         "tasks": [],
     }
