@@ -119,10 +119,11 @@ def test_commands_match_the_probed_official_entries(tmp_path):
         "seq_len": 96, "label_len": 48, "d_model": 512, "n_heads": 8, "e_layers": 3,
         "d_layers": 1, "d_ff": 512, "factor": 1, "dropout": 0.1, "train_epochs": 10,
         "batch_size": 32, "patience": 3, "learning_rate": 0.0001, "t_dim": 4,
-        "des": "final",
+        "des": "final", "split_policy": "adaptive_val_at_least_pred_len",
     }
     command = itransformer_command(
-        config, model_id="pjm_T1_h720", data_path="mc.csv", forecast_steps=720,
+        config, model_id="pjm_T1_h720", data_path="train.csv", forecast_steps=720,
+        root_path=tmp_path / "split",
     )
     assert command[2] == "run.py"
     for flag in ("--is_training", "--inverse", "--pred_len"):
@@ -165,7 +166,8 @@ def test_formal_hyperparameters_are_required_and_probe_values_are_separate(tmp_p
 
     bare = {"repo": tmp_path, "python": "py", "checkpoints": tmp_path}
     with pytest.raises(ExternalAdapterError, match="hyperparameters"):
-        itransformer_command(bare, model_id="m", data_path="d.csv", forecast_steps=24)
+        itransformer_command(bare, model_id="m", data_path="d.csv", forecast_steps=24,
+                             root_path=tmp_path / "split")
     with pytest.raises(ExternalAdapterError, match="缺少"):
         hyperparameters({"hyperparameters": {"seq_len": 96}}, "itransformer")
 
@@ -188,14 +190,16 @@ def test_itransformer_query_command_carries_do_predict_and_the_same_setting(tmp_
             "seq_len": 96, "label_len": 48, "d_model": 512, "n_heads": 8, "e_layers": 3,
             "d_layers": 1, "d_ff": 512, "factor": 1, "dropout": 0.1, "train_epochs": 10,
             "batch_size": 32, "patience": 3, "learning_rate": 0.0001, "des": "final",
+            "split_policy": "adaptive_val_at_least_pred_len",
         },
     }
     train = itransformer_command(
-        config, model_id="pjm_h24", data_path="mc_train.csv", forecast_steps=24
+        config, model_id="pjm_h24", data_path="train.csv", forecast_steps=24,
+        root_path=tmp_path / "split",
     )
     query = itransformer_predict_command(
         config, model_id="pjm_h24", data_path="mc_pred_T1.csv", forecast_steps=24,
-        output=tmp_path / "out.npy",
+        root_path=tmp_path / "split", output=tmp_path / "out.npy",
     )
 
     assert query[1] == "-c" and query[2] == ITRANSFORMER_PREDICT_SNIPPET

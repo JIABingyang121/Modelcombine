@@ -13,6 +13,7 @@ import。本模块不含任何第三方源码，只负责三件事：
 from __future__ import annotations
 
 import os
+import math
 import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Sequence
@@ -44,11 +45,16 @@ PROBE_HYPERPARAMETERS: Dict[str, Any] = {
 }
 
 #: 正式命令必须齐备的超参数键。缺任何一个都直接失败，不用探针值兜底。
+#: iTransformer 的切分策略标识，写进 external_formal.json 的超参数，使冻结定义记录它。
+ITRANSFORMER_SPLIT_POLICY = "adaptive_val_at_least_pred_len"
+
 REQUIRED_HYPERPARAMETERS: Dict[str, tuple] = {
     "itransformer": (
         "seq_len", "label_len", "d_model", "n_heads", "e_layers", "d_layers",
         "d_ff", "factor", "dropout", "train_epochs", "batch_size", "patience",
         "learning_rate", "des",
+        # 切分策略必须由配置显式声明并随冻结定义落盘：它决定了训练/验证段的边界
+        "split_policy",
     ),
     "mole": (
         "seq_len", "t_dim", "train_epochs", "batch_size", "patience",
@@ -90,6 +96,11 @@ def hyperparameters(config: Mapping[str, Any], method: str) -> Dict[str, Any]:
     missing = [k for k in REQUIRED_HYPERPARAMETERS[method] if k not in values]
     if missing:
         raise ExternalAdapterError(f"{method}: hyperparameters 缺少 {missing}")
+    if method == "itransformer" and values["split_policy"] != ITRANSFORMER_SPLIT_POLICY:
+        raise ExternalAdapterError(
+            f"itransformer: 配置声明的 split_policy 是 {values['split_policy']!r}，"
+            f"当前实现是 {ITRANSFORMER_SPLIT_POLICY!r}"
+        )
     return dict(values)
 
 #: 必须随结果一起报告的方法级限制。Time-MoE 只能证明**任务输入上下文**的截止时间，
@@ -148,9 +159,97 @@ def read_official_output(path: Path, method: str, forecast_steps: int) -> np.nda
     return values
 
 
+def itransformer_split_sizes(n_rows: int, pred_len: int) -> Dict[str, int]:
+    """自适应切分：官方 70/10/20 边界不变，只在验证段不足 ``pred_len`` 时扩大它。
+
+    官方 ``Dataset_Custom`` 按固定 70/10/20 内部切分，验证段长度 = N - floor(0.7N) - n_test。
+    PJM 的正式训练文件只有 6663 行，验证段 667 行 < pred_len=720，官方 loader 的
+    ``__len__`` 算出 ``667 - 720 + 1 = -52``，直接抛 ``ValueError: __len__() should
+    return >= 0``。这不是偶发故障，是固定比例与长预测长度在短序列上的必然不兼容。
+
+    这里只做最小、确定性的调整：``n_val = max(official_val, pred_len)``，训练段相应缩短。
+    h=24 与 h=168 的官方验证段本就够长，边界与原来完全一致；只有 h=720 会扩大验证段。
+    """
+    n_rows = int(n_rows)
+    pred_len = int(pred_len)
+    n_test = n_rows * 20 // 100
+    official_val = n_rows - (n_rows * 70 // 100) - n_test
+    n_val = max(official_val, pred_len)
+    n_train = n_rows - n_val - n_test
+    return {
+        "rows": n_rows, "train": n_train, "val": n_val, "test": n_test,
+        "official_val": official_val, "pred_len": pred_len,
+    }
+
+
+def itransformer_loader_samples(
+    sizes: Mapping[str, int], *, seq_len: int, pred_len: int
+) -> Dict[str, int]:
+    """三个 loader 的理论样本数，判据与官方 ``__len__`` 一致。
+
+    ``Dataset_Custom_Fixed.__len__ = len(rows) - seq_len - pred_len + 1``。验证段与测试段
+    各自前置 ``seq_len`` 行历史上下文，那些重叠行只作输入、不属于目标段，所以它们的文件
+    行数是 ``seq_len + n``。
+    """
+    seq_len, pred_len = int(seq_len), int(pred_len)
+    return {
+        "train": int(sizes["train"]) - seq_len - pred_len + 1,
+        "val": int(sizes["val"]) - pred_len + 1,
+        "test": int(sizes["test"]) - pred_len + 1,
+    }
+
+
+def write_itransformer_splits(
+    frame: pd.DataFrame, destination: Path, *, seq_len: int, pred_len: int
+) -> Dict[str, Any]:
+    """按自适应切分写出官方 ``custom_fixed`` 需要的 train/val/test 三份 CSV。
+
+    输入 ``frame`` 必须已经截断到正式 ``training_cutoff`` 之前——本函数不做截断，只切分。
+    启动官方训练之前先算三个 loader 的理论样本数，任何一个 < 1 就直接失败，不让官方在
+    ``__len__`` 返回负数时抛栈。
+    """
+    ordered = frame.sort_values("timestamp").reset_index(drop=True)
+    sizes = itransformer_split_sizes(len(ordered), pred_len)
+    samples = itransformer_loader_samples(sizes, seq_len=seq_len, pred_len=pred_len)
+    short = {name: count for name, count in samples.items() if count < 1}
+    if short:
+        raise ExternalAdapterError(
+            f"itransformer: 切分后这些 loader 产不出样本 {short}（"
+            f"行数={sizes['rows']} seq_len={seq_len} pred_len={pred_len} "
+            f"train/val/test={sizes['train']}/{sizes['val']}/{sizes['test']}）"
+        )
+    if sizes["train"] < seq_len + pred_len:
+        raise ExternalAdapterError(
+            f"itransformer: 训练段 {sizes['train']} 行不足 seq_len+pred_len="
+            f"{seq_len + pred_len}"
+        )
+
+    destination = Path(destination)
+    destination.mkdir(parents=True, exist_ok=True)
+    train_end = sizes["train"]
+    val_end = train_end + sizes["val"]
+    written: Dict[str, int] = {}
+    for name, start, end in (
+        ("train", 0, train_end),
+        # 验证段与测试段各前置 seq_len 行输入上下文；这些行只作输入，不是目标
+        ("val", train_end - seq_len, val_end),
+        ("test", val_end - seq_len, val_end + sizes["test"]),
+    ):
+        part = ordered.iloc[start:end][["timestamp", "load"]].rename(
+            columns={"timestamp": "date"}
+        )
+        part.to_csv(destination / f"{name}.csv", index=False)
+        written[name] = int(len(part))
+    return {
+        "policy": ITRANSFORMER_SPLIT_POLICY,
+        "sizes": sizes, "loader_samples": samples, "file_rows": written,
+        "seq_len": int(seq_len),
+    }
+
+
 def itransformer_flags(
     config: Mapping[str, Any], *, model_id: str, data_path: str, forecast_steps: int,
-    do_predict: bool,
+    do_predict: bool, root_path: Path,
 ) -> List[str]:
     """官方 ``run.py`` 的参数（不含解释器与脚本名）。
 
@@ -158,12 +257,12 @@ def itransformer_flags(
     长度/模型尺寸/des 拼成，**不含 data_path**。因此训练与查询用同一份参数、只换
     ``--data_path``，就落在同一个 checkpoint 上。
     """
-    repo = Path(config["repo"])
     hp = hyperparameters(config, "itransformer")
     return [
         "--is_training", "1",
         "--model_id", model_id, "--model", "iTransformer",
-        "--data", "custom", "--root_path", f"{repo}/dataset/", "--data_path", data_path,
+        # custom_fixed 从 root_path 读固定的 train/val/test.csv，不做内部比例切分
+        "--data", "custom_fixed", "--root_path", f"{root_path}/", "--data_path", data_path,
         "--features", "S", "--target", "load", "--freq", "h",
         "--checkpoints", str(config["checkpoints"]),
         "--seq_len", str(hp["seq_len"]), "--label_len", str(hp["label_len"]),
@@ -182,6 +281,7 @@ def itransformer_flags(
 
 def itransformer_command(
     config: Mapping[str, Any], *, model_id: str, data_path: str, forecast_steps: int,
+    root_path: Path,
 ) -> List[str]:
     """官方训练入口（探针实测通过的 ``--is_training 1`` 分支）。
 
@@ -190,7 +290,7 @@ def itransformer_command(
     误当成查询结果读回的东西。训练阶段干脆不产生它。
     """
     return [str(config["python"]), "-u", "run.py"] + itransformer_flags(
-        config, model_id=model_id, data_path=data_path,
+        config, model_id=model_id, data_path=data_path, root_path=root_path,
         forecast_steps=forecast_steps, do_predict=False,
     )
 
@@ -223,13 +323,14 @@ ITRANSFORMER_PREDICT_SNIPPET = (
 
 def itransformer_predict_command(
     config: Mapping[str, Any], *, model_id: str, data_path: str, forecast_steps: int,
+    root_path: Path,
     output: Path,
 ) -> List[str]:
     """官方查询入口：加载训练 checkpoint，对当前窗口 CSV 预测，写到 ``output``。"""
     return [
         str(config["python"]), "-c", ITRANSFORMER_PREDICT_SNIPPET, str(output),
     ] + itransformer_flags(
-        config, model_id=model_id, data_path=data_path,
+        config, model_id=model_id, data_path=data_path, root_path=root_path,
         forecast_steps=forecast_steps, do_predict=True,
     )
 

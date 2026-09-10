@@ -64,6 +64,7 @@ from src.models.external_adapters import (
     read_official_output,
     run_official,
     write_official_input,
+    write_itransformer_splits,
 )
 from scripts.library_preflight import (
     LibraryIncomplete,
@@ -440,22 +441,42 @@ def _itransformer(request: Request) -> np.ndarray:
     repo = Path(config["repo"])
     seed = OFFICIAL_FIXED_SEED[method]
     model_id = f"{request.dataset}_h{request.forecast_steps}_s{seed}"
+    hp = hyperparameters(config, method)
+    # 官方 custom_fixed 从这个目录读固定的 train/val/test.csv；查询 CSV 也放这里，
+    # 训练与查询共用同一个 root_path
+    split_root = repo / "dataset" / f"mc_split_{request.dataset}_h{request.forecast_steps}_s{seed}"
     try:
         if ("_trained", method, model_id) not in request.fitted:
-            train_file = _write_training_file(request, method, repo, seed)
+            train = request.raw[request.raw["timestamp"] < request.training_cutoff]
+            if train.empty:
+                raise FinalComparisonError(
+                    f"{method}: {request.dataset} 在 training_cutoff 之前没有训练数据"
+                )
+            plan = write_itransformer_splits(
+                train, split_root,
+                seq_len=int(hp["seq_len"]), pred_len=request.forecast_steps,
+            )
+            print(f"[final] itransformer 切分 {request.dataset} h={request.forecast_steps}: {plan}")
             run_official(
                 itransformer_command(
-                    config, model_id=model_id, data_path=train_file,
-                    forecast_steps=request.forecast_steps,
+                    config, model_id=model_id, data_path="train.csv",
+                    root_path=split_root, forecast_steps=request.forecast_steps,
                 ),
                 cwd=repo, method=method,
             )
             request.fitted[("_trained", method, model_id)] = True
-        query_file = _write_query_file(request, method, repo)
+        query_name = (
+            f"mc_pred_{request.dataset}_{request.test_window}_h{request.forecast_steps}.csv"
+        )
+        write_official_input(
+            request.history, split_root / query_name,
+            pd.Timestamp(request.window["forecast_origin"]),
+        )
         output = _external_output_path(config, repo, request, seed)
         run_official(
             itransformer_predict_command(
-                config, model_id=model_id, data_path=query_file,
+                config, model_id=model_id, data_path=query_name,
+                root_path=split_root,
                 forecast_steps=request.forecast_steps, output=output,
             ),
             cwd=repo, method=method,
