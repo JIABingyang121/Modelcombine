@@ -152,3 +152,65 @@ def test_prediction_is_a_composition_of_l2_then_l3():
 def test_two_level_cv_needs_at_least_two_folds():
     with pytest.raises(ValueError, match="至少需要 2 折"):
         MultiLayerStackEnsemble().fit(_folds(1))
+
+
+# ------------------------------------------- exp 加权的数值稳定性（溢出回归）
+#
+# `exp` 模式原本是 `np.exp(1.0 / normalised)`。某个候选的损失远小于其余时，它的
+# normalised 份额趋近 0，`1/normalised` 会到 1e8 量级，`exp` 直接溢出成 inf，
+# 归一化后整条权重退化成 [nan, 0, ...]——正式实验里这会让该折的组合器彻底失效。
+# 现在改为数学等价的 softmax 平移形式：分子分母同乘 exp(-max) 完全抵消。
+
+def test_exp_weights_do_not_overflow_on_extreme_loss_ratios():
+    """一个候选比其余好 8 个数量级时仍必须给出有效权重。"""
+    losses = np.array([1e-8, 1.0, 1.0])
+
+    weights = _performance_weights(losses, "exp")
+
+    assert np.isfinite(weights).all(), f"权重含非有限值: {weights}"
+    assert not np.isnan(weights).any()
+    # 反向确认装置有效：旧公式在这组输入上确实溢出
+    with np.errstate(over="ignore"):
+        legacy = np.exp(1.0 / (losses / losses.sum()))
+    assert np.isinf(legacy).any(), "装置无效：这组输入没有触发旧公式的溢出"
+
+
+@pytest.mark.parametrize("losses", [
+    np.array([1e-12, 1.0, 1.0]),
+    np.array([1e-8, 1e-8, 1.0]),
+    np.array([1.0, 1e6, 1e12]),
+    np.array([1e-6, 1e-3, 1.0, 1e3]),
+])
+def test_exp_weights_stay_finite_non_negative_and_sum_to_one(losses):
+    weights = _performance_weights(losses, "exp")
+
+    assert np.isfinite(weights).all()
+    assert (weights >= 0).all(), f"权重不得为负: {weights}"
+    assert weights.sum() == pytest.approx(1.0)
+
+
+def test_exp_weights_are_monotone_in_loss():
+    """损失越小权重越高——这是加权平均的定义，不能被数值处理改掉。"""
+    losses = np.array([0.1, 0.2, 0.4, 0.8])
+
+    weights = _performance_weights(losses, "exp")
+
+    assert np.all(np.diff(weights) < 0), f"权重应随损失单调下降: {weights}"
+    assert weights.argmax() == int(losses.argmin())
+
+
+def test_exp_weights_match_the_original_formula_on_ordinary_values():
+    """不溢出的普通量级上，新旧公式必须逐值相同——这次改的是数值实现，不是口径。"""
+    for losses in (
+        np.array([1.0, 2.0, 3.0]),
+        np.array([0.5, 0.5, 0.5, 0.5]),
+        np.array([1.0, 1.5]),
+        np.array([2.0, 4.0, 4.0, 8.0]),
+    ):
+        legacy_raw = np.exp(1.0 / (losses / np.sum(losses)))
+        assert np.isfinite(legacy_raw).all(), "该用例本就不该溢出，否则测不到等价性"
+        expected = legacy_raw / legacy_raw.sum()
+
+        np.testing.assert_allclose(
+            _performance_weights(losses, "exp"), expected, rtol=1e-12, atol=0
+        )

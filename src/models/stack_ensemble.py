@@ -74,7 +74,11 @@ def _performance_weights(losses: np.ndarray, mode: str) -> np.ndarray:
     elif mode == "sqr":
         raw = 1.0 / np.square(normalised)
     elif mode == "exp":
-        raw = np.exp(1.0 / normalised)
+        # 与 exp(1/normalised) 数学等价的稳定形式：softmax 对分子分母同乘 exp(-max)
+        # 后完全抵消，但避免了 exp 溢出。某个候选损失远小于其余时，1/normalised 会
+        # 达到 1e8 量级，直接 exp 会得到 inf，归一化后整条权重退化成 [nan, 0, ...]。
+        scores = 1.0 / normalised
+        raw = np.exp(scores - np.max(scores))
     else:
         raise ValueError(f"未知的性能加权模式: {mode}")
     return raw / np.sum(raw)
