@@ -200,6 +200,8 @@ def test_analysis_produces_task_dataset_and_horizon_tables():
     assert main[METHOD_UNDER_TEST]["wape"] == pytest.approx(1.0 / 100.0)
     assert len(report["by_dataset"]) == len(DATASETS) * 3
     assert len(report["by_forecast_steps"]) == 3 * 3
+    assert all(type(row["forecast_steps"]) is int for row in report["by_forecast_steps"])
+    json.dumps(report["by_forecast_steps"])
 
 
 def test_wins_and_mean_rank_follow_per_task_mae():

@@ -207,7 +207,11 @@ def _summarise(tasks: pd.DataFrame, by: Sequence[str]) -> List[Dict[str, Any]]:
     keys = [*by, "method"] if by else ["method"]
     out = []
     for key, group in tasks.groupby(keys):
-        record = dict(zip(keys, key if isinstance(key, tuple) else (key,)))
+        values = key if isinstance(key, tuple) else (key,)
+        record = {
+            name: int(value) if name == "forecast_steps" else value
+            for name, value in zip(keys, values)
+        }
         record.update({
             "tasks": int(len(group)),
             **{m: float(group[m].mean()) for m in ("mae", "rmse", "wape")},
