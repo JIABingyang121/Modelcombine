@@ -46,7 +46,7 @@ PROBE_HYPERPARAMETERS: Dict[str, Any] = {
 
 #: 正式命令必须齐备的超参数键。缺任何一个都直接失败，不用探针值兜底。
 #: iTransformer 的切分策略标识，写进 external_formal.json 的超参数，使冻结定义记录它。
-ITRANSFORMER_SPLIT_POLICY = "adaptive_val_at_least_pred_len"
+ITRANSFORMER_SPLIT_POLICY = "adaptive_val_at_least_one_full_batch"
 
 REQUIRED_HYPERPARAMETERS: Dict[str, tuple] = {
     "itransformer": (
@@ -159,26 +159,35 @@ def read_official_output(path: Path, method: str, forecast_steps: int) -> np.nda
     return values
 
 
-def itransformer_split_sizes(n_rows: int, pred_len: int) -> Dict[str, int]:
-    """自适应切分：官方 70/10/20 边界不变，只在验证段不足 ``pred_len`` 时扩大它。
+def itransformer_split_sizes(
+    n_rows: int, pred_len: int, *, batch_size: int
+) -> Dict[str, int]:
+    """自适应切分：官方 70/10/20 边界不变，只在验证段产不出一个完整 batch 时扩大它。
 
     官方 ``Dataset_Custom`` 按固定 70/10/20 内部切分，验证段长度 = N - floor(0.7N) - n_test。
     PJM 的正式训练文件只有 6663 行，验证段 667 行 < pred_len=720，官方 loader 的
     ``__len__`` 算出 ``667 - 720 + 1 = -52``，直接抛 ``ValueError: __len__() should
     return >= 0``。这不是偶发故障，是固定比例与长预测长度在短序列上的必然不兼容。
 
-    这里只做最小、确定性的调整：``n_val = max(official_val, pred_len)``，训练段相应缩短。
-    h=24 与 h=168 的官方验证段本就够长，边界与原来完全一致；只有 h=720 会扩大验证段。
+    仅仅让 val_samples >= 1 还不够：官方 ``data_factory`` 的 val 走 else 分支，
+    ``drop_last=True`` 且 ``batch_size=args.batch_size``。样本数少于一个 batch 时整批被丢弃，
+    验证集实际为空。因此下限取 ``pred_len + batch_size - 1``，使
+    ``val_samples = n_val - pred_len + 1 >= batch_size``。
+
+    h=24 与 h=168 的官方验证段本就够长，边界与原来逐个数字相同；只有 h=720 会扩大验证段。
     """
     n_rows = int(n_rows)
     pred_len = int(pred_len)
+    batch_size = int(batch_size)
     n_test = n_rows * 20 // 100
     official_val = n_rows - (n_rows * 70 // 100) - n_test
-    n_val = max(official_val, pred_len)
+    minimum_val = pred_len + batch_size - 1
+    n_val = max(official_val, minimum_val)
     n_train = n_rows - n_val - n_test
     return {
         "rows": n_rows, "train": n_train, "val": n_val, "test": n_test,
-        "official_val": official_val, "pred_len": pred_len,
+        "official_val": official_val, "minimum_val": minimum_val,
+        "pred_len": pred_len, "batch_size": batch_size,
     }
 
 
@@ -200,7 +209,8 @@ def itransformer_loader_samples(
 
 
 def write_itransformer_splits(
-    frame: pd.DataFrame, destination: Path, *, seq_len: int, pred_len: int
+    frame: pd.DataFrame, destination: Path, *, seq_len: int, pred_len: int,
+    batch_size: int,
 ) -> Dict[str, Any]:
     """按自适应切分写出官方 ``custom_fixed`` 需要的 train/val/test 三份 CSV。
 
@@ -209,19 +219,21 @@ def write_itransformer_splits(
     ``__len__`` 返回负数时抛栈。
     """
     ordered = frame.sort_values("timestamp").reset_index(drop=True)
-    sizes = itransformer_split_sizes(len(ordered), pred_len)
+    sizes = itransformer_split_sizes(len(ordered), pred_len, batch_size=batch_size)
     samples = itransformer_loader_samples(sizes, seq_len=seq_len, pred_len=pred_len)
-    short = {name: count for name, count in samples.items() if count < 1}
+    # train 与 val 都走 drop_last=True 的分支，不足一个 batch 会被整批丢弃；test 的
+    # batch_size 为 1、drop_last=False，只要求至少一个样本
+    required = {"train": batch_size, "val": batch_size, "test": 1}
+    short = {
+        name: (samples[name], need)
+        for name, need in required.items() if samples[name] < need
+    }
     if short:
         raise ExternalAdapterError(
-            f"itransformer: 切分后这些 loader 产不出样本 {short}（"
+            f"itransformer: 切分后这些 loader 样本不足（实际, 需要）{short}——"
             f"行数={sizes['rows']} seq_len={seq_len} pred_len={pred_len} "
-            f"train/val/test={sizes['train']}/{sizes['val']}/{sizes['test']}）"
-        )
-    if sizes["train"] < seq_len + pred_len:
-        raise ExternalAdapterError(
-            f"itransformer: 训练段 {sizes['train']} 行不足 seq_len+pred_len="
-            f"{seq_len + pred_len}"
+            f"batch_size={batch_size} "
+            f"train/val/test={sizes['train']}/{sizes['val']}/{sizes['test']}"
         )
 
     destination = Path(destination)
@@ -243,7 +255,7 @@ def write_itransformer_splits(
     return {
         "policy": ITRANSFORMER_SPLIT_POLICY,
         "sizes": sizes, "loader_samples": samples, "file_rows": written,
-        "seq_len": int(seq_len),
+        "seq_len": int(seq_len), "batch_size": int(batch_size),
     }
 
 
@@ -261,8 +273,10 @@ def itransformer_flags(
     return [
         "--is_training", "1",
         "--model_id", model_id, "--model", "iTransformer",
-        # custom_fixed 从 root_path 读固定的 train/val/test.csv，不做内部比例切分
-        "--data", "custom_fixed", "--root_path", f"{root_path}/", "--data_path", data_path,
+        # 锁定的官方 c2426e68 的 data_dict 只有 custom。固定切分由训练包装入口在运行时
+        # 把 data_dict["custom"] 换掉来提供，官方源码一行不改；预测走 flag='pred'，
+        # 官方仍然选 Dataset_Pred，不受替换影响。
+        "--data", "custom", "--root_path", f"{root_path}/", "--data_path", data_path,
         "--features", "S", "--target", "load", "--freq", "h",
         "--checkpoints", str(config["checkpoints"]),
         "--seq_len", str(hp["seq_len"]), "--label_len", str(hp["label_len"]),
@@ -279,6 +293,105 @@ def itransformer_flags(
     ] + (["--do_predict"] if do_predict else [])
 
 
+#: 训练包装入口：在外部进程内把官方 ``data_dict["custom"]`` 换成固定切分 Dataset，
+#: 再用 runpy 执行官方 ``run.py``。**官方仓库源码一行不改。**
+#:
+#: 为什么必须这样做：锁定的 c2426e68 的 ``data_dict`` 只有 ``custom``，没有
+#: ``custom_fixed``；而 ``Dataset_Custom`` 按固定 70/10/20 内部切分，短序列 + 长
+#: ``pred_len`` 必然算出负长度。替换 ``data_dict`` 的条目即可让官方模型、训练循环、
+#: DataLoader 与预测逻辑全部保持原样，只换数据来源。
+#:
+#: ``data_provider()`` 内部是 ``Data = data_dict[args.data]``，在调用时才查模块全局字典，
+#: 所以运行前改 ``factory.data_dict`` 生效；``exp_*`` 里 ``from ... import data_provider``
+#: 绑定的是函数本身，不受影响。
+ITRANSFORMER_TRAIN_SNIPPET = """
+import os, runpy
+import numpy as np, pandas as pd
+from sklearn.preprocessing import StandardScaler
+from torch.utils.data import Dataset
+from utils.timefeatures import time_features
+import data_provider.data_factory as factory
+
+
+class FixedSplitDataset(Dataset):
+    \"\"\"train/val/test 各读一份固定 CSV；scaler 统一在 train.csv 上拟合。
+
+    __len__ 与官方 Dataset_Custom 完全一致；val/test 的 CSV 已包含 seq_len 行输入上下文。
+    \"\"\"
+
+    FILES = {'train': 'train.csv', 'val': 'val.csv', 'test': 'test.csv'}
+
+    def __init__(self, root_path, flag='train', size=None, features='S',
+                 data_path='train.csv', target='OT', scale=True, timeenc=0, freq='h'):
+        assert flag in self.FILES, flag
+        self.seq_len, self.label_len, self.pred_len = size
+        self.flag = flag
+        self.features = features
+        self.target = target
+        self.scale = scale
+        self.timeenc = timeenc
+        self.freq = freq
+        self.root_path = root_path
+        self.__read_data__()
+
+    def _read(self, name):
+        frame = pd.read_csv(os.path.join(self.root_path, name))
+        if 'date' not in frame.columns:
+            for alt in ('timestamp', 'ds', 'datetime', 'time', 'ts'):
+                if alt in frame.columns:
+                    frame = frame.rename(columns={alt: 'date'})
+                    break
+        if 'date' not in frame.columns:
+            raise ValueError('fixed split needs a date column: ' + name)
+        return frame
+
+    def __read_data__(self):
+        self.scaler = StandardScaler()
+        train = self._read('train.csv')
+        split = self._read(self.FILES[self.flag])
+        if self.features in ('M', 'MS'):
+            train_values = train.drop(columns=['date'])
+            split_values = split.drop(columns=['date'])
+        else:
+            train_values = train[[self.target]]
+            split_values = split[[self.target]]
+        if self.scale:
+            self.scaler.fit(train_values.values)
+            data = self.scaler.transform(split_values.values)
+        else:
+            data = split_values.values
+        stamp = pd.to_datetime(split['date'])
+        if self.timeenc == 0:
+            data_stamp = pd.DataFrame({
+                'month': stamp.dt.month, 'day': stamp.dt.day,
+                'weekday': stamp.dt.weekday, 'hour': stamp.dt.hour,
+            }).values
+        else:
+            data_stamp = time_features(stamp.values, freq=self.freq).transpose(1, 0)
+        self.data_x = np.asarray(data, dtype=float)
+        self.data_y = self.data_x
+        self.data_stamp = data_stamp
+
+    def __getitem__(self, index):
+        s_begin = index
+        s_end = s_begin + self.seq_len
+        r_begin = s_end - self.label_len
+        r_end = r_begin + self.label_len + self.pred_len
+        return (self.data_x[s_begin:s_end], self.data_y[r_begin:r_end],
+                self.data_stamp[s_begin:s_end], self.data_stamp[r_begin:r_end])
+
+    def __len__(self):
+        return len(self.data_x) - self.seq_len - self.pred_len + 1
+
+    def inverse_transform(self, data):
+        return self.scaler.inverse_transform(data)
+
+
+factory.data_dict['custom'] = FixedSplitDataset
+runpy.run_path('run.py', run_name='__main__')
+"""
+
+
 def itransformer_command(
     config: Mapping[str, Any], *, model_id: str, data_path: str, forecast_steps: int,
     root_path: Path,
@@ -289,7 +402,7 @@ def itransformer_command(
     ``results/<setting>/real_prediction.npy``；那份文件与任何查询窗口都无关，正是旧接线
     误当成查询结果读回的东西。训练阶段干脆不产生它。
     """
-    return [str(config["python"]), "-u", "run.py"] + itransformer_flags(
+    return [str(config["python"]), "-c", ITRANSFORMER_TRAIN_SNIPPET] + itransformer_flags(
         config, model_id=model_id, data_path=data_path, root_path=root_path,
         forecast_steps=forecast_steps, do_predict=False,
     )

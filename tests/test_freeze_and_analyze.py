@@ -439,7 +439,7 @@ EXTERNAL_CONFIG = {
             "e_layers": 3, "d_layers": 1, "d_ff": 512, "factor": 1, "dropout": 0.1,
             "train_epochs": 10, "batch_size": 32, "patience": 3,
             "learning_rate": 0.0001, "des": "final",
-            "split_policy": "adaptive_val_at_least_pred_len",
+            "split_policy": "adaptive_val_at_least_one_full_batch",
         },
     },
     "mole": {
@@ -448,7 +448,7 @@ EXTERNAL_CONFIG = {
         "hyperparameters": {
             "seq_len": 336, "t_dim": 4, "train_epochs": 10, "batch_size": 32,
             "patience": 3, "learning_rate": 0.0001, "des": "final",
-            "split_policy": "adaptive_val_at_least_pred_len",
+            "split_policy": "adaptive_val_at_least_one_full_batch",
         },
     },
     "time_moe": {

@@ -53,6 +53,7 @@ from src.models.external_adapters import (
     EXTERNAL_METHODS,
     REQUIRED_LOCAL_FIELDS,
     ITRANSFORMER_PREDICT_SNIPPET,
+    ITRANSFORMER_TRAIN_SNIPPET,
     MOLE_PREDICT_SNIPPET,
     OFFICIAL_FIXED_SEED,
     TIME_MOE_PREDICT_SNIPPET,
@@ -455,6 +456,7 @@ def _itransformer(request: Request) -> np.ndarray:
             plan = write_itransformer_splits(
                 train, split_root,
                 seq_len=int(hp["seq_len"]), pred_len=request.forecast_steps,
+                batch_size=int(hp["batch_size"]),
             )
             print(f"[final] itransformer 切分 {request.dataset} h={request.forecast_steps}: {plan}")
             run_official(

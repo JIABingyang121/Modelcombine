@@ -119,13 +119,15 @@ def test_commands_match_the_probed_official_entries(tmp_path):
         "seq_len": 96, "label_len": 48, "d_model": 512, "n_heads": 8, "e_layers": 3,
         "d_layers": 1, "d_ff": 512, "factor": 1, "dropout": 0.1, "train_epochs": 10,
         "batch_size": 32, "patience": 3, "learning_rate": 0.0001, "t_dim": 4,
-        "des": "final", "split_policy": "adaptive_val_at_least_pred_len",
+        "des": "final", "split_policy": "adaptive_val_at_least_one_full_batch",
     }
     command = itransformer_command(
         config, model_id="pjm_T1_h720", data_path="train.csv", forecast_steps=720,
         root_path=tmp_path / "split",
     )
-    assert command[2] == "run.py"
+    # 训练走包装入口（运行时替换 data_dict["custom"]），不再直接执行 run.py
+    from src.models.external_adapters import ITRANSFORMER_TRAIN_SNIPPET
+    assert command[1] == "-c" and command[2] == ITRANSFORMER_TRAIN_SNIPPET
     for flag in ("--is_training", "--inverse", "--pred_len"):
         assert flag in command
     # 训练阶段不带 --do_predict：它产出的 real_prediction.npy 与任何查询窗口都无关
@@ -190,7 +192,7 @@ def test_itransformer_query_command_carries_do_predict_and_the_same_setting(tmp_
             "seq_len": 96, "label_len": 48, "d_model": 512, "n_heads": 8, "e_layers": 3,
             "d_layers": 1, "d_ff": 512, "factor": 1, "dropout": 0.1, "train_epochs": 10,
             "batch_size": 32, "patience": 3, "learning_rate": 0.0001, "des": "final",
-            "split_policy": "adaptive_val_at_least_pred_len",
+            "split_policy": "adaptive_val_at_least_one_full_batch",
         },
     }
     train = itransformer_command(

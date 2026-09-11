@@ -49,7 +49,7 @@ def wiring(tmp_path, monkeypatch):
                 "e_layers": 3, "d_layers": 1, "d_ff": 512, "factor": 1,
                 "dropout": 0.1, "train_epochs": 10, "batch_size": 32,
                 "patience": 3, "learning_rate": 0.0001, "t_dim": 4, "des": "final",
-            "split_policy": "adaptive_val_at_least_pred_len",
+            "split_policy": "adaptive_val_at_least_one_full_batch",
             },
         }
         for method in ("itransformer", "mole", "time_moe")
@@ -213,8 +213,11 @@ def test_itransformer_query_runs_official_predict_per_window(wiring):
     """
     _run(wiring, "itransformer")
 
-    trains = [c for c in wiring["calls"] if "run.py" in c["command"]]
-    queries = [c for c in wiring["calls"] if "run.py" not in c["command"]]
+    # 训练与查询都走 python -c <片段>，按片段区分
+    trains = [c for c in wiring["calls"]
+              if c["command"][2] == final_comparison.ITRANSFORMER_TRAIN_SNIPPET]
+    queries = [c for c in wiring["calls"]
+               if c["command"][2] == final_comparison.ITRANSFORMER_PREDICT_SNIPPET]
     assert len(trains) == 1, f"应只训练一次，实际 {len(trains)} 次"
     train = trains[0]["command"]
     assert train[train.index("--is_training") + 1] == "1"
