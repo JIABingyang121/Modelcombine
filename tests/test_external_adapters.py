@@ -140,10 +140,13 @@ def test_commands_match_the_probed_official_entries(tmp_path):
 
     mole = mole_train_command(
         {**config, "repo": tmp_path / "mole"},
-        model_id="pjm_T1_h24", data_path="mc.csv", forecast_steps=24, seed=43,
+        model_id="pjm_T1_h24", data_path="train.csv", forecast_steps=24, seed=43,
+        root_path=tmp_path / "mole_split",
     )
-    assert mole[2] == "run_longExp.py"
+    from src.models.external_adapters import MOLE_TRAIN_SNIPPET
+    assert mole[1:4] == ["-u", "-c", MOLE_TRAIN_SNIPPET]
     assert mole[mole.index("--model") + 1] == "MoLE_DLinear"
+    assert mole[mole.index("--root_path") + 1] == f"{tmp_path / 'mole_split'}/"
     assert mole[mole.index("--seed") + 1] == "43", "请求的种子必须真的传下去"
     # 官方 --do_predict 有真实缺陷，训练命令里不得带它
     assert "--do_predict" not in mole

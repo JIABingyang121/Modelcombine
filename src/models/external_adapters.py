@@ -45,8 +45,9 @@ PROBE_HYPERPARAMETERS: Dict[str, Any] = {
 }
 
 #: 正式命令必须齐备的超参数键。缺任何一个都直接失败，不用探针值兜底。
-#: iTransformer 的切分策略标识，写进 external_formal.json 的超参数，使冻结定义记录它。
+#: 外部训练方法的切分策略标识，写进 external_formal.json 的超参数，使冻结定义记录它。
 ITRANSFORMER_SPLIT_POLICY = "adaptive_val_at_least_one_full_batch"
+MOLE_SPLIT_POLICY = ITRANSFORMER_SPLIT_POLICY
 
 REQUIRED_HYPERPARAMETERS: Dict[str, tuple] = {
     "itransformer": (
@@ -58,7 +59,7 @@ REQUIRED_HYPERPARAMETERS: Dict[str, tuple] = {
     ),
     "mole": (
         "seq_len", "t_dim", "train_epochs", "batch_size", "patience",
-        "learning_rate", "des",
+        "learning_rate", "des", "split_policy",
     ),
 }
 
@@ -96,10 +97,14 @@ def hyperparameters(config: Mapping[str, Any], method: str) -> Dict[str, Any]:
     missing = [k for k in REQUIRED_HYPERPARAMETERS[method] if k not in values]
     if missing:
         raise ExternalAdapterError(f"{method}: hyperparameters 缺少 {missing}")
-    if method == "itransformer" and values["split_policy"] != ITRANSFORMER_SPLIT_POLICY:
+    expected_policy = {
+        "itransformer": ITRANSFORMER_SPLIT_POLICY,
+        "mole": MOLE_SPLIT_POLICY,
+    }.get(method)
+    if expected_policy is not None and values["split_policy"] != expected_policy:
         raise ExternalAdapterError(
-            f"itransformer: 配置声明的 split_policy 是 {values['split_policy']!r}，"
-            f"当前实现是 {ITRANSFORMER_SPLIT_POLICY!r}"
+            f"{method}: 配置声明的 split_policy 是 {values['split_policy']!r}，"
+            f"当前实现是 {expected_policy!r}"
         )
     return dict(values)
 
@@ -448,17 +453,58 @@ def itransformer_predict_command(
     )
 
 
+MOLE_TRAIN_SNIPPET = """
+import os, runpy
+import numpy as np, pandas as pd
+from sklearn.preprocessing import StandardScaler
+from utils.timefeatures import time_features
+from data_provider.data_loader import Dataset_Custom
+
+
+def fixed_read_data(self):
+    self.scaler = StandardScaler()
+    files = ('train.csv', 'val.csv', 'test.csv')
+    train = pd.read_csv(os.path.join(self.root_path, files[0]))
+    split = pd.read_csv(os.path.join(self.root_path, files[self.set_type]))
+    if self.features in ('M', 'MS'):
+        train_values = train.drop(columns=['date'])
+        split_values = split.drop(columns=['date'])
+    else:
+        train_values = train[[self.target]]
+        split_values = split[[self.target]]
+    if self.scale:
+        self.scaler.fit(train_values.values)
+        data = self.scaler.transform(split_values.values)
+    else:
+        data = split_values.values
+    stamp = pd.DatetimeIndex(pd.to_datetime(split['date']))
+    if self.timeenc == 0:
+        data_stamp = pd.DataFrame({
+            'month': stamp.month, 'day': stamp.day,
+            'weekday': stamp.weekday, 'hour': stamp.hour,
+        }).values
+    else:
+        data_stamp = time_features(stamp, freq=self.freq).transpose(1, 0)
+    self.data_x = np.asarray(data, dtype=float)
+    self.data_y = self.data_x
+    self.data_stamp = data_stamp
+
+
+Dataset_Custom.__read_data__ = fixed_read_data
+runpy.run_path('run_longExp.py', run_name='__main__')
+"""
+
+
 def mole_train_command(
     config: Mapping[str, Any], *, model_id: str, data_path: str, forecast_steps: int,
-    seed: int,
+    seed: int, root_path: Path,
 ) -> List[str]:
     """官方 `run_longExp.py` 训练。其 `--do_predict` 有真实缺陷，预测另走官方 Python API。"""
-    repo = Path(config["repo"])
     hp = hyperparameters(config, "mole")
     return [
-        str(config["python"]), "-u", "run_longExp.py",
+        str(config["python"]), "-u", "-c", MOLE_TRAIN_SNIPPET,
         "--is_training", "1", "--model_id", model_id, "--model", "MoLE_DLinear",
-        "--data", "custom", "--root_path", f"{repo}/dataset/", "--data_path", data_path,
+        "--data", "custom", "--root_path", f"{root_path}/", "--data_path", data_path,
         "--features", "S", "--target", "load", "--freq", "h",
         "--checkpoints", str(config["checkpoints"]),
         "--seq_len", str(hp["seq_len"]), "--pred_len", str(forecast_steps),

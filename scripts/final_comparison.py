@@ -500,16 +500,27 @@ def _mole(request: Request) -> np.ndarray:
     repo = Path(config["repo"])
     seed = request.seed
     model_id = f"{request.dataset}_h{request.forecast_steps}_s{seed}"
+    split_root = repo / "dataset" / f"mc_split_{request.dataset}_h{request.forecast_steps}_s{seed}"
     try:
         hp = hyperparameters(config, method)
         trained = ("_trained", method, model_id)
         if trained not in request.fitted:
-            train_file = _write_training_file(request, method, repo, seed)
+            train = request.raw[request.raw["timestamp"] < request.training_cutoff]
+            if train.empty:
+                raise FinalComparisonError(
+                    f"{method}: {request.dataset} 在 training_cutoff 之前没有训练数据"
+                )
+            plan = write_itransformer_splits(
+                train, split_root, seq_len=int(hp["seq_len"]),
+                pred_len=request.forecast_steps, batch_size=int(hp["batch_size"]),
+            )
+            print(f"[final] mole 切分 {request.dataset} h={request.forecast_steps}: {plan}")
             before = _checkpoint_snapshot(Path(config["checkpoints"]), model_id)
             run_official(
                 mole_train_command(
-                    config, model_id=model_id, data_path=train_file,
+                    config, model_id=model_id, data_path="train.csv",
                     forecast_steps=request.forecast_steps, seed=seed,
+                    root_path=split_root,
                 ),
                 cwd=repo, method=method,
             )

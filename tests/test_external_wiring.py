@@ -62,7 +62,7 @@ def wiring(tmp_path, monkeypatch):
     def _record(command, *, cwd, method):
         command = [str(c) for c in command]
         calls.append({"method": method, "command": command})
-        if any(c.endswith("run_longExp.py") for c in command):
+        if method == "mole" and "--is_training" in command:
             # 官方训练写出 checkpoint。目录名由官方 setting 决定，含 seq_len 与 des——
             # 这正是 model_id 区分不开冒烟与正式两套产物的原因。
             folder = ckpt_root / "_".join([
@@ -116,7 +116,7 @@ def test_training_file_is_frozen_and_query_history_ends_at_each_forecast_origin(
     origins = {o["label"]: o for o in plan["datasets"][0]["origins"]}
     cutoff = pd.Timestamp(origins["T1"]["history_start"])
 
-    training_files = _written(wiring["repo"], "mc_train_*.csv")
+    training_files = _written(wiring["repo"], "mc_split_*/train.csv")
     assert len(training_files) == 1, "训练文件应按 dataset×forecast_steps×seed 只写一份"
     train = pd.read_csv(training_files[0])
     assert list(train.columns) == ["date", "load"]
@@ -140,8 +140,8 @@ def test_training_happens_once_and_is_reused_across_all_test_windows(wiring):
     """iTransformer / MoLE 必须只训练一次，T1—T3 复用同一个 checkpoint。"""
     _run(wiring, "mole")
 
-    trains = [c for c in wiring["calls"] if "run_longExp.py" in c["command"]]
-    predicts = [c for c in wiring["calls"] if "run_longExp.py" not in c["command"]]
+    trains = [c for c in wiring["calls"] if "--is_training" in c["command"]]
+    predicts = [c for c in wiring["calls"] if "--is_training" not in c["command"]]
     assert len(trains) == 1, f"应只训练一次，实际 {len(trains)} 次"
     assert len(predicts) == len(WINDOWS)
 
@@ -151,9 +151,9 @@ def test_requested_seed_reaches_the_official_command(wiring):
     """请求 43 就必须真的把 43 传给官方，而不是永远用 42。"""
     _run(wiring, "mole", seeds=(43,), windows=("T1",))
 
-    train = next(c for c in wiring["calls"] if "run_longExp.py" in c["command"])
+    train = next(c for c in wiring["calls"] if "--is_training" in c["command"])
     assert train["command"][train["command"].index("--seed") + 1] == "43"
-    predict = next(c for c in wiring["calls"] if "run_longExp.py" not in c["command"])
+    predict = next(c for c in wiring["calls"] if "--is_training" not in c["command"])
     assert "43" in predict["command"], "预测调用也必须收到请求的种子"
 
 
@@ -161,9 +161,9 @@ def test_different_seeds_do_not_share_artifact_paths(wiring):
     """不同种子的训练文件与产物路径必须区分，否则后一个种子会覆盖前一个。"""
     _run(wiring, "mole", seeds=(42, 43), windows=("T1",))
 
-    training_files = _written(wiring["repo"], "mc_train_*.csv")
+    training_files = _written(wiring["repo"], "mc_split_*/train.csv")
     assert len(training_files) == 2
-    assert len({p.name for p in training_files}) == 2
+    assert len({p.parent.name for p in training_files}) == 2
     model_ids = [
         c["command"][c["command"].index("--model_id") + 1]
         for c in wiring["calls"] if "--model_id" in c["command"]
@@ -240,7 +240,11 @@ def test_itransformer_query_runs_official_predict_per_window(wiring):
 
 def test_stale_training_file_from_a_smoke_run_is_not_reused(wiring):
     """冒烟阶段留下的同名训练文件，正式实验必须覆盖重写而不是直接复用。"""
-    stale = wiring["repo"] / "dataset" / f"mc_train_{DATASET}_h{STEPS}_s42.csv"
+    stale = (
+        wiring["repo"] / "dataset" /
+        f"mc_split_{DATASET}_h{STEPS}_s42" / "train.csv"
+    )
+    stale.parent.mkdir(parents=True)
     stale.write_text("date,load\n2000-01-01 00:00:00,1.0\n", encoding="utf-8")
 
     _run(wiring, "mole", windows=("T1",))
@@ -289,7 +293,7 @@ def test_mole_loads_the_checkpoint_this_run_trained_not_a_smoke_leftover(wiring)
     fresh = wiring["ckpt_root"] / (
         f"{DATASET}_h{STEPS}_s42_MoLE_DLinear_custom_ftS_sl96_pl{STEPS}_final_0"
     )
-    predicts = [c for c in wiring["calls"] if "run_longExp.py" not in c["command"]]
+    predicts = [c for c in wiring["calls"] if "--is_training" not in c["command"]]
     assert len(predicts) == len(WINDOWS)
     for call in predicts:
         assert str(fresh / "checkpoint.pth") in call["command"]
@@ -311,7 +315,7 @@ def test_mole_detects_an_overwritten_checkpoint_at_the_same_path(wiring):
 
     _run(wiring, "mole", windows=("T1",))
 
-    predict = next(c for c in wiring["calls"] if "run_longExp.py" not in c["command"])
+    predict = next(c for c in wiring["calls"] if "--is_training" not in c["command"])
     assert str(same / "checkpoint.pth") in predict["command"]
     assert (same / "checkpoint.pth").read_text() == "checkpoint"
 
