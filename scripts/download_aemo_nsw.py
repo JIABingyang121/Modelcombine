@@ -9,6 +9,13 @@ import io
 import time
 import os
 import sys
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from scripts.prepare_aemo_hourly import aggregate_hourly
 
 # 配置
 REGION = "NSW1"
@@ -45,6 +52,8 @@ def download_and_process():
                 resp = requests.get(url, headers=HEADERS, timeout=20)
                 if resp.status_code == 200:
                     df = pd.read_csv(io.StringIO(resp.content.decode('utf-8')))
+                    df.columns = [str(c).upper().strip() for c in df.columns]
+                    df["source_file"] = filename
                     all_frames.append(df)
                     print("✅ OK")
                 elif resp.status_code == 404:
@@ -61,22 +70,14 @@ def download_and_process():
         print("❌ 下载失败：没有获取到任何数据。请检查网络或 Region 代码。")
         return
 
-    # 2. 合并与清洗
+    # 2. 合并与清洗（聚合统一走 scripts.prepare_aemo_hourly）
     print("\n🔄 正在合并与清洗...")
     full_df = pd.concat(all_frames, ignore_index=True)
-    
-    # 统一大写列名
-    full_df.columns = [c.upper().strip() for c in full_df.columns]
-    
+
     if 'SETTLEMENTDATE' in full_df.columns and 'TOTALDEMAND' in full_df.columns:
-        # 提取时间与负荷
-        full_df['ds'] = pd.to_datetime(full_df['SETTLEMENTDATE'])
-        full_df['y'] = pd.to_numeric(full_df['TOTALDEMAND'], errors='coerce')
-        
-        # 重采样为小时级 (H)
-        clean_df = full_df.set_index('ds')[['y']].resample('H').mean().reset_index()
-        clean_df = clean_df.dropna().sort_values('ds')
-        
+        hourly, _stats = aggregate_hourly(full_df, region=REGION)
+        clean_df = hourly.rename(columns={"timestamp": "ds", "load": "y"})
+
         # 3. 保存
         clean_df.to_csv(OUTPUT_FILE, index=False)
         print(f"\n✅ 成功！数据已保存至: {OUTPUT_FILE}")

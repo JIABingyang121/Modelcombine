@@ -1,11 +1,18 @@
 import argparse
 import io
+import sys
 import zipfile
 from pathlib import Path
 from typing import Iterable, List, Optional
 
 import pandas as pd
 import requests
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from scripts.prepare_aemo_hourly import aggregate_hourly
 
 
 def _read_csv_bytes(content: bytes) -> pd.DataFrame:
@@ -56,6 +63,9 @@ def download_aemo_data(year: int, region: str = "VIC1") -> pd.DataFrame:
         try:
             df = _download_month_csv(year, region, m)
             if df is not None:
+                df = df.copy()
+                df.columns = [str(c).upper().strip() for c in df.columns]
+                df["source_file"] = f"download_{year}{m}_{region}.csv"
                 frames.append(df)
         except Exception as exc:
             print(f"Skipping {year}-{m}: {exc}")
@@ -67,26 +77,12 @@ def download_aemo_data(year: int, region: str = "VIC1") -> pd.DataFrame:
         )
 
     full_df = pd.concat(frames, ignore_index=True)
-    if "SETTLEMENTDATE" not in full_df.columns or "TOTALDEMAND" not in full_df.columns:
-        raise ValueError("Missing expected columns SETTLEMENTDATE/TOTALDEMAND")
 
-    full_df["SETTLEMENTDATE"] = pd.to_datetime(full_df["SETTLEMENTDATE"], errors="coerce")
-    full_df = full_df.dropna(subset=["SETTLEMENTDATE"]).sort_values("SETTLEMENTDATE")
-
-    clean_df = full_df[["SETTLEMENTDATE", "TOTALDEMAND"]].rename(
-        columns={"SETTLEMENTDATE": "timestamp", "TOTALDEMAND": "load"}
-    )
-
-    clean_df = (
-        clean_df.set_index("timestamp")
-        .resample("H")
-        .mean()
-        .reset_index()
-    )
-
-    clean_df["region"] = region
-    clean_df["region_type"] = "real_grid"
-    return clean_df
+    # 统一由 scripts.prepare_aemo_hourly 完成聚合，禁止在此另写 resample。
+    hourly, _stats = aggregate_hourly(full_df, region=region)
+    hourly["region"] = region
+    hourly["region_type"] = "real_grid"
+    return hourly
 
 
 def parse_years(values: Iterable[str]) -> List[int]:
