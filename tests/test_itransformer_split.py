@@ -286,6 +286,7 @@ def test_wrapper_replaces_the_dataset_inside_a_locked_official_repo(tmp_path):
     (repo / "utils" / "timefeatures.py").write_text(
         "import numpy as np\n"
         "def time_features(dates, freq='h'):\n"
+        "    assert hasattr(dates, 'hour'), type(dates)\n"
         "    return np.zeros((4, len(dates)))\n",
         encoding="utf-8",
     )

@@ -367,7 +367,7 @@ class FixedSplitDataset(Dataset):
                 'weekday': stamp.dt.weekday, 'hour': stamp.dt.hour,
             }).values
         else:
-            data_stamp = time_features(stamp.values, freq=self.freq).transpose(1, 0)
+            data_stamp = time_features(pd.DatetimeIndex(stamp), freq=self.freq).transpose(1, 0)
         self.data_x = np.asarray(data, dtype=float)
         self.data_y = self.data_x
         self.data_stamp = data_stamp
