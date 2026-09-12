@@ -303,6 +303,47 @@ def test_fitted_methods_train_once_before_T1_and_do_not_refit_per_window(compari
     assert not np.allclose(perturbed["yhat"], baseline["yhat"]), "输入历史变了，预测应当变"
 
 
+def test_formal_entry_passes_explicit_b_training_cutoff(comparison):
+    """冻结定义里的显式 B training_cutoff 必须传到 run()/Request。
+
+    定义没有显式 cutoff 时入口走 T1.history_start 回退，因此旧测试证明不了新增的传递。
+    这里把 cutoff 设在 T1.history_start 之前，并截获真实 Request，断言训练数据严格截止于它。
+    """
+    built = comparison["built"]
+    tmp_path = comparison["tmp_path"] / "b_cutoff"
+    tmp_path.mkdir(exist_ok=True)
+    plan = json.loads(Path(built["window_plan"]).read_text())
+    origins = {o["label"]: o for o in plan["datasets"][0]["origins"]}
+    fallback = pd.Timestamp(origins["T1"]["history_start"])
+    explicit = fallback - pd.Timedelta(hours=100)
+    assert explicit != fallback
+
+    definition = _definition(tmp_path, built, methods=["random_forest"],
+                             windows=("T1",), seeds=(42,))
+    payload = json.loads(definition.read_text())
+    payload["datasets"][0]["training_cutoff"] = str(explicit)
+    definition.write_text(json.dumps(payload), encoding="utf-8")
+
+    seen = []
+    real = final_comparison.run_request
+
+    def spy(method, request):
+        seen.append(request.training_cutoff)
+        return real(method, request)
+
+    with mock.patch.object(final_comparison, "run_request", side_effect=spy):
+        proc, out = _run(tmp_path, built, methods=["random_forest"],
+                         windows=("T1",), definition=definition)
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert seen and all(cutoff == explicit for cutoff in seen)
+    # 训练数据必须严格早于显式 cutoff（cutoff 为 exclusive 右界）
+    raw = final_comparison._library_raw_frame(built["raw_root"], DATASET)
+    train = raw[raw["timestamp"] < explicit]
+    assert len(train) > 0
+    assert train["timestamp"].max() < explicit
+
+
 def test_same_fitted_model_serves_every_window(comparison):
     """同一 (方法, 数据集, 种子) 在 T1—T3 上必须复用同一个已拟合模型。"""
     from scripts import final_comparison

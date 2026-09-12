@@ -25,20 +25,20 @@ def _write_raw(root: Path, dataset: str, timestamps: pd.DatetimeIndex) -> None:
 
 
 def _run(tmp_path: Path, root: Path, *, datasets, steps, trajectories=7, window=720,
-         out_name="inventory.json"):
+         out_name="inventory.json", cutoffs=None):
     out = tmp_path / out_name
-    proc = subprocess.run(
-        [
-            sys.executable, "scripts/stage0_data_inventory.py",
-            "--raw-root", str(root), "--layout", "raw",
-            "--datasets", *datasets,
-            "--forecast-steps", *[str(s) for s in steps],
-            "--trajectories", str(trajectories),
-            "--signature-window", str(window),
-            "--out", str(out),
-        ],
-        cwd=REPO_ROOT, capture_output=True, text=True,
-    )
+    cmd = [
+        sys.executable, "scripts/stage0_data_inventory.py",
+        "--raw-root", str(root), "--layout", "raw",
+        "--datasets", *datasets,
+        "--forecast-steps", *[str(s) for s in steps],
+        "--trajectories", str(trajectories),
+        "--signature-window", str(window),
+        "--out", str(out),
+    ]
+    if cutoffs:
+        cmd += ["--training-cutoffs", *cutoffs]
+    proc = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True)
     report = json.loads(out.read_text()) if out.exists() else None
     return proc, report
 
@@ -130,6 +130,33 @@ def test_one_origin_serves_all_three_forecast_horizons(tmp_path):
         if previous_last is not None:
             assert pd.Timestamp(targets["720"]["first_target"]) > previous_last
         previous_last = pd.Timestamp(targets["720"]["last_target"])
+
+
+def test_explicit_b_training_cutoff_is_written_into_plan(tmp_path):
+    root = tmp_path / "data"
+    stamps = pd.date_range("2025-01-01", periods=6800, freq="h")
+    _write_raw(root, "ample", stamps)
+
+    proc, report = _run(
+        tmp_path, root, datasets=["ample"], steps=[24],
+        cutoffs=["ample=2025-02-01T00:00:00"],
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    entry = report["datasets"][0]
+    assert entry["training_cutoff"] == "2025-02-01 00:00:00"
+    assert entry["training_rows"] == int((stamps < pd.Timestamp("2025-02-01")).sum())
+
+
+def test_explicit_b_training_cutoff_after_first_s_target_is_blocked(tmp_path):
+    root = tmp_path / "data"
+    _write_raw(root, "ample", pd.date_range("2025-01-01", periods=6800, freq="h"))
+
+    proc, report = _run(
+        tmp_path, root, datasets=["ample"], steps=[24],
+        cutoffs=["ample=2025-06-01T00:00:00"],
+    )
+    assert proc.returncode != 0
+    assert any("晚于第一个 S 目标" in issue for issue in report["datasets"][0]["issues"])
 
 
 def test_requested_steps_do_not_change_origins(tmp_path):

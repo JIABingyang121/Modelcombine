@@ -221,12 +221,12 @@ def _summarise(tasks: pd.DataFrame, by: Sequence[str]) -> List[Dict[str, Any]]:
 
 
 def _ranking(tasks: pd.DataFrame) -> Dict[str, Any]:
-    """逐任务按 MAE 排名，统计胜场数与平均排名。"""
+    """逐任务按主指标 WAPE 排名，统计胜场数与平均排名。"""
     methods = sorted(tasks["method"].unique())
     wins = {m: 0 for m in methods}
     ranks: Dict[str, List[float]] = {m: [] for m in methods}
     for _task, group in tasks.groupby(list(TASK_KEYS)):
-        ordered = group.sort_values("mae")
+        ordered = group.sort_values("wape")
         wins[ordered.iloc[0]["method"]] += 1
         for rank, (_i, row) in enumerate(ordered.iterrows(), start=1):
             ranks[row["method"]].append(float(rank))
@@ -243,7 +243,7 @@ def _ranking(tasks: pd.DataFrame) -> Dict[str, Any]:
 
 
 def _conclusions(tasks: pd.DataFrame, complete: bool) -> Dict[str, Any]:
-    """§8：27 任务平均 MAE 更低 **且** 至少赢 14/27，才能说"总体优于"。"""
+    """§8：27 任务等权宏平均 WAPE 更低 **且** 至少赢 14/27，才能说"总体优于"。"""
     if METHOD_UNDER_TEST not in set(tasks["method"]):
         raise AnalysisError(f"长表里没有 {METHOD_UNDER_TEST}")
     mine = tasks[tasks["method"] == METHOD_UNDER_TEST].set_index(list(TASK_KEYS))
@@ -251,26 +251,26 @@ def _conclusions(tasks: pd.DataFrame, complete: bool) -> Dict[str, Any]:
     for method in sorted(set(tasks["method"]) - {METHOD_UNDER_TEST}):
         other = tasks[tasks["method"] == method].set_index(list(TASK_KEYS))
         shared = mine.index.intersection(other.index)
-        a, b = mine.loc[shared, "mae"], other.loc[shared, "mae"]
+        a, b = mine.loc[shared, "wape"], other.loc[shared, "wape"]
         wins = int((a < b).sum())
         full = complete and len(shared) == EXPECTED_TASKS
         results.append({
             "versus": method,
             "compared_tasks": int(len(shared)),
             "compared_all_tasks": bool(len(shared) == EXPECTED_TASKS),
-            "mean_mae_modelcombine": float(a.mean()),
-            "mean_mae_versus": float(b.mean()),
-            "relative_mae_change_pct": float((a.mean() - b.mean()) / b.mean() * 100.0),
+            "macro_wape_modelcombine": float(a.mean()),
+            "macro_wape_versus": float(b.mean()),
+            "relative_wape_change_pct": float((a.mean() - b.mean()) / b.mean() * 100.0),
             "wins": wins,
             "win_threshold": WIN_RATE_MIN_TASKS,
-            "mean_mae_lower": bool(a.mean() < b.mean()),
+            "macro_wape_lower": bool(a.mean() < b.mean()),
             # 产物与冻结定义不符、或没有覆盖全部 27 个任务时，一律不得表述总体更优
             "overall_better": bool(
                 full and a.mean() < b.mean() and wins >= WIN_RATE_MIN_TASKS
             ),
         })
     return {
-        "rule": "产物与冻结定义完全一致、覆盖全部 27 个任务、平均 MAE 更低、"
+        "rule": "产物与冻结定义完全一致、覆盖全部 27 个任务、27 任务等权宏平均 WAPE 更低、"
                 "且至少赢得 14/27，四条同时成立才能表述总体更优",
         #: 与这些方法的比较不得被读成同等条件下的比较
         "method_limitations": {
@@ -355,7 +355,7 @@ def main() -> int:
         )
 
     print(f"[analyze] 结果已保存: {out}")
-    for row in sorted(report["main"], key=lambda r: r["mae"]):
+    for row in sorted(report["main"], key=lambda r: r["wape"]):
         print(f"[analyze] {row['method']:<28} MAE={row['mae']:.4f} "
               f"RMSE={row['rmse']:.4f} WAPE={row['wape']:.4f}（{row['tasks']} 个任务）")
     ranking = report["ranking"]
@@ -374,9 +374,9 @@ def main() -> int:
         print(f"[analyze] ！{method} 限制：{limitation}")
     for row in conclusions["comparisons"]:
         verdict = "可表述总体更优" if row["overall_better"] else "不得表述总体更优"
-        print(f"[analyze] vs {row['versus']:<28} 平均 MAE "
-              f"{row['mean_mae_modelcombine']:.4f} / {row['mean_mae_versus']:.4f}"
-              f"（{row['relative_mae_change_pct']:+.2f}%），胜 {row['wins']}/"
+        print(f"[analyze] vs {row['versus']:<28} 宏平均 WAPE "
+              f"{row['macro_wape_modelcombine']:.4f} / {row['macro_wape_versus']:.4f}"
+              f"（{row['relative_wape_change_pct']:+.2f}%），胜 {row['wins']}/"
               f"{row['compared_tasks']} -> {verdict}")
     return 0
 

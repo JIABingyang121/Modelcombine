@@ -202,6 +202,54 @@ def test_subprocess_train_baselines_populates_model_library(tmp_path):
     store.close()
 
 
+def test_pjm_rto_is_registered_and_horizon_can_be_limited_to_h1(tmp_path):
+    """D2 需要 pjm_rto 的 h=1 基础产物；登记缺失时入口曾会静默产出空报告。"""
+    features = tmp_path / "features"
+    _write_features(features / "pjm_rto")
+    pipeline = tmp_path / "pipeline.yaml"
+    pipeline.write_text(
+        "models:\n  lgbm_reg:\n    n_estimators: 5\n    n_jobs: 1\n    verbose: -1\n",
+        encoding="utf-8",
+    )
+    db = tmp_path / "lib.sqlite3"
+    proc = subprocess.run(
+        [
+            sys.executable, "-m", "scripts.train_baselines",
+            "--datasets", "pjm_rto",
+            "--horizons", "1",
+            "--features", str(features),
+            "--out", str(tmp_path / "out"),
+            "--pipeline-config", str(pipeline),
+            "--database", str(db),
+            "--model-artifacts", str(tmp_path / "artifacts"),
+            "--allow_partial",
+        ],
+        cwd=REPO_ROOT, capture_output=True, text=True,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+    store = ModelStore(str(db))
+    rows = store.connection.execute("SELECT model_id FROM models ORDER BY model_id").fetchall()
+    assert {r[0] for r in rows} == {"pjm_rto__h1__lgbm_reg"}
+    store.close()
+
+
+def test_unknown_or_empty_dataset_selection_is_rejected(tmp_path):
+    base = [
+        sys.executable, "-m", "scripts.train_baselines",
+        "--features", str(tmp_path / "features"),
+        "--out", str(tmp_path / "out"),
+        "--allow_partial",
+    ]
+    for extra, needle in (
+        (["--datasets", "not_a_dataset"], "未登记"),
+        (["--datasets"], "不能为空"),
+    ):
+        proc = subprocess.run(base + extra, cwd=REPO_ROOT, capture_output=True, text=True)
+        assert proc.returncode != 0, (extra, proc.stdout + proc.stderr)
+        assert needle in (proc.stderr + proc.stdout)
+
+
 def test_database_without_artifact_dir_is_rejected(tmp_path):
     proc = subprocess.run(
         [

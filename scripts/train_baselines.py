@@ -545,7 +545,10 @@ def main():
     )
     parser.add_argument("--features", default="data/features", help="特征根目录")
     parser.add_argument("--out", default="reports/baselines", help="输出目录")
-    parser.add_argument("--datasets", nargs="*", default=None, help="仅运行指定数据集，如 pjm aemo_vic aemo_nsw")
+    parser.add_argument("--datasets", nargs="*", default=None,
+                        help="仅运行指定数据集，如 pjm_rto aemo_vic aemo_nsw")
+    parser.add_argument("--horizons", nargs="*", type=int, default=None,
+                        help="仅训练指定预测长度（正式 D2 只用 --horizons 1）；缺省用登记表 [1,6,24]")
     parser.add_argument("--max_rows", type=int, default=None, help="训练集最大行数（全局）")
     parser.add_argument("--allow_partial", action="store_true",
                         help="允许部分 dataset/horizon 产物缺失（默认严格校验完整性）")
@@ -583,11 +586,13 @@ def main():
     # Horizon设定与target映射
     horizons = {
         "pjm": [1, 6, 24],
+        "pjm_rto": [1, 6, 24],
         "aemo_vic": [1, 6, 24],
         "aemo_nsw": [1, 6, 24],
     }
     targets = {
         "pjm": "load",
+        "pjm_rto": "load",
         "aemo_vic": "load",
         "aemo_nsw": "load",
     }
@@ -595,12 +600,31 @@ def main():
     all_results = {}
     datasets = [
         ("pjm", Path(args.features) / "pjm"),
+        ("pjm_rto", Path(args.features) / "pjm_rto"),
         ("aemo_vic", Path(args.features) / "aemo_vic"),
         ("aemo_nsw", Path(args.features) / "aemo_nsw"),
     ]
-    if args.datasets:
+    known_datasets = {name for name, _ in datasets}
+    if args.datasets is not None:
+        if not args.datasets:
+            parser.error("--datasets 不能为空")
+        unknown = sorted(set(args.datasets) - known_datasets)
+        if unknown:
+            parser.error(f"--datasets 未登记: {unknown}；可用: {sorted(known_datasets)}")
         selected = set(args.datasets)
         datasets = [d for d in datasets if d[0] in selected]
+        if not datasets:
+            parser.error("--datasets 过滤后为空，拒绝空运行")
+    if args.horizons is not None:
+        if not args.horizons:
+            parser.error("--horizons 不能为空")
+        unknown_horizons = sorted(set(args.horizons) - {1, 6, 24})
+        if unknown_horizons:
+            parser.error(f"--horizons 未登记: {unknown_horizons}；可用: [1, 6, 24]")
+    effective_horizons = {
+        name: (list(args.horizons) if args.horizons is not None else horizons[name])
+        for name, _ in datasets
+    }
 
     for name, root in datasets:
         if not root.exists():
@@ -610,7 +634,7 @@ def main():
             name,
             root,
             targets[name],
-            horizons[name],
+            effective_horizons[name],
             out_root,
             args.max_rows,
             model_params,
@@ -629,7 +653,7 @@ def main():
         verify_prediction_artifacts(
             out_root,
             selected_dataset_names,
-            horizons,
+            effective_horizons,
             min_models_per_task=min_models_per_task,
         )
         print(f"[OK] baseline artifacts integrity passed (min_models_per_task={min_models_per_task})")

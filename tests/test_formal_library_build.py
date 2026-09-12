@@ -126,13 +126,13 @@ def test_formal_freeze_entry_enforces_full_scope(monkeypatch):
                         lambda **kw: calls.append(kw) or {"ok": True})
     monkeypatch.setattr(freeze, "repo_state", lambda: ("f" * 40, []))
     full = dict(methods=list(_ALL_METHODS),
-                datasets=["pjm", "aemo_vic", "aemo_nsw"],
+                datasets=["pjm_rto", "aemo_vic", "aemo_nsw"],
                 forecast_steps=[24, 168, 720])
 
     # 少一个方法 / 少一个数据集 / 少一个长度，都不得进入底层构造
     for over, needle in [
         ({"methods": _ALL_METHODS[:-1]}, "全部已注册方法"),
-        ({"datasets": ["pjm", "aemo_vic"]}, "数据集必须恰好"),
+        ({"datasets": ["pjm_rto", "aemo_vic"]}, "数据集必须恰好"),
         ({"forecast_steps": [24, 168]}, "预测长度必须恰好"),
     ]:
         with pytest.raises(FreezeError, match=needle):
@@ -156,7 +156,7 @@ def test_formal_freeze_refuses_a_dirty_worktree(monkeypatch):
 
     with pytest.raises(FreezeError, match="未提交修改"):
         build_formal_definition(methods=list(_ALL_METHODS),
-                                datasets=["pjm", "aemo_vic", "aemo_nsw"],
+                                datasets=["pjm_rto", "aemo_vic", "aemo_nsw"],
                                 forecast_steps=[24, 168, 720])
     assert calls == [], "脏工作树时底层构造函数不得被调用"
 
@@ -172,7 +172,7 @@ def test_formal_freeze_writes_the_actual_head(monkeypatch):
     monkeypatch.setattr(freeze, "repo_state", lambda: ("d" * 40, []))
 
     build_formal_definition(methods=list(_ALL_METHODS),
-                            datasets=["pjm", "aemo_vic", "aemo_nsw"],
+                            datasets=["pjm_rto", "aemo_vic", "aemo_nsw"],
                             forecast_steps=[24, 168, 720])
 
     assert calls[0]["repo_commit"] == "d" * 40
@@ -190,7 +190,7 @@ def test_formal_freeze_refuses_a_caller_supplied_commit(monkeypatch):
 
     with pytest.raises(FreezeError, match="不接受调用方提供的 repo_commit"):
         build_formal_definition(methods=list(_ALL_METHODS),
-                                datasets=["pjm", "aemo_vic", "aemo_nsw"],
+                                datasets=["pjm_rto", "aemo_vic", "aemo_nsw"],
                                 forecast_steps=[24, 168, 720],
                                 repo_commit="e" * 40)
     assert calls == []

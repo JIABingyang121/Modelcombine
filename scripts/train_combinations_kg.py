@@ -1206,7 +1206,7 @@ FORECAST_HORIZON_LABELS: Dict[int, str] = {24: "H1", 168: "H2", 720: "H3"}
 SIGNATURE_WINDOW = 720
 #: 用户在线只需提交这两列；离线建库也只从这两列派生成员输入。
 TRAJECTORY_INPUT_COLUMNS = ("timestamp", "load")
-MODEL_LIBRARY_COUNTRY_BY_REGION = {"pjm": "US", "aemo_vic": "AU", "aemo_nsw": "AU"}
+MODEL_LIBRARY_COUNTRY_BY_REGION = {"pjm": "US", "pjm_rto": "US", "aemo_vic": "AU", "aemo_nsw": "AU"}
 #: seasonal_naive 在 KG 基础候选里被排除（扩展池节点），但它在轨迹契约下有
 #: 明确定义的多步行为，是模型库的合法成员。
 MODEL_LIBRARY_EXTRA_CANDIDATES = ("seasonal_naive",)

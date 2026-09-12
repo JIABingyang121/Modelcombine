@@ -920,11 +920,17 @@ def main() -> int:
         versions = verify_external_versions(external, args.methods)
         for method, record in versions.items():
             print(f"[final] {method} 版本已核对: {record}")
+        cutoffs = {
+            d["dataset"]: pd.Timestamp(d["training_cutoff"])
+            for d in definition["datasets"]
+            if d.get("training_cutoff")
+        }
         frame = run(
             relations=relations,
             methods=args.methods, datasets=args.datasets, windows=args.windows,
             forecast_steps=args.forecast_steps, seeds=args.seeds,
             raw_root=args.raw_root, window_plan=args.window_plan, database=args.database,
+            training_cutoff=cutoffs or None,
             candidates=args.candidates,
             external=external,
         )

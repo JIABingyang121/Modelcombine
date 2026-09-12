@@ -3,7 +3,7 @@
 冻结要点：只冻结一次、窗口必须齐全且落在数据范围内、训练截止取 T1 的输入历史起点、
 深度方法三种子而确定性方法一次。
 分析要点：一个任务 = (数据集, 测试窗口, 预测长度)，共 27 个；§8 的"总体更优"必须
-同时满足平均 MAE 更低与至少赢 14/27；任务不齐或时间戳不一致时不产出结论。
+同时满足 27 任务等权宏平均 WAPE 更低与至少赢 14/27；任务不齐或时间戳不一致时不产出结论。
 """
 from __future__ import annotations
 
@@ -111,6 +111,20 @@ def test_definition_records_dates_cutoff_windows_methods_seeds_and_columns(froze
     assert [w["label"] for w in entry["windows"]] == ["S1", "S2", "S3", "A", "T1", "T2", "T3"]
 
 
+def test_freeze_uses_explicit_b_training_cutoff_when_plan_provides_it(frozen_inputs):
+    """窗口计划带显式 B training_cutoff 时，冻结必须采用它，而不是回退 T1.history_start。"""
+    plan = json.loads(frozen_inputs["plan"].read_text())
+    origins = {o["label"]: o for o in plan["datasets"][0]["origins"]}
+    cutoff = pd.Timestamp(origins["S1"]["forecast_origin"]) + pd.Timedelta(hours=1)
+    plan["datasets"][0]["training_cutoff"] = str(cutoff)
+    frozen_inputs["plan"].write_text(json.dumps(plan), encoding="utf-8")
+
+    entry = _freeze(frozen_inputs)["datasets"][0]
+    assert entry["training_cutoff"] == str(cutoff)
+    assert entry["training_rows"] > 0
+    assert entry["training_cutoff"] != origins["T1"]["history_start"]
+
+
 def test_freeze_refuses_when_capacity_or_windows_are_missing(frozen_inputs):
     plan = json.loads(frozen_inputs["plan"].read_text())
     plan["datasets"][0]["fits"] = False
@@ -204,7 +218,7 @@ def test_analysis_produces_task_dataset_and_horizon_tables():
     json.dumps(report["by_forecast_steps"])
 
 
-def test_wins_and_mean_rank_follow_per_task_mae():
+def test_wins_and_mean_rank_follow_per_task_wape():
     frame = _long_table({METHOD_UNDER_TEST: 1.0, "xgboost": 2.0, "random_forest": 4.0})
 
     ranking = analyse(frame, _definition(set(frame["method"])))["ranking"]
@@ -231,11 +245,11 @@ def _long_table_per_task(offsets_by_task):
     return pd.concat(rows, ignore_index=True)
 
 
-def test_overall_superiority_needs_both_mean_mae_and_win_count():
-    """平均 MAE 更低但胜场只有 13/27 时，不得表述总体更优。
+def test_overall_superiority_needs_both_macro_wape_and_win_count():
+    """宏平均 WAPE 更低但胜场只有 13/27 时，不得表述总体更优。
 
     13 个任务上大幅领先（0.1 对 5.0），14 个任务上小幅落后（1.0 对 0.9）：
-    平均 MAE 明显更低，胜场却不到 14——两条必须同时满足，缺一不可。
+    宏平均 WAPE 明显更低，胜场却不到 14——两条必须同时满足，缺一不可。
     """
     tasks = [
         (dataset, window, steps)
@@ -254,9 +268,9 @@ def test_overall_superiority_needs_both_mean_mae_and_win_count():
 
     assert versus["compared_tasks"] == EXPECTED_TASKS
     assert versus["wins"] == 13 < WIN_RATE_MIN_TASKS
-    assert versus["mean_mae_lower"] is True
+    assert versus["macro_wape_lower"] is True
     assert versus["overall_better"] is False
-    assert versus["relative_mae_change_pct"] < 0
+    assert versus["relative_wape_change_pct"] < 0
 
     # 反面：把领先任务数提到 14，两条同时满足才允许表述总体更优
     offsets = {
@@ -266,6 +280,50 @@ def test_overall_superiority_needs_both_mean_mae_and_win_count():
     }
     better = analyse(_long_table_per_task(offsets), _definition([METHOD_UNDER_TEST, "xgboost"]))["conclusions"]["comparisons"][0]
     assert better["wins"] == 14 and better["overall_better"] is True
+
+
+def _long_table_scale_split():
+    """13 个小尺度任务 + 14 个大尺度任务，使平均 MAE 与宏平均 WAPE 排序相反。"""
+    rows = []
+    tasks = [
+        (dataset, window, steps)
+        for dataset in DATASETS for window in ("T1", "T2", "T3")
+        for steps in (24, 168, 720)
+    ]
+    for index, (dataset, window, steps) in enumerate(tasks):
+        stamps = pd.date_range("2026-01-01", periods=steps, freq="h")
+        if index < 13:
+            y_value, mc_error, xgb_error = 1.0, 0.9, 0.1
+        else:
+            y_value, mc_error, xgb_error = 1000.0, 100.0, 200.0
+        y = np.full(steps, y_value)
+        for method, error in ((METHOD_UNDER_TEST, mc_error), ("xgboost", xgb_error)):
+            rows.append(pd.DataFrame({
+                "timestamp": stamps, "y_true": y, "yhat": y + error,
+                "method": method, "dataset": dataset, "test_window": window,
+                "forecast_steps": steps, "seed": 42,
+            }))
+    return pd.concat(rows, ignore_index=True)
+
+
+def test_conclusions_follow_macro_wape_not_mean_mae():
+    """MAE 与宏 WAPE 排序相反时，判据必须跟宏 WAPE 走。
+
+    13 个小尺度任务上 modelcombine 两项都更差；14 个大尺度任务上两项都更好。
+    平均 MAE 更低，但宏平均 WAPE 更高——若实现仍按 MAE 判定，本测试会失败。
+    """
+    frame = _long_table_scale_split()
+    report = analyse(frame, _definition([METHOD_UNDER_TEST, "xgboost"]))
+    versus = report["conclusions"]["comparisons"][0]
+    tasks = pd.DataFrame(report["task_metrics"])
+    mean_mae = tasks.groupby("method")["mae"].mean()
+    macro_wape = tasks.groupby("method")["wape"].mean()
+
+    assert mean_mae[METHOD_UNDER_TEST] < mean_mae["xgboost"]
+    assert macro_wape[METHOD_UNDER_TEST] > macro_wape["xgboost"]
+    assert versus["wins"] == 14, "胜场必须按 WAPE 计"
+    assert versus["macro_wape_lower"] is False
+    assert versus["overall_better"] is False
 
 
 def test_incomplete_grid_and_timestamp_mismatch_block_conclusions():
@@ -339,7 +397,7 @@ def test_missing_seed_for_one_method_blocks_conclusions():
     assert report["completeness"]["passed"] is False
     assert any("种子集合" in p for p in report["completeness"]["problems"])
     versus = report["conclusions"]["comparisons"][0]
-    assert versus["mean_mae_lower"] is True
+    assert versus["macro_wape_lower"] is True
     assert versus["overall_better"] is False, "产物不完整时不得表述总体更优"
 
 

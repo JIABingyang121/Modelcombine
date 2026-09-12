@@ -58,13 +58,22 @@ _RAW_TIME_COLUMNS = ("timestamp", "ds", "datetime", "time")
 _RAW_VALUE_COLUMNS = ("load", "y", "value", "demand")
 
 
-def _read_series(path: Path) -> pd.DataFrame:
-    frame = pd.read_csv(path)
-    time_col = next((c for c in _RAW_TIME_COLUMNS if c in frame.columns), None)
-    value_col = next((c for c in _RAW_VALUE_COLUMNS if c in frame.columns), None)
-    if time_col is None or value_col is None:
-        raise ValueError(f"{path} 缺少可识别的时间/负荷列，实际列: {list(frame.columns)}")
-    frame = frame[[time_col, value_col]].rename(
+def _read_series(path: Path, *, timestamp_only: bool = False) -> pd.DataFrame:
+    header = pd.read_csv(path, nrows=0)
+    time_col = next((c for c in _RAW_TIME_COLUMNS if c in header.columns), None)
+    if time_col is None:
+        raise ValueError(f"{path} 缺少可识别的时间列，实际列: {list(header.columns)}")
+    if timestamp_only:
+        # 窗口生成只需要时间轴：不把负荷列载入内存。
+        frame = pd.read_csv(path, usecols=[time_col]).rename(
+            columns={time_col: "timestamp"}
+        )
+        frame["timestamp"] = pd.to_datetime(frame["timestamp"])
+        return frame.sort_values("timestamp").reset_index(drop=True)
+    value_col = next((c for c in _RAW_VALUE_COLUMNS if c in header.columns), None)
+    if value_col is None:
+        raise ValueError(f"{path} 缺少可识别的负荷列，实际列: {list(header.columns)}")
+    frame = pd.read_csv(path, usecols=[time_col, value_col]).rename(
         columns={time_col: "timestamp", value_col: TARGET}
     )
     frame["timestamp"] = pd.to_datetime(frame["timestamp"])
@@ -161,6 +170,8 @@ def inventory_dataset(
     signature_window: int,
     trajectories: int,
     layout: str = "features",
+    timestamp_only: bool = False,
+    training_cutoff: Optional[pd.Timestamp] = None,
 ) -> Dict[str, Any]:
     record: Dict[str, Any] = {"dataset": dataset, "layout": layout, "splits": {}, "issues": []}
     root = raw_root / dataset
@@ -174,7 +185,7 @@ def inventory_dataset(
             record["splits"][split] = {"present": False}
             record["issues"].append(f"缺少数据文件: {path}")
             continue
-        frame = _read_series(path)
+        frame = _read_series(path, timestamp_only=timestamp_only)
         duplicated = int(frame["timestamp"].duplicated().sum())
         record["splits"][split] = {
             "present": True,
@@ -182,7 +193,7 @@ def inventory_dataset(
             "start": str(frame["timestamp"].iloc[0]),
             "end": str(frame["timestamp"].iloc[-1]),
             "duplicate_timestamps": duplicated,
-            "nan_load": int(frame[TARGET].isna().sum()),
+            "nan_load": None if timestamp_only else int(frame[TARGET].isna().sum()),
             "gap_count": len(_gaps(frame["timestamp"])),
         }
         frames.append(frame)
@@ -228,6 +239,23 @@ def inventory_dataset(
             signature_window=signature_window,
             trajectories=trajectories,
         )
+        if training_cutoff is not None:
+            first_s_target = (
+                pd.Timestamp(record["origins"][0]["forecast_origin"]) + STEP
+            )
+            if training_cutoff <= pd.Timestamp(union["timestamp"].iloc[0]):
+                record["issues"].append(
+                    f"显式 B training_cutoff={training_cutoff} 不晚于数据起点"
+                )
+            if training_cutoff > first_s_target:
+                record["issues"].append(
+                    f"显式 B training_cutoff={training_cutoff} 晚于第一个 S 目标 "
+                    f"{first_s_target}"
+                )
+            record["training_cutoff"] = str(training_cutoff)
+            record["training_rows"] = int(
+                (union["timestamp"] < training_cutoff).sum()
+            )
     else:
         record["shortfall_hours"] = int(needed - run["hours"])
         record["issues"].append(
@@ -243,7 +271,7 @@ def main() -> int:
     parser.add_argument("--layout", choices=["features", "raw"], default="features",
                         help="features=建库消费的 <ds>/{train,val,test}.csv；"
                              "raw=原始负荷序列 <ds>/load.csv（冻结预测起点看这个）")
-    parser.add_argument("--datasets", nargs="+", default=["pjm", "aemo_vic", "aemo_nsw"])
+    parser.add_argument("--datasets", nargs="+", default=["pjm_rto", "aemo_vic", "aemo_nsw"])
     parser.add_argument("--forecast-steps", nargs="+", type=int,
                         default=list(SUPPORTED_FORECAST_STEPS))
     parser.add_argument("--signature-window", type=int, default=720,
@@ -251,8 +279,24 @@ def main() -> int:
     parser.add_argument("--trajectories", type=int, default=len(WINDOW_ROLES),
                         help="每个数据集×预测长度需要的不重叠轨迹条数"
                              "（§6.2：S1,S2,S3,A,T1,T2,T3 共 7 条）")
+    parser.add_argument("--training-cutoffs", nargs="+", default=[],
+                        metavar="DATASET=ISO",
+                        help="显式 B 训练截止（exclusive），例如 pjm_rto=2020-01-01T06:00:00；"
+                             "缺省时由冻结阶段回退到 T1.history_start")
     parser.add_argument("--out", type=Path, default=Path("reports/stage0/data_inventory.json"))
     args = parser.parse_args()
+
+    cutoffs: Dict[str, pd.Timestamp] = {}
+    for item in args.training_cutoffs:
+        if "=" not in item:
+            print(f"[stage0] --training-cutoffs 需要 DATASET=ISO 形式，收到 {item}")
+            return 2
+        name, value = item.split("=", 1)
+        cutoffs[name] = pd.Timestamp(value)
+    unknown = sorted(set(cutoffs) - set(args.datasets))
+    if unknown:
+        print(f"[stage0] --training-cutoffs 含未盘点数据集: {unknown}")
+        return 2
 
     raw_root = args.raw_root if args.raw_root.is_absolute() else PROJECT_ROOT / args.raw_root
     report: Dict[str, Any] = {
@@ -274,6 +318,8 @@ def main() -> int:
                 signature_window=args.signature_window,
                 trajectories=args.trajectories,
                 layout=args.layout,
+                timestamp_only=(args.layout == "raw"),
+                training_cutoff=cutoffs.get(dataset),
             )
         )
 

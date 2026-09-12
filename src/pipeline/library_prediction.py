@@ -65,7 +65,7 @@ _HISTORY_SCENARIO_FIELDS = (
     "forecast_steps",
     "freq",
 )
-_COUNTRY_BY_REGION = {"pjm": "US", "aemo_vic": "AU", "aemo_nsw": "AU"}
+_COUNTRY_BY_REGION = {"pjm": "US", "pjm_rto": "US", "aemo_vic": "AU", "aemo_nsw": "AU"}
 
 
 class LibraryPredictionError(RuntimeError):

@@ -69,7 +69,7 @@ SEED_INSENSITIVE_REASONS = {
 }
 
 #: 正式实验批准的数据集，冻结时不接受子集。
-APPROVED_DATASETS = ("pjm", "aemo_vic", "aemo_nsw")
+APPROVED_DATASETS = ("pjm_rto", "aemo_vic", "aemo_nsw")
 
 LIBRARY_WINDOWS = tuple(label for label, role in WINDOW_ROLES if role == "library")
 AUDIT_WINDOWS = tuple(label for label, role in WINDOW_ROLES if role == "audit")
@@ -102,10 +102,15 @@ def _dataset_definition(
     stamps = _library_raw_timestamps(raw_root, dataset)
     data_start, data_end = stamps.iloc[0], stamps.iloc[-1]
 
-    # §5：所有参数只能用 T1 之前的数据确定 -> 训练数据右边界取 T1 的输入历史起点（不含）
-    training_cutoff = pd.Timestamp(origins[TEST_WINDOWS[0]]["history_start"])
+    # B 训练截止：优先窗口计划里的显式值（v2 契约），缺省回退 T1.history_start（旧口径）。
+    plan_cutoff = entry.get("training_cutoff")
+    training_cutoff = (
+        pd.Timestamp(plan_cutoff)
+        if plan_cutoff is not None
+        else pd.Timestamp(origins[TEST_WINDOWS[0]]["history_start"])
+    )
     if training_cutoff <= data_start:
-        raise FreezeError(f"{dataset}: T1 之前没有可用训练数据")
+        raise FreezeError(f"{dataset}: training_cutoff 之前没有可用训练数据")
 
     for label, origin in origins.items():
         last = max(
