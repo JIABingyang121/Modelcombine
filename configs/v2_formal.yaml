@@ -1,0 +1,27 @@
+experiment: v2_formal
+random_seed: 42
+
+# D2 正式基线特征配置。
+# splits 的值是 --splits-root 下的子目录名；每个子目录含 train.csv/val.csv/test.csv。
+# 正式实验的 train 恰为 B；val=S1–S3 目标窗；test=A 目标窗。
+splits:
+  pjm_rto: pjm_rto
+  aemo_vic: aemo_vic
+  aemo_nsw: aemo_nsw
+
+features:
+  lags:
+    pjm_rto: [1, 2, 6, 12, 24]
+    aemo_vic: [1, 2, 6, 12, 24]
+    aemo_nsw: [1, 2, 6, 12, 24]
+  rolling:
+    pjm_rto: [3, 6, 12, 24]
+    aemo_vic: [3, 6, 12, 24]
+    aemo_nsw: [3, 6, 12, 24]
+  holiday:
+    pjm_rto: {enabled: true, calendar: US}
+    aemo_vic: {enabled: true, calendar: AU}
+    aemo_nsw: {enabled: true, calendar: AU}
+
+notes:
+  scope: "V2 正式实验：pjm_rto / aemo_vic / aemo_nsw；train 恰为 B。"

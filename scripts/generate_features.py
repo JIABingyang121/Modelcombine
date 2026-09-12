@@ -1,10 +1,20 @@
+"""按配置为每个数据集生成 time/lag/rolling/holiday 特征。
+
+配置的 ``splits`` 段决定要处理哪些数据集以及它们的 train/val/test 目录：
+
+- 旧口径：值为相对/绝对路径（``data/splits/pjm``），直接使用；
+- 正式实验口径：值为子目录名（``pjm_rto``），配合 ``--splits-root`` 解析到私有
+  split 目录（``<splits-root>/pjm_rto``）。新增数据集只需在配置里登记，不再改代码。
+
+特征定义（lags / rolling / holiday 日历）全部来自配置，按数据集取。
+"""
 import argparse
-import os
 from pathlib import Path
 from typing import Dict, List, Optional
-import pandas as pd
-import numpy as np
+
 import holidays
+import numpy as np
+import pandas as pd
 import yaml
 
 
@@ -80,30 +90,26 @@ def load_split(root: Path, split: str) -> pd.DataFrame:
     return pd.read_csv(path)
 
 
-def process_pjm(cfg: Dict, out_root: Path) -> None:
-    root = Path(cfg["splits"]["pjm"])
-    lags = cfg["features"]["lags"]["pjm"]
-    rolls = cfg["features"]["rolling"]["pjm"]
+def resolve_split_root(raw: str, splits_root: Optional[Path]) -> Path:
+    """``--splits-root`` 给出时把配置值当子目录名；否则按路径使用。"""
+    root = Path(raw)
+    if splits_root is not None and not root.is_absolute():
+        return Path(splits_root) / raw
+    return root
+
+
+def process_dataset(
+    dataset: str, cfg: Dict, out_root: Path, splits_root: Optional[Path] = None
+) -> None:
+    root = resolve_split_root(cfg["splits"][dataset], splits_root)
+    lags = cfg["features"]["lags"][dataset]
+    rolls = cfg["features"]["rolling"][dataset]
+    calendar = cfg["features"]["holiday"][dataset].get("calendar", "US")
     splits = {}
     for split in ["train", "val", "test"]:
         df = load_split(root, split)
         df = add_time_features(df, "timestamp")
-        df = add_holiday(df, "timestamp", cfg["features"]["holiday"]["pjm"].get("calendar", "US"))
-        df = add_lag_roll_grouped(df, entity_cols=select_entity_cols(df, ["region"]), time_col="timestamp", target_col="load", lags=lags, roll_windows=rolls)
-        df = df.dropna().reset_index(drop=True)
-        splits[split] = df
-    save_splits(out_root, "pjm", splits)
-
-
-def process_aemo_vic(cfg: Dict, out_root: Path) -> None:
-    root = Path(cfg["splits"]["aemo_vic"])
-    lags = cfg["features"]["lags"]["aemo_vic"]
-    rolls = cfg["features"]["rolling"]["aemo_vic"]
-    splits = {}
-    for split in ["train", "val", "test"]:
-        df = load_split(root, split)
-        df = add_time_features(df, "timestamp")
-        df = add_holiday(df, "timestamp", cfg["features"]["holiday"]["aemo_vic"].get("calendar", "AU"))
+        df = add_holiday(df, "timestamp", calendar)
         df = add_lag_roll_grouped(
             df,
             entity_cols=select_entity_cols(df, ["region"]),
@@ -114,34 +120,18 @@ def process_aemo_vic(cfg: Dict, out_root: Path) -> None:
         )
         df = df.dropna().reset_index(drop=True)
         splits[split] = df
-    save_splits(out_root, "aemo_vic", splits)
-
-
-def process_aemo_nsw(cfg: Dict, out_root: Path) -> None:
-    root = Path(cfg["splits"]["aemo_nsw"])
-    lags = cfg["features"]["lags"]["aemo_nsw"]
-    rolls = cfg["features"]["rolling"]["aemo_nsw"]
-    splits = {}
-    for split in ["train", "val", "test"]:
-        df = load_split(root, split)
-        df = add_time_features(df, "timestamp")
-        df = add_holiday(df, "timestamp", cfg["features"]["holiday"]["aemo_nsw"].get("calendar", "AU"))
-        df = add_lag_roll_grouped(
-            df,
-            entity_cols=select_entity_cols(df, ["region"]),
-            time_col="timestamp",
-            target_col="load",
-            lags=lags,
-            roll_windows=rolls,
-        )
-        df = df.dropna().reset_index(drop=True)
-        splits[split] = df
-    save_splits(out_root, "aemo_nsw", splits)
+    save_splits(out_root, dataset, splits)
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/exp_comparativetest1.yaml", help="配置文件路径")
+    parser.add_argument(
+        "--splits-root",
+        type=Path,
+        default=None,
+        help="可选：把配置里的 splits 值当作该目录下的子目录名（正式实验私有 split 目录）",
+    )
     parser.add_argument("--out", default="data/features", help="输出特征目录")
     args = parser.parse_args()
 
@@ -149,9 +139,8 @@ def main():
     out_root = Path(args.out)
     ensure_dir(out_root)
 
-    process_pjm(cfg, out_root)
-    process_aemo_vic(cfg, out_root)
-    process_aemo_nsw(cfg, out_root)
+    for dataset in cfg["splits"]:
+        process_dataset(dataset, cfg, out_root, splits_root=args.splits_root)
 
 
 if __name__ == "__main__":
