@@ -188,6 +188,24 @@ def test_gate_reads_the_csv_again_not_the_old_database(workspace):
         assert_training_ends_before_s1(workspace["features"], DATASETS, starts)
 
 
+def test_gate_uses_explicit_b_training_cutoff_when_present(tmp_path):
+    """窗口计划带显式 B training_cutoff 时，门控必须用它而不是 S1 历史起点。"""
+    plan = tmp_path / "plan.json"
+    _write_window_plan(plan)
+    payload = json.loads(plan.read_text())
+    for entry in payload["datasets"]:
+        entry["training_cutoff"] = "2026-04-01 00:00:00"
+    plan.write_text(json.dumps(payload), encoding="utf-8")
+
+    features = tmp_path / "features"
+    _write_train(features, end="2026-03-15 00:00:00")  # 晚于 S1、早于显式 cutoff
+
+    starts = s1_history_starts(plan, DATASETS)
+    assert starts["pjm"] == pd.Timestamp("2026-04-01 00:00:00")
+    ranges = assert_training_ends_before_s1(features, DATASETS, starts)
+    assert ranges["pjm"]["end"] == "2026-03-15 00:00:00"
+
+
 # ------------------------------------------------------------------ 完整性
 def test_missing_candidate_in_source_is_refused(workspace):
     source = _build_source(workspace["tmp"] / "partial", models=(CANDIDATES[0],))

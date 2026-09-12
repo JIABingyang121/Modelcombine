@@ -73,7 +73,11 @@ class ImportError_(RuntimeError):
 def s1_history_starts(
     window_plan: Path, datasets: Sequence[str]
 ) -> Dict[str, pd.Timestamp]:
-    """从 Stage 0 权威窗口计划取每个数据集的 S1 输入历史起点。"""
+    """从 Stage 0 权威窗口计划取每个数据集的训练截止（exclusive 上界）。
+
+    优先用计划里显式的 B ``training_cutoff``（v2 契约）；缺省回退 S1 输入历史起点
+    （旧口径）。
+    """
     plan = json.loads(Path(window_plan).read_text(encoding="utf-8"))
     by_dataset = {entry["dataset"]: entry for entry in plan.get("datasets", [])}
     starts: Dict[str, pd.Timestamp] = {}
@@ -81,6 +85,9 @@ def s1_history_starts(
         entry = by_dataset.get(dataset)
         if entry is None:
             raise ImportError_(f"窗口计划里没有数据集 {dataset}: {window_plan}")
+        if entry.get("training_cutoff") is not None:
+            starts[dataset] = pd.Timestamp(entry["training_cutoff"])
+            continue
         origins = {origin["label"]: origin for origin in entry.get("origins", [])}
         if "S1" not in origins:
             raise ImportError_(f"{dataset} 的窗口计划里没有 S1: {window_plan}")
@@ -122,7 +129,8 @@ def assert_training_ends_before_s1(
         start = starts[dataset]
         if not last < start:
             raise ImportError_(
-                f"{dataset} 的训练数据截止到 {last}，未严格早于 S1 输入历史起点 {start}；"
+                f"{dataset} 的训练数据截止到 {last}，未严格早于训练截止 {start}"
+                "（显式 B training_cutoff，缺省为 S1 输入历史起点）；"
                 "这批基础模型不能复用到当前窗口计划。本入口不截断、不重新切分"
             )
         ranges[dataset] = {

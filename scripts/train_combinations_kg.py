@@ -1593,10 +1593,8 @@ def _build_library_task(
         country=country,
         label=f"{label} test",
     )
-    if test_skipped:
-        raise RuntimeError(
-            f"model library build failed for {label}: 候选在 test 起点无法产出轨迹 {test_skipped}"
-        )
+    # A 只用于冻结后审计最终组合：未入选候选在 A 起点产不出轨迹时记录原因，不阻断
+    # S 选型；入选成员是否通过 A 在组合冻结后判定（见下），不允许因 A 失败改选第二名。
 
     model_cols = sorted(eligible)
     candidate_maes = _library_candidate_maes(val_matrix, model_cols)
@@ -1620,7 +1618,10 @@ def _build_library_task(
 
     cols = list(dict.fromkeys(list(safe_models) + ["y", "timestamp"]))
     dval = val_matrix.rename(columns={"target_timestamp": "timestamp"})[cols]
-    dtest = test_matrix.rename(columns={"target_timestamp": "timestamp"})[cols]
+    audit_models = [m for m in safe_models if m in test_matrix.columns]
+    dtest = test_matrix.rename(columns={"target_timestamp": "timestamp"})[
+        audit_models + ["y", "timestamp"]
+    ]
 
     # 非空子集全枚举：不写死二/三模型上限。相同实际成员只保留 validation 最小者。
     #
@@ -1679,6 +1680,16 @@ def _build_library_task(
     )
     best = candidates_by_members[best_key]
     predictor = best["predictor"]
+
+    # 组合与权重已由 S 冻结：入选成员必须能在 A 起点产出完整轨迹，否则在写产物/写库前
+    # 硬失败；未入选候选的 A 失败只记录原因，不影响选型。
+    failed_on_audit = {entry["model_type"]: entry["reason"] for entry in test_skipped}
+    missing_members = [m for m in predictor.member_ids if m not in test_matrix.columns]
+    if missing_members:
+        raise RuntimeError(
+            f"model library build failed for {label}: 最终组合成员在 A 起点无法产出轨迹 "
+            f"{[(m, failed_on_audit.get(m)) for m in missing_members]}"
+        )
 
     freq = _infer_freq(dval["timestamp"])
     val_history = val_frame.iloc[: len(val_frame) - forecast_steps]
@@ -1776,6 +1787,7 @@ def _build_library_task(
         "safe_models": list(safe_models),
         "declared_candidates": list(model_types),
         "skipped_candidates": skipped,
+        "audit_skipped_candidates": test_skipped,
         "candidate_validation_mae": candidate_maes,
         "filter_excluded": list(filter_meta.get("final_excluded", [])),
         "requested_members": best["requested_members"],

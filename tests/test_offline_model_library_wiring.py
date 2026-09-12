@@ -257,6 +257,82 @@ def test_build_rejects_non_replayable_combination(tmp_path):
     store.close()
 
 
+def _audit_failure_wrapper(tck, victim):
+    """让 victim 在 A（test）起点产不出轨迹，val 不受影响。"""
+    real = tck._library_trajectory_matrix
+
+    def wrapper(candidates, *, frame, forecast_steps, country, label):
+        matrix, calendar, skipped, origin = real(
+            candidates, frame=frame, forecast_steps=forecast_steps,
+            country=country, label=label,
+        )
+        if label.endswith("test") and victim in matrix.columns:
+            matrix = matrix.drop(columns=[victim])
+            skipped = list(skipped) + [
+                {"model_type": victim, "reason": "A 起点注入 non-finite（测试装置）"}
+            ]
+        return matrix, calendar, skipped, origin
+
+    return real, wrapper
+
+
+def test_audit_failure_of_unselected_candidate_does_not_change_selection(tmp_path):
+    """未入选候选在 A 起点失败：只记录原因，不改成员、权重与 validation 指标。"""
+    import scripts.train_combinations_kg as tck
+
+    baseline = run_build(tmp_path / "base", [STEPS], rows=ROWS)
+    task_a = task_of(baseline["report"], STEPS)
+    selected_types = [m.split("__")[2] for m in task_a["effective_members"]]
+    victim = "seasonal_naive"
+    assert victim in task_a["filter_excluded"] and victim not in selected_types
+
+    raw_root, db, _frames = _prepare(tmp_path / "victim")
+    store = ModelStore(str(db))
+    real, wrapper = _audit_failure_wrapper(tck, victim)
+    tck._library_trajectory_matrix = wrapper
+    try:
+        task_b = tck._build_library_task(
+            store, dataset=DATASET, forecast_steps=STEPS, model_types=FIXTURE_CANDIDATES,
+            raw_root=raw_root, artifact_dir=tmp_path / "victim" / "combo_artifacts",
+            filter_threshold=2.0,
+        )
+    finally:
+        tck._library_trajectory_matrix = real
+        store.close()
+
+    assert [m.split("__")[2] for m in task_b["effective_members"]] == selected_types
+    assert task_b["linear_weights"] == pytest.approx(task_a["linear_weights"], abs=1e-12)
+    assert task_b["validation_mae"] == pytest.approx(task_a["validation_mae"], abs=1e-12)
+    assert [entry["model_type"] for entry in task_b["audit_skipped_candidates"]] == [victim]
+
+
+def test_audit_failure_of_selected_member_stops_before_db_write(tmp_path):
+    """入选成员在 A 起点失败：写库前硬失败，且不得改选第二名组合。"""
+    import scripts.train_combinations_kg as tck
+
+    baseline = run_build(tmp_path / "base", [STEPS], rows=ROWS)
+    task_a = task_of(baseline["report"], STEPS)
+    victim = task_a["effective_members"][0].split("__")[2]
+
+    raw_root, db, _frames = _prepare(tmp_path / "victim")
+    store = ModelStore(str(db))
+    real, wrapper = _audit_failure_wrapper(tck, victim)
+    tck._library_trajectory_matrix = wrapper
+    try:
+        with pytest.raises(RuntimeError, match="最终组合成员在 A 起点无法产出轨迹"):
+            tck._build_library_task(
+                store, dataset=DATASET, forecast_steps=STEPS, model_types=FIXTURE_CANDIDATES,
+                raw_root=raw_root, artifact_dir=tmp_path / "victim" / "combo_artifacts",
+                filter_threshold=2.0,
+            )
+    finally:
+        tck._library_trajectory_matrix = real
+
+    for table in ("scenarios", "data_profiles", "combinations", "scenario_data_combinations"):
+        assert store.connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
+    store.close()
+
+
 def test_build_fails_loudly_when_raw_data_is_missing(tmp_path):
     tmp_path.mkdir(parents=True, exist_ok=True)
     out_root = tmp_path / "out"
