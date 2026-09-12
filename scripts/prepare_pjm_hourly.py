@@ -2,13 +2,15 @@
 
 来源与语义（审查结论）
 --------------------
-- ``data/pjm/load.csv`` 由 ``scripts/convert_pjm.py`` 从 Kaggle
-  ``robikscube/hourly-energy-consumption`` 的 ``PJME_hourly.csv``（列
-  ``Datetime,PJME_MW``）转换而来；``scripts/download_pjm.py`` 负责取该文件。
+- 正式输入为 Kaggle ``robikscube/hourly-energy-consumption`` **v3** 的原始
+  ``PJME_hourly.csv``（列 ``Datetime,PJME_MW``），版本化保存在
+  ``data/external/pjm_raw_20260912/PJME_hourly.csv``。该文件按“日块”乱序存放，
+  必须用**稳定排序**保留同一时间戳两行的原始先后顺序。
 - 时间戳为 **hour ending**，时区为 **Eastern Prevailing Time（EST/EDT，随
-  夏令时切换）**。依据：PJM 官方 Data Miner API 指南对 ``_ept`` 的定义
-  （Eastern Prevailing Time），以及数据本身春季跳时缺口恰为
-  ``02:00->04:00``、秋季重复标签恰为 ``02:00``——两者只与 hour-ending 唯一一致。
+  夏令时切换）**。依据：PJM 官方规范（春季跳过 HE 03、秋季重复 HE 02、EPT），
+  以及数据本身春季跳时缺口恰为 ``02:00->04:00``、秋季重复标签恰为 ``02:00``。
+- 不要使用派生的 ``data/pjm/load.csv``：旧 ``convert_pjm.py`` 的非稳定排序会
+  打乱秋季重复行的先后顺序（本机实测 2014-11-02 已被打乱）。
 
 转换规则
 --------
@@ -25,7 +27,7 @@
 正式入口::
 
     python -m scripts.prepare_pjm_hourly \
-        --input data/pjm/load.csv \
+        --input data/external/pjm_raw_20260912/PJME_hourly.csv \
         --start 2014-01-01 \
         --out-root data/processed/pjm_hourly_2014_2018
 """
@@ -55,33 +57,45 @@ DST_PARSING_RULE = (
     "(first occurrence DST, second occurrence STANDARD)"
 )
 SOURCE_DESCRIPTION = (
-    "PJME_hourly.csv (Kaggle robikscube/hourly-energy-consumption v3, "
+    "PJME_hourly.csv v3 (Kaggle robikscube/hourly-energy-consumption, "
     "from PJM website hourly load)"
 )
+RAW_INPUT_DEFAULT = "data/external/pjm_raw_20260912/PJME_hourly.csv"
+RAW_DATETIME_COLUMN = "Datetime"
+RAW_LOAD_COLUMN = "PJME_MW"
 OUTPUT_DATASET_DIR = "pjm"
 DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 HOUR = pd.Timedelta(hours=1)
 
 
 def _load_input(path: Path) -> pd.DataFrame:
-    """读取并校验 ``timestamp,load``；不做列名猜测。"""
+    """读取原始 ``PJME_hourly.csv``（``Datetime,PJME_MW``）；不做列名猜测。
+
+    原始文件按“日块”乱序存放，这里按 ``Datetime`` 做**稳定排序**，从而保留同一
+    时间戳两行（秋季回拨）的原始先后顺序。
+    """
     frame = pd.read_csv(path)
-    missing = [c for c in ("timestamp", "load") if c not in frame.columns]
+    missing = [
+        c for c in (RAW_DATETIME_COLUMN, RAW_LOAD_COLUMN) if c not in frame.columns
+    ]
     if missing:
         raise ValueError(f"{path} 缺少必填列: {missing}")
 
-    ts = pd.to_datetime(frame["timestamp"], format=DATETIME_FORMAT, errors="coerce")
+    ts = pd.to_datetime(
+        frame[RAW_DATETIME_COLUMN], format=DATETIME_FORMAT, errors="coerce"
+    )
     if ts.isna().any():
-        bad = frame.loc[ts.isna(), "timestamp"].astype(str).head(5).tolist()
-        raise ValueError(f"{path} timestamp 无法解析: {bad}")
+        bad = frame.loc[ts.isna(), RAW_DATETIME_COLUMN].astype(str).head(5).tolist()
+        raise ValueError(f"{path} {RAW_DATETIME_COLUMN} 无法解析: {bad}")
 
-    load = pd.to_numeric(frame["load"], errors="coerce")
+    load = pd.to_numeric(frame[RAW_LOAD_COLUMN], errors="coerce")
     nonfinite = load.isna() | ~np.isfinite(load.to_numpy(dtype="float64", na_value=np.nan))
     if nonfinite.any():
-        bad = frame.loc[nonfinite, "load"].astype(str).head(5).tolist()
-        raise ValueError(f"{path} load 存在非数字或非有限值: {bad}")
+        bad = frame.loc[nonfinite, RAW_LOAD_COLUMN].astype(str).head(5).tolist()
+        raise ValueError(f"{path} {RAW_LOAD_COLUMN} 存在非数字或非有限值: {bad}")
 
-    return pd.DataFrame({"timestamp": ts, "load": load.astype(float)})
+    out = pd.DataFrame({"timestamp": ts, "load": load.astype(float)})
+    return out.sort_values("timestamp", kind="mergesort").reset_index(drop=True)
 
 
 def _localize_interval_starts(ts_start: pd.Series) -> pd.DatetimeIndex:
@@ -177,9 +191,13 @@ def prepare(
     else:
         output_gaps = 0
 
-    load_one_to_one = bool(
-        sorted(out["load"].tolist()) == sorted(frame["load"].tolist())
-        and len(out) == len(frame)
+    load_multiset_preserved = bool(
+        len(out) == len(frame)
+        and sorted(out["load"].tolist()) == sorted(frame["load"].tolist())
+    )
+    load_sequence_preserved = bool(
+        len(out) == len(frame)
+        and out["load"].tolist() == frame["load"].tolist()
     )
 
     out_path = out_root / OUTPUT_DATASET_DIR / "load.csv"
@@ -213,7 +231,8 @@ def prepare(
             "gaps": output_gaps,
             "step_hours": 1,
         },
-        "load_one_to_one": load_one_to_one,
+        "load_multiset_preserved": load_multiset_preserved,
+        "load_sequence_preserved": load_sequence_preserved,
         "output_file": str(out_path),
     }
 
@@ -229,7 +248,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description="PJM hour-ending EPT → 连续固定 EST/UTC-5 小时序列（唯一实现）"
     )
-    parser.add_argument("--input", default="data/pjm/load.csv", help="输入 load.csv")
+    parser.add_argument(
+        "--input",
+        default=RAW_INPUT_DEFAULT,
+        help="原始 PJME_hourly.csv（Datetime,PJME_MW）",
+    )
     parser.add_argument("--start", default="2014-01-01", help="区间起点下界（含）")
     parser.add_argument(
         "--out-root",

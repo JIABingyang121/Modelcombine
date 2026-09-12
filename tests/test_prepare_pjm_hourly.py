@@ -1,7 +1,10 @@
-"""PJM hour-ending EPT → 连续固定 EST/UTC-5 的契约测试。
+"""PJM hour-ending EPT → 连续固定 EST/UTC-5 的合成契约测试。
 
-覆盖：普通小时、春季跳时闭合、秋季重复小时分别保留且不平均、严格逐小时连续、
-非 DST 缺口失败、原始 CSV 字节不变、真实 2014-2018 数据 40199 行且无缺口。
+仅使用受控合成装置（原始格式 ``Datetime,PJME_MW``），不读取任何机器本地的
+真实 ``data/pjm/load.csv``；真实数据的 40199 行验收属于转换质量门，不在 pytest。
+
+覆盖：普通小时、春季跳时闭合、秋季重复小时分别保留且不平均、稳定排序保留重复
+行原始顺序、严格逐小时连续、非 DST 缺口失败、CLI 输出与原始字节不变。
 """
 from __future__ import annotations
 
@@ -13,11 +16,10 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from scripts.prepare_pjm_hourly import prepare, transform
+from scripts.prepare_pjm_hourly import _load_input, prepare, transform
 
 ROOT = Path(__file__).resolve().parents[1]
-HEADER = "timestamp,load,region,region_type"
-REAL_INPUT = ROOT / "data" / "pjm" / "load.csv"
+RAW_HEADER = "Datetime,PJME_MW"
 HOUR = pd.Timedelta(hours=1)
 
 
@@ -27,10 +29,10 @@ def _frame(labels, loads):
     )
 
 
-def _write_csv(path: Path, labels, loads) -> None:
-    lines = [HEADER]
+def _write_raw_csv(path: Path, labels, loads) -> None:
+    lines = [RAW_HEADER]
     for label, value in zip(labels, loads):
-        lines.append(f"{label},{float(value)},PJME,real_grid")
+        lines.append(f"{label},{float(value)}")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -87,15 +89,36 @@ def test_fall_back_duplicate_hours_kept_separate():
     assert out["timestamp"].nunique() == 5
 
 
-def test_duplicate_hour_loads_are_not_averaged():
+def test_duplicate_hour_loads_are_not_averaged_and_keep_order():
     frame = _frame(
         ["2014-11-02 01:00:00", "2014-11-02 02:00:00", "2014-11-02 02:00:00"],
         [20, 100, 200],
     )
     out = transform(frame)
-    loads = sorted(out["load"].tolist())
-    assert loads == [20.0, 100.0, 200.0]
-    assert 150.0 not in loads
+    # 第 1 个重复行=DST → EST 01:00；第 2 个重复行=STANDARD → EST 02:00
+    assert out["timestamp"].dt.strftime("%Y-%m-%d %H:%M").tolist() == [
+        "2014-11-02 00:00",
+        "2014-11-02 01:00",
+        "2014-11-02 02:00",
+    ]
+    assert out["load"].tolist() == [20.0, 100.0, 200.0]
+    assert 150.0 not in out["load"].tolist()
+
+
+def test_stable_sort_preserves_duplicate_row_order(tmp_path):
+    src = tmp_path / "PJME_hourly.csv"
+    src.write_text(
+        RAW_HEADER + "\n"
+        "2014-11-02 02:00:00,100.0\n"
+        "2014-11-02 02:00:00,200.0\n"
+        "2014-11-02 01:00:00,50.0\n"
+        "2014-11-02 03:00:00,300.0\n",
+        encoding="utf-8",
+    )
+    frame = _load_input(src)
+    assert frame["timestamp"].is_monotonic_increasing
+    dup = frame[frame["timestamp"] == pd.Timestamp("2014-11-02 02:00:00")]
+    assert dup["load"].tolist() == [100.0, 200.0]
 
 
 def test_output_is_strictly_hourly_continuous():
@@ -112,20 +135,20 @@ def test_output_is_strictly_hourly_continuous():
 
 
 def test_non_dst_gap_fails(tmp_path):
-    src = tmp_path / "load.csv"
-    _write_csv(src, ["2014-06-01 01:00:00", "2014-06-01 03:00:00"], [1, 2])
+    src = tmp_path / "PJME_hourly.csv"
+    _write_raw_csv(src, ["2014-06-01 01:00:00", "2014-06-01 03:00:00"], [1, 2])
     with pytest.raises(ValueError) as excinfo:
         prepare(input_path=src, start="2014-01-01", out_root=tmp_path / "out")
     assert "非 DST 缺口" in str(excinfo.value)
 
 
 def test_cli_outputs_and_raw_bytes_unchanged(tmp_path):
-    src = tmp_path / "load.csv"
+    src = tmp_path / "PJME_hourly.csv"
     out_root = tmp_path / "out"
     labels = pd.date_range("2014-06-01 00:00", "2014-06-01 05:00", freq="h").strftime(
         "%Y-%m-%d %H:%M:%S"
     )
-    _write_csv(src, labels, range(6))
+    _write_raw_csv(src, labels, range(6))
     before = src.read_bytes()
 
     proc = subprocess.run(
@@ -163,19 +186,5 @@ def test_cli_outputs_and_raw_bytes_unchanged(tmp_path):
     assert report["output"]["rows"] == 6
     assert report["output"]["gaps"] == 0
     assert report["output"]["duplicate_timestamps"] == 0
-    assert report["load_one_to_one"] is True
-
-
-@pytest.mark.skipif(not REAL_INPUT.exists(), reason="本机缺少 data/pjm/load.csv")
-def test_real_2014_2018_data_is_40199_rows_without_gaps(tmp_path):
-    report, _ = prepare(input_path=REAL_INPUT, start="2014-01-01", out_root=tmp_path)
-    assert report["input"]["rows"] == 40199
-    assert report["input"]["duplicate_labels"] == 4
-    assert report["input"]["dst_expanded_labels"] == 4
-    assert report["input"]["non_dst_gaps"] == []
-    assert report["output"]["rows"] == 40199
-    assert report["output"]["first_timestamp"] == "2014-01-01 01:00:00"
-    assert report["output"]["last_timestamp"] == "2018-08-02 23:00:00"
-    assert report["output"]["gaps"] == 0
-    assert report["output"]["duplicate_timestamps"] == 0
-    assert report["load_one_to_one"] is True
+    assert report["load_multiset_preserved"] is True
+    assert report["load_sequence_preserved"] is True
