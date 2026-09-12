@@ -48,6 +48,30 @@ METHODS = ("modelcombine", "random_forest", "xgboost")
 FIXTURE_CANDIDATES = ("lgbm_reg", "seasonal_naive")
 
 
+def _quality_report(tmp_path: Path, raw_root: Path, dataset: str) -> Path:
+    """从原始序列时间列造一份最小 D0 质量报告。"""
+    stamps = pd.to_datetime(
+        pd.read_csv(raw_root / dataset / "load.csv", usecols=["timestamp"])["timestamp"]
+    )
+    payload = {
+        "stage": "D0",
+        "datasets": {
+            dataset: {
+                "source": "synthetic://fixture",
+                "timezone_semantics": "fixed_UTC+10_AEST",
+                "timestamp_semantics": "interval_end",
+                "load_field": "load",
+                "rows": int(len(stamps)),
+                "first_timestamp": str(stamps.iloc[0]),
+                "last_timestamp": str(stamps.iloc[-1]),
+            }
+        },
+    }
+    path = tmp_path / "d0_quality_report.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
 @pytest.fixture
 def frozen_inputs(tmp_path):
     """窗口计划 + 一个内部完整的模型库（DATASET 一个数据集、STEPS 一个长度）。
@@ -65,7 +89,12 @@ def frozen_inputs(tmp_path):
         tmp_path / "library", datasets=[DATASET], forecast_steps=[STEPS],
         candidates=list(FIXTURE_CANDIDATES),
     )
-    return {"raw_root": raw_root, "plan": plan_path, "library": library}
+    return {
+        "raw_root": raw_root,
+        "plan": plan_path,
+        "library": library,
+        "quality_report": _quality_report(tmp_path, raw_root, DATASET),
+    }
 
 
 def _freeze(frozen_inputs, **over):
@@ -77,6 +106,7 @@ def _freeze(frozen_inputs, **over):
         candidates=list(FIXTURE_CANDIDATES),
         pipeline_config=frozen_inputs["library"]["pipeline"],
         library_report=frozen_inputs["library"]["report"],
+        data_quality_report=frozen_inputs["quality_report"],
     )
     kwargs.update(over)
     return build_definition(**kwargs)
@@ -109,6 +139,36 @@ def test_definition_records_dates_cutoff_windows_methods_seeds_and_columns(froze
     assert entry["training_cutoff"] == origins["T1"]["history_start"]
     assert entry["training_rows"] > 0
     assert [w["label"] for w in entry["windows"]] == ["S1", "S2", "S3", "A", "T1", "T2", "T3"]
+
+    # D0 数据语义必须逐项进入定义
+    assert entry["source"] == "synthetic://fixture"
+    assert entry["timezone_semantics"] == "fixed_UTC+10_AEST"
+    assert entry["timestamp_semantics"] == "interval_end"
+    assert entry["load_field"] == "load"
+    assert definition["data_quality_report"].endswith("d0_quality_report.json")
+
+    # 主指标与总体优于判据；每 method×seed 行数 = 数据集 × 测试窗 × Σ预测长度
+    evaluation = definition["evaluation"]
+    assert evaluation["task_definition"] == ["dataset", "test_window", "forecast_steps"]
+    assert evaluation["primary_metric"] == "wape"
+    assert evaluation["expected_tasks"] == 3
+    assert evaluation["aggregate"] == "3 个任务等权宏平均 WAPE"
+    assert evaluation["overall_better_min_wins"] == WIN_RATE_MIN_TASKS
+    assert definition["expected_result_rows"] == 3 * STEPS
+    assert definition["expected_result_rows_per_seed"] == 3 * STEPS
+    assert definition["expected_result_rows_mole"] == 0
+    assert definition["expected_result_rows_total"] == len(METHODS) * 3 * STEPS
+
+
+def test_freeze_requires_and_validates_data_quality_report(frozen_inputs):
+    with pytest.raises(FreezeError, match="data-quality-report"):
+        _freeze(frozen_inputs, data_quality_report=None)
+
+    payload = json.loads(frozen_inputs["quality_report"].read_text())
+    payload["datasets"][DATASET]["rows"] = 1
+    frozen_inputs["quality_report"].write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(FreezeError, match="行数"):
+        _freeze(frozen_inputs)
 
 
 def test_freeze_uses_explicit_b_training_cutoff_when_plan_provides_it(frozen_inputs):
@@ -162,6 +222,7 @@ def test_freeze_does_not_overwrite_an_existing_definition(tmp_path, frozen_input
             "--forecast-steps", str(STEPS), "--out", str(out),
             "--database", str(frozen_inputs["library"]["database"]),
             "--library-report", str(frozen_inputs["library"]["report"]),
+            "--data-quality-report", str(frozen_inputs["quality_report"]),
             "--candidates", *FIXTURE_CANDIDATES,
         ],
         cwd=REPO_ROOT, capture_output=True, text=True,

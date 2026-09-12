@@ -35,6 +35,7 @@ from src.models.external_adapters import (
     OFFICIAL_FIXED_SEED,
     REQUIRED_HYPERPARAMETERS,
 )
+from scripts.analyze_final_comparison import WIN_RATE_MIN_TASKS
 from scripts.stage0_data_inventory import FORECAST_HORIZONS, WINDOW_ROLES
 from scripts.library_preflight import LibraryIncomplete, assert_library_complete
 from scripts.train_baselines import load_pipeline_model_params
@@ -81,7 +82,10 @@ class FreezeError(RuntimeError):
 
 
 def _dataset_definition(
-    raw_root: Path, window_plan: Dict[str, Any], dataset: str
+    raw_root: Path,
+    window_plan: Dict[str, Any],
+    dataset: str,
+    quality: Mapping[str, Any] | None,
 ) -> Dict[str, Any]:
     entry = next(
         (e for e in window_plan["datasets"] if e["dataset"] == dataset), None
@@ -90,6 +94,13 @@ def _dataset_definition(
         raise FreezeError(f"窗口计划里没有数据集 {dataset}")
     if not entry.get("fits", False):
         raise FreezeError(f"{dataset}: 窗口计划判定容量不足，不能冻结实验")
+
+    if quality is None:
+        raise FreezeError(f"{dataset}: D0 质量报告里没有这个数据集")
+    required_semantics = ("source", "timezone_semantics", "timestamp_semantics", "load_field")
+    absent = [key for key in required_semantics if key not in quality]
+    if absent:
+        raise FreezeError(f"{dataset}: D0 质量报告缺少数据语义字段 {absent}")
 
     origins = {o["label"]: o for o in entry["origins"]}
     missing = [
@@ -101,6 +112,19 @@ def _dataset_definition(
     # 冻结只需要数据覆盖范围，只读时间列——不把任何窗口的负荷值载入内存
     stamps = _library_raw_timestamps(raw_root, dataset)
     data_start, data_end = stamps.iloc[0], stamps.iloc[-1]
+
+    # D0 报告必须与实际原始序列逐项一致：行数、起止时间。
+    if int(quality.get("rows", -1)) != int(len(stamps)):
+        raise FreezeError(
+            f"{dataset}: D0 报告行数 {quality.get('rows')} 与实际原始序列 {len(stamps)} 不一致"
+        )
+    reported_range = (str(quality.get("first_timestamp")), str(quality.get("last_timestamp")))
+    actual_range = (str(data_start), str(data_end))
+    if reported_range != actual_range:
+        raise FreezeError(
+            f"{dataset}: D0 报告时间范围 {reported_range[0]}~{reported_range[1]} "
+            f"与实际 {actual_range[0]}~{actual_range[1]} 不一致"
+        )
 
     # B 训练截止：优先窗口计划里的显式值（v2 契约），缺省回退 T1.history_start（旧口径）。
     plan_cutoff = entry.get("training_cutoff")
@@ -123,6 +147,10 @@ def _dataset_definition(
 
     return {
         "dataset": dataset,
+        "source": quality["source"],
+        "timezone_semantics": quality["timezone_semantics"],
+        "timestamp_semantics": quality["timestamp_semantics"],
+        "load_field": quality["load_field"],
         "data_start": str(data_start),
         "data_end": str(data_end),
         "rows": int(len(stamps)),
@@ -249,6 +277,7 @@ def build_definition(
     *,
     raw_root: Path, window_plan_path: Path, datasets: Sequence[str],
     methods: Sequence[str], forecast_steps: Sequence[int], database: Path | None,
+    data_quality_report: Path | None = None,
     external_config: Mapping[str, Any] | None = None,
     candidates: Sequence[str] = (),
     repo_commit: str | None = None,
@@ -278,6 +307,14 @@ def build_definition(
             "正式冻结必须提供 --library-report：时间戳策略与 27 任务矩阵都记在建库报告里，"
             "没有它就没法证明这个库是用当前口径建的"
         )
+    if data_quality_report is None:
+        raise FreezeError(
+            "正式冻结必须提供 --data-quality-report：数据来源与时区/时间语义以 D0 质量报告为准"
+        )
+    quality_payload = json.loads(Path(data_quality_report).read_text(encoding="utf-8"))
+    quality_datasets = quality_payload.get("datasets")
+    if not isinstance(quality_datasets, dict):
+        raise FreezeError(f"--data-quality-report 缺少 datasets 段: {data_quality_report}")
     try:
         library = assert_library_complete(
             database, datasets=datasets, forecast_steps=forecast_steps,
@@ -289,7 +326,8 @@ def build_definition(
     external = _frozen_external(methods, external_config)
     plan = json.loads(window_plan_path.read_text(encoding="utf-8"))
     definitions = [
-        _dataset_definition(raw_root, plan, dataset) for dataset in datasets
+        _dataset_definition(raw_root, plan, dataset, quality_datasets.get(dataset))
+        for dataset in datasets
     ]
     # 官方内部硬编码种子的方法（iTransformer 的 fix_seed=2023），结果表记的就是那个值，
     # 定义里必须记同一个值，否则完整性核对必然判"种子集合不符"。
@@ -309,6 +347,12 @@ def build_definition(
         method: SEED_INSENSITIVE_REASONS[method]
         for method in methods if method in SEED_INSENSITIVE_REASONS
     }
+    expected_tasks = len(datasets) * len(TEST_WINDOWS) * len(forecast_steps)
+    per_seed_rows = (
+        len(datasets) * len(TEST_WINDOWS) * sum(int(s) for s in forecast_steps)
+    )
+    mole_rows = per_seed_rows * len(seeds["mole"]) if "mole" in seeds else 0
+    total_rows = sum(per_seed_rows * len(seeds[method]) for method in methods)
     return {
         "experiment": "final_comparison",
         #: 正式运行时逐项比对的口径。路径按绝对路径记，避免相对路径在不同 cwd 下"看着相同"。
@@ -320,6 +364,7 @@ def build_definition(
         #: 原始序列里重复时刻的处理策略。建库、冻结、正式运行必须是同一个。
         "timestamp_policy": TIMESTAMP_POLICY,
         "library_report": None if library_report is None else str(Path(library_report).resolve()),
+        "data_quality_report": str(Path(data_quality_report).resolve()),
         "library_preflight": library,
         "methods": list(methods),
         "seeds": seeds,
@@ -339,9 +384,24 @@ def build_definition(
         "test_windows": list(TEST_WINDOWS),
         "input_columns": list(BASE_FEATURES),
         "output_columns": list(OUTPUT_COLUMNS),
-        "expected_result_rows": (
-            len(datasets) * len(TEST_WINDOWS) * len(forecast_steps)
-        ),
+        #: 每个 method×seed 的预测行数 = 数据集 × 测试窗 × Σ预测长度。
+        "expected_result_rows": per_seed_rows,
+        "expected_result_rows_per_seed": per_seed_rows,
+        "expected_result_rows_mole": mole_rows,
+        "expected_result_rows_total": total_rows,
+        #: 主指标与总体优于判据（分析入口 scripts/analyze_final_comparison.py 必须一致）。
+        "evaluation": {
+            "task_definition": ["dataset", "test_window", "forecast_steps"],
+            "expected_tasks": expected_tasks,
+            "primary_metric": "wape",
+            "task_metric": "WAPE = sum(|y - yhat|) / sum(|y|)",
+            "aggregate": f"{expected_tasks} 个任务等权宏平均 WAPE",
+            "multi_seed_rule": "MoLE 先按种子分别计算任务指标，再在任务内取种子均值；其他方法单种子",
+            "overall_better_rule": (
+                f"宏平均 WAPE 更低且胜场 >= {WIN_RATE_MIN_TASKS}/{expected_tasks}"
+            ),
+            "overall_better_min_wins": WIN_RATE_MIN_TASKS,
+        },
         "datasets": definitions,
     }
 
@@ -360,6 +420,8 @@ def main() -> int:
                              "其中的超参数、commit 与 checkpoint_id 会被写进定义")
     parser.add_argument("--library-report", type=Path, required=True,
                         help="建库产出的 model_library_report.json；核对时间戳策略与 27 任务矩阵")
+    parser.add_argument("--data-quality-report", type=Path, required=True,
+                        help="D0 产出的 d0_quality_report.json；数据来源与时区/时间语义以它为准")
     parser.add_argument("--pipeline-config", type=Path,
                         default=PROJECT_ROOT / "configs" / "pipeline.yaml",
                         help="候选池的唯一真源")
@@ -384,6 +446,7 @@ def main() -> int:
             candidates=args.candidates,
             pipeline_config=args.pipeline_config,
             library_report=args.library_report,
+            data_quality_report=args.data_quality_report,
         )
     except FreezeError as exc:
         print(f"[freeze] 无法冻结: {exc}")
@@ -403,7 +466,9 @@ def main() -> int:
         print(f"[freeze] {method} 对种子不敏感：{reason}")
     for method, limitation in definition["method_limitations"].items():
         print(f"[freeze] ！{method} 限制：{limitation}")
-    print(f"[freeze] 每种方法预期结果数: {definition['expected_result_rows']}")
+    print(f"[freeze] 每种方法每种子预期结果数: {definition['expected_result_rows_per_seed']}")
+    print(f"[freeze] MoLE 三种子预期结果数: {definition['expected_result_rows_mole']}")
+    print(f"[freeze] 全部方法预期结果总数: {definition['expected_result_rows_total']}")
     return 0
 
 

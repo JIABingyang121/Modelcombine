@@ -52,6 +52,22 @@ def _poison_test_window_loads(raw_root: Path, plan_path: Path) -> pd.Timestamp:
     return boundary
 
 
+def _quality_entry(raw_root: Path, dataset: str) -> dict:
+    """从原始序列时间列造一条 D0 质量报告条目。"""
+    stamps = pd.to_datetime(
+        pd.read_csv(raw_root / dataset / "load.csv", usecols=["timestamp"])["timestamp"]
+    )
+    return {
+        "source": "synthetic://fixture",
+        "timezone_semantics": "fixed_UTC+10_AEST",
+        "timestamp_semantics": "interval_end",
+        "load_field": "load",
+        "rows": int(len(stamps)),
+        "first_timestamp": str(stamps.iloc[0]),
+        "last_timestamp": str(stamps.iloc[-1]),
+    }
+
+
 def _build(tmp_path: Path, *, db: Path, raw_root: Path, plan: Path, out: Path):
     return subprocess.run(
         [
@@ -104,7 +120,9 @@ def test_freeze_reads_timestamps_only(formal):
     plan = json.loads(formal["plan"].read_text(encoding="utf-8"))
     plan["datasets"][0]["fits"] = True
 
-    entry = _dataset_definition(formal["raw_root"], plan, DATASET)
+    entry = _dataset_definition(
+        formal["raw_root"], plan, DATASET, _quality_entry(formal["raw_root"], DATASET)
+    )
 
     expected_rows = len(pd.read_csv(formal["raw_root"] / DATASET / "load.csv"))
     assert entry["rows"] == expected_rows
