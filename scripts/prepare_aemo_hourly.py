@@ -1,9 +1,11 @@
-"""AEMO NEM PRICE_AND_DEMAND 原始五分钟数据 → 统一小时级负荷。
+"""AEMO NEM PRICE_AND_DEMAND 原始数据 → 统一小时级负荷。
 
 本模块是 AEMO 原始数据转换的**唯一实现**与正式 CLI。语义固定为：
 
 - 时区：固定 UTC+10（AEST），不使用 Australia/Melbourne，不做夏令时转换；
 - 时间戳：区间结束（interval_end）；
+- 采样间隔：支持 5 分钟（2021-10 起）与 30 分钟（2021-10 前）两种粒度，
+  每小时分别要求 12/2 条来源记录；
 - 小时规则：右闭右标签，``resample("h", label="right", closed="right")``；
 - 重复：``REGION + SETTLEMENTDATE`` 精确重复去重，字段冲突立即失败。
 
@@ -43,6 +45,8 @@ REQUIRED_COLUMNS: Tuple[str, ...] = (
 REGION_TO_DATASET: Mapping[str, str] = {"VIC1": "aemo_vic", "NSW1": "aemo_nsw"}
 PERIODTYPE_EXPECTED = "TRADE"
 SOURCE_ROWS_PER_HOUR = 12
+#: 支持的来源采样间隔（分钟）→ 每小时应有的记录数。
+SOURCE_CADENCE_ROWS_PER_HOUR: Mapping[int, int] = {5: 12, 30: 2}
 SETTLEMENTDATE_FORMAT = "%Y/%m/%d %H:%M:%S"
 AEST_TZ = timezone(timedelta(hours=10))
 RAW_INTERVAL = pd.Timedelta(minutes=5)
@@ -148,6 +152,17 @@ def _read_month_file(path: Path, region: str) -> pd.DataFrame:
 
     frame = frame.copy()
     frame["source_file"] = path.name
+    parsed = _parse_settlement(frame["SETTLEMENTDATE"])
+    deltas = parsed.sort_values().diff().dropna()
+    if deltas.empty:
+        raise ValueError(f"{path.name} 无法判断采样间隔（有效时间戳不足 2 个）")
+    median_minutes = int(round(deltas.median().total_seconds() / 60.0))
+    if median_minutes not in SOURCE_CADENCE_ROWS_PER_HOUR:
+        raise ValueError(
+            f"{path.name} 采样间隔 {median_minutes} 分钟不受支持；"
+            f"仅支持 {sorted(SOURCE_CADENCE_ROWS_PER_HOUR)} 分钟"
+        )
+    frame["_rows_per_hour"] = SOURCE_CADENCE_ROWS_PER_HOUR[median_minutes]
     return frame
 
 
@@ -256,17 +271,25 @@ def aggregate_hourly(
     }
 
     deduped, dup_stats = _deduplicate(work)
+    if "_rows_per_hour" not in deduped.columns:
+        deduped["_rows_per_hour"] = SOURCE_ROWS_PER_HOUR
     series = deduped.set_index("_ts")["_load"].sort_index()
 
     resampler = series.resample("h", label="right", closed="right")
     means = resampler.mean()
     counts = resampler.count()
+    expected_counts = (
+        deduped.set_index("_ts")["_rows_per_hour"]
+        .sort_index()
+        .resample("h", label="right", closed="right")
+        .first()
+    )
 
-    incomplete = counts[counts != SOURCE_ROWS_PER_HOUR]
+    incomplete = counts[counts != expected_counts]
     if len(incomplete) > 0:
         labels = [str(x) for x in incomplete.index[:20]]
         raise ValueError(
-            f"存在来源记录数不等于 {SOURCE_ROWS_PER_HOUR} 的小时，"
+            "存在来源记录数与采样间隔不符的小时，"
             f"共 {len(incomplete)} 个: {labels}"
         )
 
@@ -279,6 +302,10 @@ def aggregate_hourly(
 
     distribution = {
         str(int(k)): int(v) for k, v in counts.value_counts().sort_index().items()
+    }
+    cadence_distribution = {
+        str(int(k)): int(v)
+        for k, v in deduped["_rows_per_hour"].value_counts().sort_index().items()
     }
     output_year = (hourly["timestamp"] - HOURLY_INTERVAL).dt.year
     hourly_rows_per_year = {
@@ -301,6 +328,7 @@ def aggregate_hourly(
         "exact_duplicate_rows_dropped": dup_stats["exact_duplicate_rows_dropped"],
         "conflict_duplicate_keys": dup_stats["conflict_duplicate_keys"],
         "non_numeric_or_non_finite": non_numeric_or_non_finite,
+        "source_cadence_rows_per_hour_distribution": cadence_distribution,
         "source_rows_per_hour_distribution": distribution,
         "incomplete_hours": [],
         "hourly_rows": int(len(hourly)),
@@ -363,6 +391,9 @@ def prepare(
             "exact_duplicate_rows_dropped": stats["exact_duplicate_rows_dropped"],
             "conflict_duplicate_keys": stats["conflict_duplicate_keys"],
             "non_numeric_or_non_finite": stats["non_numeric_or_non_finite"],
+            "source_cadence_rows_per_hour_distribution": stats[
+                "source_cadence_rows_per_hour_distribution"
+            ],
             "source_rows_per_hour_distribution": stats["source_rows_per_hour_distribution"],
             "incomplete_hours": stats["incomplete_hours"],
             "hourly_rows": stats["hourly_rows"],
@@ -395,7 +426,7 @@ def _parse_years(values: Sequence[str]) -> List[int]:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(
-        description="AEMO 原始五分钟数据 → 统一小时级负荷（唯一实现）"
+        description="AEMO 原始五分钟/三十分钟数据 → 统一小时级负荷（唯一实现）"
     )
     parser.add_argument(
         "--input-root", default="data/external/aemo_raw_20260912", help="原始数据根目录"

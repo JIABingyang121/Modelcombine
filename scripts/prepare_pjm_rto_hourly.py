@@ -3,7 +3,9 @@
 口径（已批准方案）
 ------------------
 - 时间列：``UTC Time at End of Hour``；**UTC、hour ending**，不做任何时区转换。
-- 负荷列：仅 ``Demand (MW) (Adjusted)``；缺失或非有限立即失败。
+- 负荷列：仅 ``Demand (MW) (Adjusted)``；缺失或非有限默认立即失败；
+  可选 ``--interpolate-missing-hours`` 对**区间内部**孤立缺失小时做线性插值，
+  并在质量报告中记录被插值的时刻。
 - 输出严格为 ``timestamp,load``；时间戳唯一、严格逐小时连续。
 
 注意：这是 **PJM RTO**，不是旧 PJME（PJM East）；不得拼接、不得复用旧结果。
@@ -90,8 +92,13 @@ def transform(
     raw: pd.DataFrame,
     start: Optional[str] = None,
     end: Optional[str] = None,
+    interpolate_missing: bool = False,
 ) -> pd.DataFrame:
-    """按 UTC hour-ending 输出 ``timestamp,load``（不做时区转换）。"""
+    """按 UTC hour-ending 输出 ``timestamp,load``（不做时区转换）。
+
+    ``interpolate_missing=True`` 时，对区间内部的孤立缺失小时按时间做线性插值；
+    区间边界缺失无法插值，仍然失败。被插值的时刻记录在返回表 ``.attrs``。
+    """
     work = raw.sort_values("utc_end", kind="mergesort").reset_index(drop=True)
     if work["utc_end"].duplicated().any():
         dup = work.loc[work["utc_end"].duplicated(), "utc_end"].head(5).tolist()
@@ -106,15 +113,28 @@ def transform(
         raise ValueError("区间过滤后没有数据")
     values = work["load"].to_numpy(dtype="float64", na_value=np.nan)
     bad_load = ~np.isfinite(values)
+    interpolated_hours: List[str] = []
     if bad_load.any():
         bad = work.loc[bad_load, "timestamp"].head(5).tolist()
-        raise ValueError(f"{DEMAND_COLUMN} 缺失或非有限: {bad}")
+        if not interpolate_missing:
+            raise ValueError(f"{DEMAND_COLUMN} 缺失或非有限: {bad}")
+        if bool(bad_load[0]) or bool(bad_load[-1]):
+            raise ValueError(f"区间边界缺失，无法线性插值: {bad}")
+        series = pd.Series(values, index=pd.DatetimeIndex(work["timestamp"]))
+        values = (
+            series.interpolate(method="time", limit_area="inside")
+            .to_numpy(dtype="float64")
+        )
+        interpolated_hours = [
+            _format_ts(ts) for ts in work.loc[bad_load, "timestamp"]
+        ]
     out = pd.DataFrame({"timestamp": work["timestamp"], "load": values})
     if len(out) > 1:
         diffs = out["timestamp"].diff().dropna()
         if not (diffs == HOUR).all():
             offenders = out.loc[out["timestamp"].diff() != HOUR, "timestamp"].head(10).tolist()
             raise ValueError(f"输出不是严格逐小时连续: {offenders}")
+    out.attrs["interpolated_hours"] = interpolated_hours
     return out
 
 
@@ -123,11 +143,15 @@ def prepare(
     out_root: Path,
     start: Optional[str] = None,
     end: Optional[str] = None,
+    interpolate_missing: bool = False,
 ) -> Tuple[Dict[str, object], Path]:
     input_dir = Path(input_dir)
     out_root = Path(out_root)
     raw, files = load_balance_files(input_dir)
-    hourly = transform(raw, start=start, end=end)
+    hourly = transform(
+        raw, start=start, end=end, interpolate_missing=interpolate_missing
+    )
+    interpolated_hours = list(hourly.attrs.get("interpolated_hours", []))
 
     out_path = out_root / OUTPUT_DATASET_DIR / "load.csv"
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -142,6 +166,11 @@ def prepare(
         "load_field": DEMAND_COLUMN,
         "start_filter": start,
         "end_filter": end,
+        "missing_policy": (
+            "linear_interpolation" if interpolate_missing else "fail_on_missing"
+        ),
+        "interpolated_hours": interpolated_hours,
+        "interpolated_count": len(interpolated_hours),
         "rows": int(len(hourly)),
         "first_timestamp": _format_ts(hourly["timestamp"].iloc[0]),
         "last_timestamp": _format_ts(hourly["timestamp"].iloc[-1]),
@@ -174,9 +203,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--out-root", required=True, help="输出根目录")
     parser.add_argument("--start", default=None, help="UTC 起始标签（含）")
     parser.add_argument("--end", default=None, help="UTC 结束标签（含）")
+    parser.add_argument(
+        "--interpolate-missing-hours",
+        action="store_true",
+        help="对区间内部孤立缺失小时做线性插值（记录在质量报告）",
+    )
     args = parser.parse_args(argv)
     report, report_path = prepare(
-        Path(args.input_dir), Path(args.out_root), start=args.start, end=args.end
+        Path(args.input_dir),
+        Path(args.out_root),
+        start=args.start,
+        end=args.end,
+        interpolate_missing=args.interpolate_missing_hours,
     )
     print(
         f"[prepare_pjm_rto_hourly] {report['output_file']} rows={report['rows']} "

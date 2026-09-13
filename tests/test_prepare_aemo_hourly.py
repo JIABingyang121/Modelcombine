@@ -185,7 +185,63 @@ def test_incomplete_hour_fails_without_interpolation():
     frame = _raw("VIC1", ts, [1.0] * len(ts))
     with pytest.raises(ValueError) as excinfo:
         aggregate_hourly(frame, region="VIC1")
-    assert str(SOURCE_ROWS_PER_HOUR) in str(excinfo.value)
+    assert "采样间隔" in str(excinfo.value)
+
+
+def test_half_hour_cadence_aggregates_mean_of_two():
+    ts = pd.date_range("2021-08-01 00:30", periods=2, freq="30min")
+    frame = _raw("NSW1", ts, [10.0, 20.0])
+    frame["_rows_per_hour"] = 2
+    hourly, stats = aggregate_hourly(frame, region="NSW1")
+    assert len(hourly) == 1
+    assert hourly["timestamp"].iloc[0] == pd.Timestamp("2021-08-01 01:00:00")
+    assert hourly["load"].iloc[0] == pytest.approx(15.0)
+    assert stats["source_rows_per_hour_distribution"] == {"2": 1}
+    assert stats["source_cadence_rows_per_hour_distribution"] == {"2": 2}
+
+
+def test_half_hour_incomplete_hour_fails():
+    ts = pd.date_range("2021-08-01 00:30", periods=1, freq="30min")
+    frame = _raw("NSW1", ts, [10.0])
+    frame["_rows_per_hour"] = 2
+    with pytest.raises(ValueError) as excinfo:
+        aggregate_hourly(frame, region="NSW1")
+    assert "采样间隔" in str(excinfo.value)
+
+
+def test_mixed_cadence_hours_aggregate_with_expected_counts():
+    half = pd.date_range("2021-08-01 00:30", periods=2, freq="30min")
+    five = pd.date_range("2021-08-01 01:05", periods=12, freq="5min")
+    frame = pd.concat(
+        [_raw("NSW1", half, [10.0, 20.0]), _raw("NSW1", five, [30.0] * 12)],
+        ignore_index=True,
+    )
+    frame["_rows_per_hour"] = [2] * len(half) + [12] * len(five)
+    hourly, stats = aggregate_hourly(frame, region="NSW1")
+    assert len(hourly) == 2
+    assert list(hourly["load"]) == pytest.approx([15.0, 30.0])
+    assert stats["source_cadence_rows_per_hour_distribution"] == {"2": 2, "12": 12}
+
+
+def test_read_month_file_detects_half_hour_cadence(tmp_path):
+    path = tmp_path / "PRICE_AND_DEMAND_202108_NSW1.csv"
+    lines = [HEADER]
+    for ts in pd.date_range("2021-08-01 00:30", periods=4, freq="30min"):
+        lines.append(f"NSW1,{_ts_str(ts)},100.0,1.00,TRADE")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    frame = _read_month_file(path, "NSW1")
+    assert set(frame["_rows_per_hour"]) == {2}
+
+
+def test_read_month_file_rejects_unsupported_cadence(tmp_path):
+    path = tmp_path / "PRICE_AND_DEMAND_202108_NSW1.csv"
+    lines = [HEADER]
+    for ts in pd.date_range("2021-08-01 00:15", periods=3, freq="15min"):
+        lines.append(f"NSW1,{_ts_str(ts)},100.0,1.00,TRADE")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError) as excinfo:
+        _read_month_file(path, "NSW1")
+    assert "采样间隔" in str(excinfo.value)
 
 
 def _write_month_file(path: Path, region: str, timestamps) -> None:

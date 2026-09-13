@@ -61,6 +61,55 @@ def test_gap_fails(tmp_path):
     assert "逐小时连续" in str(excinfo.value)
 
 
+def test_interpolate_missing_hours_fills_interior_and_records(tmp_path):
+    _write_balance(
+        tmp_path / "f.csv",
+        [
+            (_utc(2019, 1, 1, 6, "AM"), 100.0),
+            (_utc(2019, 1, 1, 7, "AM"), ""),
+            (_utc(2019, 1, 1, 8, "AM"), 200.0),
+        ],
+    )
+    raw, _ = load_balance_files(tmp_path)
+    out = transform(raw, interpolate_missing=True)
+    assert len(out) == 3
+    assert out["load"].iloc[1] == pytest.approx(150.0)
+    assert out.attrs["interpolated_hours"] == ["2019-01-01 07:00:00"]
+
+
+def test_interpolate_missing_rejects_boundary(tmp_path):
+    _write_balance(
+        tmp_path / "f.csv",
+        [(_utc(2019, 1, 1, 6, "AM"), ""), (_utc(2019, 1, 1, 7, "AM"), 100.0)],
+    )
+    raw, _ = load_balance_files(tmp_path)
+    with pytest.raises(ValueError) as excinfo:
+        transform(raw, interpolate_missing=True)
+    assert "边界" in str(excinfo.value)
+
+
+def test_prepare_reports_interpolated_hours(tmp_path):
+    src_dir = tmp_path / "balance"
+    src_dir.mkdir()
+    _write_balance(
+        src_dir / "f.csv",
+        [
+            (_utc(2019, 1, 1, 6, "AM"), 100.0),
+            (_utc(2019, 1, 1, 7, "AM"), ""),
+            (_utc(2019, 1, 1, 8, "AM"), 200.0),
+        ],
+    )
+    report, report_path = prepare(
+        src_dir, tmp_path / "out", interpolate_missing=True
+    )
+    assert report["missing_policy"] == "linear_interpolation"
+    assert report["interpolated_hours"] == ["2019-01-01 07:00:00"]
+    assert report["interpolated_count"] == 1
+    assert report["rows"] == 3
+    saved = json.loads(report_path.read_text(encoding="utf-8"))
+    assert saved["interpolated_count"] == 1
+
+
 def test_cli_and_raw_bytes_unchanged(tmp_path):
     src_dir = tmp_path / "balance"
     src_dir.mkdir()
