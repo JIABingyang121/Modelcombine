@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from scripts.v3_fit_history import FitHistoryError, main
+from scripts.v3_fit_history import FitHistoryError, _season_key, main
 
 DATASET = "aemo_vic"
 POOL = ["seasonal_naive", "random_forest", "xgboost_reg"]
@@ -20,7 +20,7 @@ HORIZONS = [24, 48]
 
 
 def _copy() -> pd.DataFrame:
-    ts = pd.date_range("2021-01-01 00:00", "2023-06-30 23:00", freq="h")
+    ts = pd.date_range("2021-01-01 00:00", "2023-12-31 23:00", freq="h")
     index = np.arange(len(ts), dtype=float)
     hours = ts.hour.to_numpy(dtype=float)
     doy = ts.dayofyear.to_numpy(dtype=float)
@@ -171,3 +171,43 @@ def test_missing_history_task_fails_grid(tmp_path):
     with pytest.raises(FitHistoryError) as excinfo:
         _run(tmp_path, definition, plan, shared, tmp_path / "out")
     assert "H 任务网格" in str(excinfo.value)
+
+
+def test_season_key_uses_meteorological_seasons():
+    # 12-2 / 3-5 / 6-8 / 9-11；6 与 8 同季，10 与 12 不同季
+    assert _season_key(6) == _season_key(8)
+    assert _season_key(12) == _season_key(1) == _season_key(2)
+    assert _season_key(10) != _season_key(12)
+    assert _season_key(3) == _season_key(5)
+    assert _season_key(9) == _season_key(11)
+
+
+def test_nsw_like_same_season_retrieval_passes(tmp_path):
+    windows = [
+        _window("H1", "history", "2022-06-01 00:00:00"),
+        _window("H2", "history", "2022-08-01 00:00:00"),
+        _window("T1", "test", "2023-08-01 00:00:00"),
+    ]
+    definition, plan, shared = _write_inputs(tmp_path, windows=windows)
+    out = tmp_path / "out"
+    assert _run(tmp_path, definition, plan, shared, out) == 0
+    check = json.loads((out / "nn_check.json").read_text(encoding="utf-8"))
+    assert check["test_retrieval_passed"] == check["test_retrieval_total"] == len(HORIZONS)
+    assert check["passed"] is True
+
+
+def test_pool_validation_failure_stops_without_reduction(tmp_path):
+    definition, plan, shared = _write_inputs(tmp_path)
+    frame = pd.read_csv(shared)
+    mask = (
+        (frame["model"] == "seasonal_naive")
+        & (frame["window_label"] == "H1")
+        & (frame["forecast_steps"] == 24)
+    )
+    frame.loc[mask, "yhat"] = -1.0
+    frame.to_csv(shared, index=False)
+    out = tmp_path / "out"
+    assert _run(tmp_path, definition, plan, shared, out) == 1
+    validation = json.loads((out / "pool_validation.json").read_text(encoding="utf-8"))
+    assert "seasonal_naive" in validation["removed"]
+    assert not (out / "memory.json").exists()

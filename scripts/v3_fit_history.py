@@ -8,9 +8,11 @@
 - ``champions.json``        每数据集 H 宏平均 WAPE 最低的单模型。
 - ``stacking.json``         每 (数据集, 长度) 在 H 上学习并冻结的线性权重。
 - ``mole_router.pt`` / ``mole_router_meta.json``
-                            每数据集的 MoLE 风格线性门控网络（共享池预测 +
-                            场景特征 → 7 模型权重）。
-- ``nn_check.json``         记忆读回自检（每条记录必须取回自己）与盲测覆盖检查。
+                            每数据集的 **MoLE-style 动态门控**（项目自写单层线性
+                            Softmax 路由，非官方 MoLE 复现；共享池预测 + 场景特征
+                            → 7 模型权重）。
+- ``nn_check.json``         盲测前检索自检：T 同季检索 N/N（只允许更早记录）+
+                            落盘 ``memory.json`` 重新读回的写读一致 N/N。
 """
 from __future__ import annotations
 
@@ -49,7 +51,11 @@ class FitHistoryError(RuntimeError):
 
 
 def validate_pool(shared: pd.DataFrame, pool: Sequence[str]) -> Dict[str, Any]:
-    """设计 §2：H 预测必须完整、有限且非负，否则该模型从共享池统一移除。"""
+    """冻结池校验：H 预测必须完整、有限且非负。
+
+    冻结后模型池不再变动——任何模型不合格都直接停止（不做自动缩减，避免正式实验
+    静默变成 6 模型实验）。
+    """
     history = shared[shared["role"] == "history"]
     problems: Dict[str, List[str]] = {}
     for model in pool:
@@ -247,6 +253,7 @@ def router_features(yhat: np.ndarray, timestamps: pd.DatetimeIndex, horizon: int
 def train_routers(
     tasks: Sequence[Mapping[str, Any]], pool: Sequence[str], out_dir: Path
 ) -> Dict[str, Any]:
+    """训练 MoLE-style 动态门控（项目自写单层线性 Softmax 路由，非官方 MoLE 复现）。"""
     import torch
     from torch import nn
 
@@ -332,8 +339,13 @@ def rank_memory_records(
 
 
 def _season_key(month: int) -> int:
-    """同季块：1-3 / 4-6 / 7-9 / 10-12。"""
-    return (int(month) - 1) // 3
+    """气象季节分组（12-2 / 3-5 / 6-8 / 9-11），南北半球同构。"""
+    return {
+        12: 0, 1: 0, 2: 0,
+        3: 1, 4: 1, 5: 1,
+        6: 2, 7: 2, 8: 2,
+        9: 3, 10: 3, 11: 3,
+    }[int(month)]
 
 
 def retrieval_check(
@@ -424,8 +436,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("[v3-fit] 共享池校验后没有可用模型", file=sys.stderr)
         return 1
     if pool_validation["removed"]:
-        print(f"[v3-fit] 移除不合格模型: {sorted(pool_validation['removed'])}")
-    pool = pool_validation["effective_pool"]
+        print(
+            f"[v3-fit] 冻结模型池校验失败（不自动缩减）: "
+            f"{sorted(pool_validation['removed'])}",
+            file=sys.stderr,
+        )
+        return 1
+    pool = list(declared_pool)
     tasks = h_tasks(shared, pool)
     expected_h = expected_task_grid(plan, horizons, "history")
     observed_h = [(t["dataset"], t["window_label"], t["horizon"]) for t in tasks]
@@ -509,6 +526,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     (args.out_dir / "memory.json").write_text(
         json.dumps(memory, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
+    # 自检必须使用落盘后重新读回的记录，才能证明序列化写读一致
+    loaded_records = json.loads(
+        (args.out_dir / "memory.json").read_text(encoding="utf-8")
+    )["records"]
+    if loaded_records != records:
+        raise FitHistoryError("memory.json 写读不一致（落盘后内容与内存记录不同）")
+    check = retrieval_check(loaded_records, t_queries)
     (args.out_dir / "champions.json").write_text(
         json.dumps(champions, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
@@ -516,7 +540,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         json.dumps(stacking, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
     train_routers(tasks, pool, args.out_dir)
-    check = retrieval_check(records, t_queries)
     (args.out_dir / "nn_check.json").write_text(
         json.dumps(check, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
