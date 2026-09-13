@@ -12,7 +12,12 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from scripts.v3_fit_history import FitHistoryError, _season_key, main
+from scripts.v3_fit_history import (
+    FitHistoryError,
+    main,
+    rank_memory_records,
+    season_key,
+)
 
 DATASET = "aemo_vic"
 POOL = ["seasonal_naive", "random_forest", "xgboost_reg"]
@@ -173,13 +178,13 @@ def test_missing_history_task_fails_grid(tmp_path):
     assert "H 任务网格" in str(excinfo.value)
 
 
-def test_season_key_uses_meteorological_seasons():
+def testseason_key_uses_meteorological_seasons():
     # 12-2 / 3-5 / 6-8 / 9-11；6 与 8 同季，10 与 12 不同季
-    assert _season_key(6) == _season_key(8)
-    assert _season_key(12) == _season_key(1) == _season_key(2)
-    assert _season_key(10) != _season_key(12)
-    assert _season_key(3) == _season_key(5)
-    assert _season_key(9) == _season_key(11)
+    assert season_key(6) == season_key(8)
+    assert season_key(12) == season_key(1) == season_key(2)
+    assert season_key(10) != season_key(12)
+    assert season_key(3) == season_key(5)
+    assert season_key(9) == season_key(11)
 
 
 def test_nsw_like_same_season_retrieval_passes(tmp_path):
@@ -211,3 +216,25 @@ def test_pool_validation_failure_stops_without_reduction(tmp_path):
     validation = json.loads((out / "pool_validation.json").read_text(encoding="utf-8"))
     assert "seasonal_naive" in validation["removed"]
     assert not (out / "memory.json").exists()
+
+
+def test_rank_memory_records_prefers_same_season(tmp_path):
+    records = [
+        {"dataset": DATASET, "window_label": "H_apr", "horizon": 24,
+         "origin": "2024-04-01 00:00:00", "members": ["seasonal_naive"],
+         "weights": {"seasonal_naive": 1.0}, "scenario_profile": [1.0, 0.0, 0.0]},
+        {"dataset": DATASET, "window_label": "H_oct", "horizon": 24,
+         "origin": "2024-10-01 00:00:00", "members": ["seasonal_naive"],
+         "weights": {"seasonal_naive": 1.0}, "scenario_profile": [1.0, 0.0, 0.0]},
+    ]
+    query = [1.0, 0.0, 0.0]
+    before = pd.Timestamp("2025-04-01 00:00:00")
+    top_all = rank_memory_records(
+        records, query, dataset=DATASET, horizon=24, before_origin=before, inclusive=False
+    )[0]
+    assert top_all["window_label"] == "H_oct"  # 无季节过滤时更近者优先
+    top_apr = rank_memory_records(
+        records, query, dataset=DATASET, horizon=24, before_origin=before,
+        inclusive=False, same_season_as=season_key(4),
+    )[0]
+    assert top_apr["window_label"] == "H_apr"  # 同季过滤后只能取 4 月记录

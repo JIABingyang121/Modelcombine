@@ -322,8 +322,13 @@ def rank_memory_records(
     horizon: int,
     before_origin: pd.Timestamp,
     inclusive: bool,
+    same_season_as: Optional[int] = None,
 ) -> List[Mapping[str, Any]]:
-    """按场景相似度检索记忆；平局时更近的记录优先（最近相似场景）。"""
+    """按场景相似度检索记忆；平局时更近的记录优先（最近相似场景）。
+
+    ``same_season_as`` 不为空时先按同季（12-2/3-5/6-8/9-11）过滤候选——设计 §4 要求
+    检索到"同类场景"（相同数据集、预测长度、季节），画像相似度只在同类内排序。
+    """
     query = np.asarray(profile, dtype=float)
     candidates = [
         r
@@ -336,6 +341,12 @@ def rank_memory_records(
             else pd.Timestamp(r["origin"]) < before_origin
         )
     ]
+    if same_season_as is not None:
+        candidates = [
+            r
+            for r in candidates
+            if season_key(pd.Timestamp(r["origin"]).month) == same_season_as
+        ]
     return sorted(
         candidates,
         key=lambda r: (
@@ -345,7 +356,7 @@ def rank_memory_records(
     )
 
 
-def _season_key(month: int) -> int:
+def season_key(month: int) -> int:
     """气象季节分组（12-2 / 3-5 / 6-8 / 9-11），南北半球同构。"""
     return {
         12: 0, 1: 0, 2: 0,
@@ -374,15 +385,16 @@ def retrieval_check(
             horizon=query["horizon"],
             before_origin=pd.Timestamp(query["origin"]),
             inclusive=False,
+            same_season_as=season_key(pd.Timestamp(query["origin"]).month),
         )
         label = f"{query['dataset']}/{query['window_label']}/h{query['horizon']}"
         if not ranked:
-            test_failures.append(f"{label}: 没有更早记录")
+            test_failures.append(f"{label}: 没有更早的同季记录")
             continue
         top = ranked[0]
         query_month = pd.Timestamp(query["origin"]).month
         top_month = pd.Timestamp(top["origin"]).month
-        if _season_key(query_month) != _season_key(top_month):
+        if season_key(query_month) != season_key(top_month):
             test_failures.append(
                 f"{label}: 取回 {top['window_label']}（{top_month} 月）与 {query_month} 月不同季"
             )

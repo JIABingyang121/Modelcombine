@@ -32,6 +32,7 @@ from scripts.v3_fit_history import (
     rank_memory_records,
     router_features,
     scenario_profile,
+    season_key,
 )
 from scripts.v3_shared_pool import SharedPoolError, expected_task_grid, load_copy
 
@@ -115,6 +116,7 @@ def predict_modelcombine(
         horizon=task["horizon"],
         before_origin=task["origin"],
         inclusive=False,
+        same_season_as=season_key(pd.Timestamp(task["origin"]).month),
     )
     if not ranked:
         raise BlindPredictError(
