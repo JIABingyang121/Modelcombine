@@ -178,6 +178,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     stacking = _load_json(args.fit_dir / "stacking.json")
     router_meta = _load_json(args.fit_dir / "mole_router_meta.json")
 
+    import os
+
+    # 门控推理是纯 CPU 计算；隐藏 CUDA 以避免与服务器驱动不匹配的 torch 初始化问题。
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
     import torch
 
     router_state = torch.load(args.fit_dir / "mole_router.pt", weights_only=True)
