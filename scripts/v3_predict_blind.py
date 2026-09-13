@@ -26,7 +26,7 @@ from scripts.v3_fit_history import (
     router_features,
     scenario_profile,
 )
-from scripts.v3_shared_pool import SharedPoolError, load_copy
+from scripts.v3_shared_pool import SharedPoolError, expected_task_grid, load_copy
 
 OUTPUT_COLUMNS = ("method", "dataset", "window_label", "forecast_steps", "timestamp", "yhat")
 
@@ -98,10 +98,9 @@ def predict_router(
 def predict_modelcombine(
     task: Mapping[str, Any],
     memory: Mapping[str, Any],
-    copy: pd.DataFrame,
+    profile: Sequence[float],
     pool: Sequence[str],
 ) -> Dict[str, Any]:
-    profile = scenario_profile(copy, task["origin"])
     ranked = rank_memory_records(
         memory["records"],
         profile,
@@ -183,6 +182,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     router_state = torch.load(args.fit_dir / "mole_router.pt", weights_only=True)
     tasks = t_tasks(shared, pool)
+    horizons = [int(s) for s in definition["horizons"]]
+    expected = expected_task_grid(plan, horizons, "test")
+    observed = [(t["dataset"], t["window_label"], t["horizon"]) for t in tasks]
+    if sorted(observed) != sorted(expected):
+        raise BlindPredictError(
+            f"T 任务网格与窗口计划不符：缺 {sorted(set(expected) - set(observed))}，"
+            f"多 {sorted(set(observed) - set(expected))}"
+        )
+    forbidden = {
+        entry["dataset"]: [
+            (
+                pd.Timestamp(w["targets"][str(step)]["first_target"]),
+                pd.Timestamp(w["targets"][str(step)]["last_target"]),
+            )
+            for w in entry["windows"]
+            if w["role"] == "test"
+            for step in horizons
+        ]
+        for entry in plan["datasets"]
+    }
     copies = {
         entry["dataset"]: load_copy(args.data_root / entry["dataset"] / "load.csv")
         for entry in plan["datasets"]
@@ -190,8 +209,35 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     rows: List[Dict[str, Any]] = []
     retrievals: List[Dict[str, Any]] = []
+    truth_read_evidence: List[Dict[str, Any]] = []
     methods = [*pool, "equal_weight", "stacking", "mole_router", "modelcombine"]
     for task in tasks:
+        copy = copies[task["dataset"]]
+        accessed_start = task["origin"] - pd.Timedelta(hours=719)
+        accessed = copy[
+            (copy["timestamp"] >= accessed_start) & (copy["timestamp"] <= task["origin"])
+        ]
+        overlaps = int(
+            sum(
+                ((accessed["timestamp"] >= lo) & (accessed["timestamp"] <= hi)).sum()
+                for lo, hi in forbidden[task["dataset"]]
+            )
+        )
+        truth_read_evidence.append(
+            {
+                "dataset": task["dataset"],
+                "window_label": task["window_label"],
+                "horizon": task["horizon"],
+                "accessed_start": str(accessed_start),
+                "accessed_end": str(task["origin"]),
+                "overlap_with_test_targets": overlaps,
+            }
+        )
+        if overlaps:
+            raise BlindPredictError(
+                f"{task['dataset']}/{task['window_label']}: 场景画像读取了 T 目标区间"
+            )
+        profile = scenario_profile(copy, task["origin"])
         for i, model in enumerate(pool):
             rows.extend(build_rows(model, task, task["yhat"][:, i]))
         rows.extend(build_rows("equal_weight", task, task["yhat"].mean(axis=1)))
@@ -201,7 +247,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "mole_router", task, predict_router(task, router_meta, router_state, pool)
             )
         )
-        combined = predict_modelcombine(task, memory, copies[task["dataset"]], pool)
+        combined = predict_modelcombine(task, memory, profile, pool)
         rows.extend(build_rows("modelcombine", task, combined["prediction"]))
         retrievals.append(
             {
@@ -279,8 +325,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "retrievals": retrievals,
             },
             "no_truth_read": {
-                "passed": True,
-                "detail": "本脚本只读共享池预测与 T 起点前 720 小时观测；产物无 y_true 列",
+                "passed": all(
+                    e["overlap_with_test_targets"] == 0 for e in truth_read_evidence
+                ),
+                "detail": "T 场景画像只读各自起点前 720 小时观测；与全部 T 目标区间零相交",
+                "evidence": truth_read_evidence,
             },
         },
     }

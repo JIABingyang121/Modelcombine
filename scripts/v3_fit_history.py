@@ -29,7 +29,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts.v3_shared_pool import POOL, SharedPoolError, load_copy
+from scripts.v3_shared_pool import (
+    POOL,
+    SharedPoolError,
+    expected_task_grid,
+    load_copy,
+    validate_plan_causality,
+)
 
 CV_FOLDS = 4
 SCENARIO_POINTS = 120
@@ -325,10 +331,43 @@ def rank_memory_records(
     )
 
 
-def memory_readback_check(
+def _season_key(month: int) -> int:
+    """同季块：1-3 / 4-6 / 7-9 / 10-12。"""
+    return (int(month) - 1) // 3
+
+
+def retrieval_check(
     records: Sequence[Mapping[str, Any]], t_queries: Sequence[Mapping[str, Any]]
 ) -> Dict[str, Any]:
-    readback_failures = []
+    """盲测前检索自检：
+
+    1. 对每个 T 场景（27 个），只允许检索更早记录，且取回的记录必须与 T 同季
+       （验证"每个 T 在 H 中存在更早的同类场景"确实可检索到）。
+    2. 写读一致性：每条 H 记录按自身场景检索（允许含自身）必须取回同一条记录
+       的完整方案（数据集/窗口/长度/成员/权重）。
+    """
+    test_failures: List[str] = []
+    for query in t_queries:
+        ranked = rank_memory_records(
+            records,
+            query["scenario_profile"],
+            dataset=query["dataset"],
+            horizon=query["horizon"],
+            before_origin=pd.Timestamp(query["origin"]),
+            inclusive=False,
+        )
+        label = f"{query['dataset']}/{query['window_label']}/h{query['horizon']}"
+        if not ranked:
+            test_failures.append(f"{label}: 没有更早记录")
+            continue
+        top = ranked[0]
+        query_month = pd.Timestamp(query["origin"]).month
+        top_month = pd.Timestamp(top["origin"]).month
+        if _season_key(query_month) != _season_key(top_month):
+            test_failures.append(
+                f"{label}: 取回 {top['window_label']}（{top_month} 月）与 {query_month} 月不同季"
+            )
+    readback_failures: List[str] = []
     for record in records:
         ranked = rank_memory_records(
             records,
@@ -339,36 +378,25 @@ def memory_readback_check(
             inclusive=True,
         )
         top = ranked[0]
-        if not (
-            top["window_label"] == record["window_label"]
+        same = (
+            top["dataset"] == record["dataset"]
+            and top["window_label"] == record["window_label"]
             and top["horizon"] == record["horizon"]
-        ):
-            readback_failures.append(
-                {"expected": f"{record['dataset']}/{record['window_label']}/h{record['horizon']}",
-                 "got": f"{top['dataset']}/{top['window_label']}/h{top['horizon']}"}
-            )
-    coverage_failures = []
-    for query in t_queries:
-        ranked = rank_memory_records(
-            records,
-            query["scenario_profile"],
-            dataset=query["dataset"],
-            horizon=query["horizon"],
-            before_origin=pd.Timestamp(query["origin"]),
-            inclusive=False,
+            and top["members"] == record["members"]
+            and top["weights"] == record["weights"]
         )
-        if not ranked:
-            coverage_failures.append(
-                f"{query['dataset']}/{query['window_label']}/h{query['horizon']}"
+        if not same:
+            readback_failures.append(
+                f"{record['dataset']}/{record['window_label']}/h{record['horizon']}"
             )
     return {
-        "readback_total": len(records),
-        "readback_passed": len(records) - len(readback_failures),
-        "readback_failures": readback_failures[:10],
-        "coverage_total": len(t_queries),
-        "coverage_passed": len(t_queries) - len(coverage_failures),
-        "coverage_failures": coverage_failures[:10],
-        "passed": not readback_failures and not coverage_failures,
+        "test_retrieval_total": len(t_queries),
+        "test_retrieval_passed": len(t_queries) - len(test_failures),
+        "test_retrieval_failures": test_failures[:10],
+        "readback_identity_total": len(records),
+        "readback_identity_passed": len(records) - len(readback_failures),
+        "readback_identity_failures": readback_failures[:10],
+        "passed": not test_failures and not readback_failures,
     }
 
 
@@ -383,6 +411,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     definition = _load_json(args.definition)
     plan = _load_json(args.window_plan)
+    validate_plan_causality(plan)
+    horizons = [int(s) for s in definition["horizons"]]
     declared_pool = list(definition["pool"])
     shared = load_shared(args.shared)
     pool_validation = validate_pool(shared, declared_pool)
@@ -397,6 +427,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"[v3-fit] 移除不合格模型: {sorted(pool_validation['removed'])}")
     pool = pool_validation["effective_pool"]
     tasks = h_tasks(shared, pool)
+    expected_h = expected_task_grid(plan, horizons, "history")
+    observed_h = [(t["dataset"], t["window_label"], t["horizon"]) for t in tasks]
+    if sorted(observed_h) != sorted(expected_h):
+        raise FitHistoryError(
+            f"H 任务网格与窗口计划不符：缺 {sorted(set(expected_h) - set(observed_h))}，"
+            f"多 {sorted(set(observed_h) - set(expected_h))}"
+        )
 
     copies = {
         entry["dataset"]: load_copy(args.data_root / entry["dataset"] / "load.csv")
@@ -458,6 +495,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "scenario_profile": scenario_profile(copies[dataset], origin),
             }
         )
+    expected_t = expected_task_grid(plan, horizons, "test")
+    observed_t = [(q["dataset"], q["window_label"], q["horizon"]) for q in t_queries]
+    if sorted(observed_t) != sorted(expected_t):
+        raise FitHistoryError(
+            f"T 任务网格与窗口计划不符：缺 {sorted(set(expected_t) - set(observed_t))}，"
+            f"多 {sorted(set(observed_t) - set(expected_t))}"
+        )
 
     champions = compute_champions(tasks, pool)
     stacking = fit_stacking(tasks, pool)
@@ -472,14 +516,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         json.dumps(stacking, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
     train_routers(tasks, pool, args.out_dir)
-    check = memory_readback_check(records, t_queries)
+    check = retrieval_check(records, t_queries)
     (args.out_dir / "nn_check.json").write_text(
         json.dumps(check, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
     print(
-        f"[v3-fit] 记忆 {len(records)} 条；读回 {check['readback_passed']}/"
-        f"{check['readback_total']}，盲测覆盖 {check['coverage_passed']}/"
-        f"{check['coverage_total']}"
+        f"[v3-fit] 记忆 {len(records)} 条；T 检索 {check['test_retrieval_passed']}/"
+        f"{check['test_retrieval_total']}，写读一致 {check['readback_identity_passed']}/"
+        f"{check['readback_identity_total']}"
     )
     if not check["passed"]:
         print("[v3-fit] 记忆自检未通过，不能进入 T", file=sys.stderr)

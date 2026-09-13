@@ -1,6 +1,7 @@
 """V3 报告脚本的契约测试。
 
-覆盖：主指标任务数、宏平均、胜场计数与规则、3×3 冠军交叉表结构。
+覆盖：主指标任务数、宏平均、胜场计数与规则、3×3 冠军交叉表结构（Modelcombine
+列按盲测数据集计算）、T 任务网格强制。
 """
 from __future__ import annotations
 
@@ -8,12 +9,15 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from test_v3_fit_history import DATASET, HORIZONS, POOL, _write_inputs  # noqa: E402
 
 from scripts.v3_fit_history import main as fit_main  # noqa: E402
 from scripts.v3_predict_blind import main as blind_main  # noqa: E402
+from scripts.v3_report import ReportError  # noqa: E402
 from scripts.v3_report import main as report_main  # noqa: E402
 
 
@@ -34,17 +38,21 @@ def _prepare(tmp_path: Path) -> tuple[Path, Path]:
     return fit_out, blind_out
 
 
-def test_report_metrics_and_wins(tmp_path):
-    fit_out, blind_out = _prepare(tmp_path)
-    out = tmp_path / "report"
-    assert report_main([
+def _report(tmp_path: Path, fit_out: Path, blind_out: Path, plan: Path, out: Path) -> int:
+    return report_main([
         "--definition", str(tmp_path / "definition.json"),
-        "--window-plan", str(tmp_path / "window_plan.json"),
+        "--window-plan", str(plan),
         "--predictions", str(blind_out / "predictions.csv"),
         "--fit-dir", str(fit_out),
         "--data-root", str(tmp_path / "data"),
         "--out-dir", str(out),
-    ]) == 0
+    ])
+
+
+def test_report_metrics_and_wins(tmp_path):
+    fit_out, blind_out = _prepare(tmp_path)
+    out = tmp_path / "report"
+    assert _report(tmp_path, fit_out, blind_out, tmp_path / "window_plan.json", out) == 0
 
     metrics = json.loads((out / "main_metrics.json").read_text(encoding="utf-8"))
     methods = set(POOL) | {"equal_weight", "stacking", "mole_router", "modelcombine"}
@@ -64,7 +72,25 @@ def test_report_metrics_and_wins(tmp_path):
     row = table["table"][0]
     assert row["test_dataset"] == DATASET
     assert f"{DATASET}_champion" in row
-    assert "modelcombine" in row
+    expected = [
+        t["wape"] for t in metrics["tasks"]
+        if t["dataset"] == DATASET and t["method"] == "modelcombine"
+    ]
+    assert row["modelcombine"] == pytest.approx(sum(expected) / len(expected))
 
     assert (out / "by_dataset.json").is_file()
     assert (out / "by_forecast_steps.json").is_file()
+
+
+def test_plan_with_extra_test_task_fails_grid(tmp_path):
+    fit_out, blind_out = _prepare(tmp_path)
+    plan = tmp_path / "window_plan.json"
+    data = json.loads(plan.read_text(encoding="utf-8"))
+    data["datasets"][0]["windows"].append(
+        {"label": "T2", "role": "test", "dataset": DATASET,
+         "forecast_origin": "2023-03-01 00:00:00"}
+    )
+    plan.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(ReportError) as excinfo:
+        _report(tmp_path, fit_out, blind_out, plan, tmp_path / "report")
+    assert "T 任务网格" in str(excinfo.value)

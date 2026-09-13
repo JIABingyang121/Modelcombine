@@ -19,7 +19,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts.v3_shared_pool import SharedPoolError, load_copy
+from scripts.v3_shared_pool import SharedPoolError, expected_task_grid, load_copy
 
 STATIC_METHODS = ("equal_weight", "stacking")
 DYNAMIC_METHODS = ("mole_router",)
@@ -55,6 +55,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     pool_validation = _load_json(args.fit_dir / "pool_validation.json")
     pool = list(pool_validation["effective_pool"])
     methods = sorted(predictions["method"].unique())
+    horizons = [int(s) for s in definition["horizons"]]
+    expected = expected_task_grid(plan, horizons, "test")
+    observed = sorted(
+        set(
+            zip(
+                predictions["dataset"],
+                predictions["window_label"],
+                predictions["forecast_steps"].astype(int),
+            )
+        )
+    )
+    if observed != sorted(expected):
+        raise ReportError(
+            f"T 任务网格与窗口计划不符：缺 {sorted(set(expected) - set(observed))}，"
+            f"多 {sorted(set(observed) - set(expected))}"
+        )
 
     truth_frames = []
     for entry in plan["datasets"]:
@@ -136,7 +152,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             row[f"{champion_dataset}_champion"] = (
                 float(subset["wape"].mean()) if not subset.empty else None
             )
-        row["modelcombine"] = macro["modelcombine"]
+        row["modelcombine"] = float(
+            tasks[
+                (tasks["dataset"] == test_dataset) & (tasks["method"] == "modelcombine")
+            ]["wape"].mean()
+        )
         table_rows.append(row)
 
     by_dataset = []

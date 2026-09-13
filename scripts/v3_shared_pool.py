@@ -3,10 +3,11 @@
 
 - 模型池（7）：``seasonal_naive, prophet, random_forest, xgboost_reg, lgbm_reg,
   catboost_reg, itransformer``（V3 冻结，见 ``experiment_definition_v3.json``）。
-- 训练口径（V3 冻结）：H 窗口用各自起点前 8,760 小时滚动训练；T 窗口统一用
-  T1 起点前 8,760 小时训练。全程不读取任何 T 真值。
+- 训练口径（V3 rev2 冻结）：H 窗口用各自起点前 8,760 小时滚动训练；**T 窗口
+  统一在 T1 起点前 8,760 小时训练一次**，T1/T2/T3 复用同一批模型（iTransformer
+  每个长度训练一次并复用 checkpoint）。全程不读取任何 T 真值。
+- 因果性：窗口计划里全部 H 起点必须早于最早 T 起点，否则拒绝运行。
 - 非外部模型：h=1 递归轨迹，特征固定为 ``final_comparison.BASE_FEATURES``。
-- itransformer：官方实现，按（数据集 × 窗口 × 长度）训练一次后预测该窗口。
 
 产物：
 
@@ -80,6 +81,40 @@ class SharedPoolError(RuntimeError):
 
 def _load_json(path: Path) -> Any:
     return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def validate_plan_causality(plan: Mapping[str, Any]) -> None:
+    """全部 H 起点必须早于最早 T 起点；否则训练口径没有因果性。"""
+    for entry in plan["datasets"]:
+        histories = [
+            pd.Timestamp(w["forecast_origin"])
+            for w in entry["windows"]
+            if w["role"] == "history"
+        ]
+        tests = [
+            pd.Timestamp(w["forecast_origin"])
+            for w in entry["windows"]
+            if w["role"] == "test"
+        ]
+        if not histories or not tests:
+            raise SharedPoolError(f"{entry['dataset']} 缺少 H 或 T 窗口")
+        late = [str(h) for h in histories if h >= min(tests)]
+        if late:
+            raise SharedPoolError(
+                f"{entry['dataset']} 存在不早于最早 T 起点的 H 窗口: {late}"
+            )
+
+
+def expected_task_grid(
+    plan: Mapping[str, Any], horizons: Sequence[int], role: str
+) -> List[Tuple[str, str, int]]:
+    return [
+        (entry["dataset"], w["label"], int(step))
+        for entry in plan["datasets"]
+        for w in entry["windows"]
+        if w["role"] == role
+        for step in horizons
+    ]
 
 
 def load_copy(path: Path) -> pd.DataFrame:
@@ -172,18 +207,17 @@ def trajectories_for(
     return out
 
 
-def run_itransformer(
+def itransformer_train(
     config: Mapping[str, Any],
     dataset: str,
-    window_label: str,
+    tag: str,
     steps: int,
     train_slice: pd.DataFrame,
-    history: pd.DataFrame,
     seed: int,
-) -> np.ndarray:
+) -> str:
     repo = Path(config["repo"])
     hp = hyperparameters(config, "itransformer")
-    model_id = f"{dataset}_{window_label}_h{steps}_s{seed}"
+    model_id = f"{dataset}_{tag}_h{steps}_s{seed}"
     split_root = repo / "dataset" / f"mc_split_{model_id}"
     write_itransformer_splits(
         train_slice,
@@ -203,11 +237,26 @@ def run_itransformer(
         cwd=repo,
         method="itransformer",
     )
-    query_name = f"mc_pred_{model_id}.csv"
+    return model_id
+
+
+def itransformer_predict(
+    config: Mapping[str, Any],
+    model_id: str,
+    window_label: str,
+    steps: int,
+    history: pd.DataFrame,
+) -> np.ndarray:
+    repo = Path(config["repo"])
+    split_root = repo / "dataset" / f"mc_split_{model_id}"
+    query_name = f"mc_pred_{model_id}_{window_label}.csv"
     write_official_input(
         history, split_root / query_name, pd.Timestamp(history["timestamp"].max())
     )
-    output = Path(config.get("output_dir", repo / "mc_output")) / f"real_prediction_{model_id}.npy"
+    output = (
+        Path(config.get("output_dir", repo / "mc_output"))
+        / f"real_prediction_{model_id}_{window_label}.npy"
+    )
     output.parent.mkdir(parents=True, exist_ok=True)
     if output.exists():
         output.unlink()
@@ -276,7 +325,7 @@ def build_window_rows(
     return pd.DataFrame(rows, columns=list(OUTPUT_COLUMNS))
 
 
-def generate_window(
+def generate_history_window(
     out_dir: Path,
     dataset: str,
     window: Mapping[str, Any],
@@ -285,17 +334,11 @@ def generate_window(
     params: Mapping[str, Mapping[str, Any]],
     horizons: Sequence[int],
     external: Optional[Mapping[str, Any]],
-    t1_origin: pd.Timestamp,
 ) -> None:
+    """H 窗口：各自用起点前 8,760 小时滚动训练。"""
     origin = pd.Timestamp(window["forecast_origin"])
     history = window_history(copy, window["forecast_origin"])
-    if window["role"] == "history":
-        train_start = origin - pd.Timedelta(hours=TRAINING_HOURS)
-        train_end = origin
-    else:
-        train_start = t1_origin - pd.Timedelta(hours=TRAINING_HOURS)
-        train_end = t1_origin
-    train_slice = training_frame(copy, train_start, train_end)
+    train_slice = training_frame(copy, origin - pd.Timedelta(hours=TRAINING_HOURS), origin)
     x, y = build_supervised(train_slice)
     country = MODEL_LIBRARY_COUNTRY_BY_REGION[dataset]
     for model_type in pool:
@@ -306,23 +349,78 @@ def generate_window(
         if model_type in EXTERNAL_MODELS:
             if external is None or model_type not in external:
                 raise SharedPoolError(f"{model_type} 需要 --external-config 提供路径")
-            config = external[model_type]
             seed = OFFICIAL_FIXED_SEED["itransformer"]
-            values = {
-                int(steps): run_itransformer(
-                    config, dataset, window["label"], int(steps), train_slice, history, seed
+            values = {}
+            for steps in horizons:
+                model_id = itransformer_train(
+                    external[model_type], dataset, window["label"], int(steps),
+                    train_slice, seed,
                 )
-                for steps in horizons
-            }
+                values[int(steps)] = itransformer_predict(
+                    external[model_type], model_id, window["label"], int(steps), history
+                )
         else:
-            model = fit_pool_model(
-                model_type, x, y, params.get(model_type, {}), POOL_SEED
-            )
+            model = fit_pool_model(model_type, x, y, params.get(model_type, {}), POOL_SEED)
             values = trajectories_for(model, model_type, history, horizons, country)
         frame = build_window_rows(dataset, window, model_type, values)
         path.parent.mkdir(parents=True, exist_ok=True)
         frame.to_csv(path, index=False)
         print(f"[v3-pool] 写出 {path.name}: {len(frame)} 行")
+
+
+def generate_test_windows(
+    out_dir: Path,
+    dataset: str,
+    test_windows: Sequence[Mapping[str, Any]],
+    copy: pd.DataFrame,
+    pool: Sequence[str],
+    params: Mapping[str, Mapping[str, Any]],
+    horizons: Sequence[int],
+    external: Optional[Mapping[str, Any]],
+    t1_origin: pd.Timestamp,
+) -> None:
+    """T 窗口：在 T1 起点前 8,760 小时训练一次，T1/T2/T3 复用同一批模型。"""
+    train_slice = training_frame(
+        copy, t1_origin - pd.Timedelta(hours=TRAINING_HOURS), t1_origin
+    )
+    x, y = build_supervised(train_slice)
+    country = MODEL_LIBRARY_COUNTRY_BY_REGION[dataset]
+    fitted: Dict[str, Optional[Any]] = {}
+    itransformer_ids: Dict[int, str] = {}
+    seed = OFFICIAL_FIXED_SEED["itransformer"]
+    for window in test_windows:
+        history = window_history(copy, window["forecast_origin"])
+        for model_type in pool:
+            path = window_file(out_dir, dataset, window["label"], model_type)
+            if _valid_window_file(path, horizons):
+                print(f"[v3-pool] 跳过已完成: {path.name}")
+                continue
+            if model_type in EXTERNAL_MODELS:
+                if external is None or model_type not in external:
+                    raise SharedPoolError(f"{model_type} 需要 --external-config 提供路径")
+                config = external[model_type]
+                values = {}
+                for steps in horizons:
+                    if int(steps) not in itransformer_ids:
+                        itransformer_ids[int(steps)] = itransformer_train(
+                            config, dataset, "T", int(steps), train_slice, seed
+                        )
+                    values[int(steps)] = itransformer_predict(
+                        config, itransformer_ids[int(steps)], window["label"],
+                        int(steps), history,
+                    )
+            else:
+                if model_type not in fitted:
+                    fitted[model_type] = fit_pool_model(
+                        model_type, x, y, params.get(model_type, {}), POOL_SEED
+                    )
+                values = trajectories_for(
+                    fitted[model_type], model_type, history, horizons, country
+                )
+            frame = build_window_rows(dataset, window, model_type, values)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            frame.to_csv(path, index=False)
+            print(f"[v3-pool] 写出 {path.name}: {len(frame)} 行")
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -342,6 +440,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     definition = _load_json(args.definition)
     plan = _load_json(args.window_plan)
+    validate_plan_causality(plan)
     pool = [m for m in definition["pool"] if not args.models or m in args.models]
     unknown = [m for m in pool if m not in POOL]
     if unknown:
@@ -356,14 +455,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.datasets and dataset not in args.datasets:
             continue
         copy = load_copy(args.data_root / dataset / "load.csv")
-        t1_origin = pd.Timestamp(
-            next(w["forecast_origin"] for w in entry["windows"] if w["role"] == "test")
-        )
+        test_windows = [w for w in entry["windows"] if w["role"] == "test"]
+        if not test_windows:
+            raise SharedPoolError(f"{dataset} 没有 T 窗口")
+        t1_origin = pd.Timestamp(test_windows[0]["forecast_origin"])
         for window in entry["windows"]:
+            if window["role"] != "history":
+                continue
             if args.windows and window["label"] not in args.windows:
                 continue
-            generate_window(
-                args.out_dir, dataset, window, copy, pool, params, horizons,
+            generate_history_window(
+                args.out_dir, dataset, window, copy, pool, params, horizons, external
+            )
+        selected_tests = [
+            w for w in test_windows if not args.windows or w["label"] in args.windows
+        ]
+        if selected_tests:
+            generate_test_windows(
+                args.out_dir, dataset, selected_tests, copy, pool, params, horizons,
                 external, t1_origin,
             )
 
