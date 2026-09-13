@@ -16,6 +16,13 @@
 """
 from __future__ import annotations
 
+import os
+
+# 本脚本的门控训练为纯 CPU 计算。服务器主 venv 的 torch 为 cu130 构建而驱动只支持
+# CUDA 12.8：必须在**任何项目模块导入之前**（v3_shared_pool → model_registry →
+# deep_learning 会间接导入 torch）隐藏 CUDA，否则 accelerator 可能提前初始化失败。
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
+
 import argparse
 import json
 import sys
@@ -254,11 +261,6 @@ def train_routers(
     tasks: Sequence[Mapping[str, Any]], pool: Sequence[str], out_dir: Path
 ) -> Dict[str, Any]:
     """训练 MoLE-style 动态门控（项目自写单层线性 Softmax 路由，非官方 MoLE 复现）。"""
-    import os
-
-    # 路由是纯 CPU 计算。服务器主 venv 的 torch 为 cu130 构建而驱动只支持 CUDA 12.8，
-    # 不隐藏 CUDA 时 optimizer.step() 的 accelerator 初始化会直接抛 RuntimeError。
-    os.environ["CUDA_VISIBLE_DEVICES"] = ""
     import torch
     from torch import nn
 

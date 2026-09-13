@@ -8,6 +8,13 @@
 """
 from __future__ import annotations
 
+import os
+
+# 门控推理为纯 CPU 计算。必须在**任何项目模块导入之前**（v3_fit_history →
+# v3_shared_pool → model_registry → deep_learning 会间接导入 torch）隐藏 CUDA，
+# 避免服务器上 cu130 torch 与驱动不匹配导致 accelerator 提前初始化失败。
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
+
 import argparse
 import json
 import sys
@@ -178,10 +185,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     stacking = _load_json(args.fit_dir / "stacking.json")
     router_meta = _load_json(args.fit_dir / "mole_router_meta.json")
 
-    import os
-
-    # 门控推理是纯 CPU 计算；隐藏 CUDA 以避免与服务器驱动不匹配的 torch 初始化问题。
-    os.environ["CUDA_VISIBLE_DEVICES"] = ""
     import torch
 
     router_state = torch.load(args.fit_dir / "mole_router.pt", weights_only=True)
